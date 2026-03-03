@@ -22,6 +22,12 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+models = [
+  "torch-geometric>=2.6",
+]
+bench = [
+  "numpy>=1.24",
+]
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
