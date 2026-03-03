@@ -65,7 +65,7 @@ PYTHONPATH=src python scripts/benchmark_relational_models.py \
 - `--model-kinds decentralized,centralized` runs both models for direct comparison.
 - `RELM_MODELS_MP_FANIN=1` enables model-side use of `relm.ops.mp` fanin kernels (default: on).
 - `RELM_MODELS_MP_FANIN_FUSED=1` enables fanin kernels in `CentralFusedLayerMP` (default: on).
-- `RELM_MODELS_MP_FANIN_BATCHED=0` enables fanin kernels in `BatchedFanInMP` (default: off).
+- `RELM_MODELS_MP_FANIN_BATCHED=1` enables fanin kernels in `BatchedFanInMP` (default: on).
 - `RELM_MODELS_MP_FANOUT=0` enables fanout kernel path in batched/fused MPs (default: off).
 
 Benchmark snapshots are tracked in [docs/BENCHMARK_HISTORY.md](docs/BENCHMARK_HISTORY.md).

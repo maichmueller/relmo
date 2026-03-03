@@ -1531,27 +1531,25 @@ class BatchedFanInMP(torch.nn.Module):
                 x_dict[dst]
             )
             use_mp_fanin = use_mp_fanin and _env_bool(
-                "RELM_MODELS_MP_FANIN_BATCHED", False
+                "RELM_MODELS_MP_FANIN_BATCHED", True
             )
             if use_mp_fanin:
                 plan = mp_fanin_plans.get(dst)
                 if plan is not None:
                     rel_parts: list[torch.Tensor] = []
                     plan_ok = True
-                    for pred, expected_rows in zip(
-                        plan["pred_order"], plan["rel_rows"]
-                    ):
-                        if pred not in x_dict:
+                    for pred in plan["pred_order"]:
+                        rel_pred = x_dict.get(pred)
+                        if rel_pred is None:
                             plan_ok = False
                             break
-                        rel_flat = x_dict[pred].view(-1, self.embedding_size)
-                        if int(rel_flat.size(0)) != int(expected_rows):
-                            plan_ok = False
-                            break
-                        rel_parts.append(rel_flat)
+                        rel_parts.append(rel_pred.view(-1, self.embedding_size))
                     if plan_ok and rel_parts:
                         rel_cat = _cat_or_single(rel_parts, dim=0)
-                        if int(rel_cat.size(0)) == int(plan["total_rel_rows"]):
+                        if (
+                            (not self.validate_routing)
+                            or int(rel_cat.size(0)) == int(plan["total_rel_rows"])
+                        ):
                             out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                                 rel_cat,
                                 plan["flat_src"],
