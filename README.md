@@ -69,6 +69,32 @@ PYTHONPATH=src python scripts/benchmark_relational_models.py \
 - `RELM_MODELS_MP_GROUPED_MLP=1` enables grouped execution for compatible per-relation residual MLPs in `BatchedFanOutMP` (default: on, with automatic fallback).
 - `RELM_MODELS_MP_FANOUT=0` enables fanout kernel path in batched/fused MPs (default: off).
 
+### Grouped MLP Interface
+
+`RELM_MODELS_MP_GROUPED_MLP=1` can accelerate custom per-relation modules when they expose:
+
+```python
+from relm.models import GroupedMLPSpec
+
+def relm_grouped_mlp_spec(self) -> GroupedMLPSpec | dict | None:
+    return GroupedMLPSpec(
+        linears=[self.lin1, self.lin2, self.lin3],  # torch.nn.Linear list
+        ops=[  # execution order
+            ("linear", 0),
+            ("pointwise", self.act1),  # one of: Identity/ReLU/Mish/GELU/SiLU/Tanh/ELU/LeakyReLU
+            ("linear", 1),
+            ("pointwise", self.act2),
+            ("linear", 2),
+        ],
+        truncated_dim=self.out_dim,  # optional residual truncation behavior
+        truncate_right=False,        # optional
+        signature=("my-mlp-v1",),    # optional grouping key (must be hashable)
+    )
+```
+
+Returning a raw `dict` with the same keys is still supported for backward compatibility.
+If this method is missing, returns `None`, or the module is incompatible, relm automatically falls back to per-relation execution.
+
 Benchmark snapshots are tracked in [docs/BENCHMARK_HISTORY.md](docs/BENCHMARK_HISTORY.md).
 
 ## Full handoff and implementation plan

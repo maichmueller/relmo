@@ -15,7 +15,7 @@ from ._logging import get_logger
 
 from .aggr import LogSumExpAggregation
 from .film import CentralFilmFactory, FiLMConcatMLP
-from .hetero_message_passing import (
+from .hetero_mp import (
     CentralFanOutMP,
     CentralFusedLayerMP,
     FanInMP,
@@ -317,7 +317,7 @@ class RelationalGNN(PyGHeteroModule):
         }
 
         if self.rel_layer_mode == "batched_cached":
-            from .hetero_message_passing import BatchedFanInMP, BatchedFanOutMP
+            from .hetero_mp import BatchedFanInMP, BatchedFanOutMP
 
             relation_arities = {
                 pred: arity
@@ -798,3 +798,249 @@ class CentralizedRelationalGNN(RelationalGNN):
         return factory(
             embedding_size, max_arity, condition_dim, mask_dim, self.condition_position
         )
+
+
+class LGANRelationalGNN(RelationalGNN):
+    """
+    LGANRelationalGNN implements the explicit LGAN-v2 stack with dual target aggregation:
+    AGGR_t (target-neighbor), AGGR_n (neighbor-neighbor), and relation-relation exchange (RR).
+    """
+
+    def __init__(
+        self,
+        embedding_size: int,
+        num_layer: int,
+        aggr: Optional[str | pyg.nn.aggr.Aggregation],
+        symbol_type_ids: Iterable[str] | str,
+        relation_dict: RelationDict,
+        relation_module_factory: Callable[[str, int], torch.nn.Module] | None = None,
+        ignore_zero_arity_relations: bool = True,
+        include_lgan_edges: bool = True,
+        lgan_tn_edge_pos: str = "_lgan_tn_",
+        lgan_nn_edge_pos: str = "_lgan_nn_",
+        lgan_rr_edge_pos: str = "_lgan_rr_",
+        **kwargs,
+    ):
+        self.include_lgan_edges = bool(include_lgan_edges)
+        if not self.include_lgan_edges:
+            raise ValueError(
+                "LGANRelationalGNN requires include_lgan_edges=True. "
+                "Use RelationalGNN for non-LGAN message passing."
+            )
+        self.lgan_tn_edge_pos = str(lgan_tn_edge_pos)
+        self.lgan_nn_edge_pos = str(lgan_nn_edge_pos)
+        self.lgan_rr_edge_pos = str(lgan_rr_edge_pos)
+        super().__init__(
+            embedding_size=embedding_size,
+            num_layer=num_layer,
+            aggr=aggr,
+            symbol_type_ids=symbol_type_ids,
+            relation_dict=relation_dict,
+            relation_module_factory=relation_module_factory,
+            ignore_zero_arity_relations=ignore_zero_arity_relations,
+            **kwargs,
+        )
+        self._relation_type_ids = tuple(str(k) for k in self.relation_dict.keys())
+        self.tn_relations_to_symbols_mp = FanInMP(
+            embedding_size=self.embedding_size,
+            dst_types=self.symbol_type_ids,
+            src_types=self._relation_type_ids,
+            edge_labels=(self.lgan_tn_edge_pos,),
+            aggr=aggr,
+            strict_filter_mode=self.strict_ntype_filter,
+        )
+        self.nn_relations_to_symbols_mp = FanInMP(
+            embedding_size=self.embedding_size,
+            dst_types=self.symbol_type_ids,
+            src_types=self._relation_type_ids,
+            edge_labels=(self.lgan_nn_edge_pos,),
+            aggr=aggr,
+            strict_filter_mode=self.strict_ntype_filter,
+        )
+        self.rr_relations_to_relations_mp = FanInMP(
+            embedding_size=self.embedding_size,
+            dst_types=self._relation_type_ids,
+            src_types=self._relation_type_ids,
+            edge_labels=(self.lgan_rr_edge_pos,),
+            aggr=aggr,
+            strict_filter_mode=self.strict_ntype_filter,
+        )
+        self.fusion_updater = SimpleMLP(
+            in_size=3 * embedding_size,
+            embedding_size=2 * embedding_size,
+            out_size=embedding_size,
+            activation=self.activation,
+        )
+
+    def _matches_ntype(self, node_type: str, candidates: Sequence[str]) -> bool:
+        if self.strict_ntype_filter:
+            return node_type in candidates
+        return any(candidate in node_type for candidate in candidates)
+
+    def _is_symbol_ntype(self, node_type: str) -> bool:
+        return self._matches_ntype(node_type, self.symbol_type_ids)
+
+    def _is_relation_ntype(self, node_type: str) -> bool:
+        return self._matches_ntype(node_type, self._relation_type_ids)
+
+    def _filter_directional_edges(
+        self,
+        edge_index_dict: Dict[EdgeType, Adj],
+        *,
+        edge_label: str,
+        relation_to_relation: bool,
+    ) -> Dict[EdgeType, Adj]:
+        filtered: Dict[EdgeType, Adj] = {}
+        for edge_type, edge_index in edge_index_dict.items():
+            src, rel, dst = edge_type
+            if str(rel) != edge_label:
+                continue
+            if relation_to_relation:
+                if not (self._is_relation_ntype(src) and self._is_relation_ntype(dst)):
+                    continue
+            else:
+                if not (self._is_relation_ntype(src) and self._is_symbol_ntype(dst)):
+                    continue
+            filtered[edge_type] = edge_index
+        return filtered
+
+    def _ensure_required_edge_families(self, edge_index_dict: Dict[EdgeType, Adj]) -> None:
+        tn_edges = self._filter_directional_edges(
+            edge_index_dict,
+            edge_label=self.lgan_tn_edge_pos,
+            relation_to_relation=False,
+        )
+        nn_edges = self._filter_directional_edges(
+            edge_index_dict,
+            edge_label=self.lgan_nn_edge_pos,
+            relation_to_relation=False,
+        )
+        rr_edges = self._filter_directional_edges(
+            edge_index_dict,
+            edge_label=self.lgan_rr_edge_pos,
+            relation_to_relation=True,
+        )
+        missing: list[str] = []
+        if not tn_edges:
+            missing.append(self.lgan_tn_edge_pos)
+        if not nn_edges:
+            missing.append(self.lgan_nn_edge_pos)
+        if not rr_edges:
+            missing.append(self.lgan_rr_edge_pos)
+        if missing:
+            raise ValueError(
+                "LGAN enabled but required LGAN edge families are missing from the "
+                f"encoded graph. missing={missing}; available_labels="
+                f"{sorted({str(edge_type[1]) for edge_type in edge_index_dict.keys()})}. "
+                "Ensure the encoder emits TN/NN/RR labels."
+            )
+
+    def _pool_relation_embeddings(self, x_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        pooled: Dict[str, Tensor] = {}
+        for relation_type in self._relation_type_ids:
+            if relation_type not in x_dict:
+                continue
+            rel_x = x_dict[relation_type]
+            if rel_x.dim() != 2:
+                raise ValueError(
+                    f"Expected 2D relation embedding for {relation_type!r}, got dim={rel_x.dim()}."
+                )
+            arity = int(self.relation_dict[relation_type])
+            if arity <= 0:
+                pooled[relation_type] = rel_x.new_zeros((rel_x.size(0), self.embedding_size))
+                continue
+            expected_dim = arity * self.embedding_size
+            if rel_x.size(-1) != expected_dim:
+                raise ValueError(
+                    f"Relation embedding width mismatch for {relation_type!r}: "
+                    f"got {rel_x.size(-1)}, expected {expected_dim}."
+                )
+            pooled[relation_type] = rel_x.view(rel_x.size(0), arity, self.embedding_size).mean(
+                dim=1
+            )
+        return pooled
+
+    def layer(
+        self, x_dict, edge_index_dict, *, extra=None, symbol_ntype_ids: Sequence[str]
+    ):
+        if not symbol_ntype_ids:
+            raise RuntimeError(
+                "LGANRelationalGNN received a batch without symbol node types. "
+                f"x_dict_keys={sorted(x_dict.keys())}."
+            )
+
+        # Phase 1: standard positional symbol->relation updates.
+        standard_edges = {
+            edge_type: edge_index
+            for edge_type, edge_index in edge_index_dict.items()
+            if str(edge_type[1]).isdigit()
+        }
+        atom_msgs = self.symbols_to_relations_mp(x_dict, standard_edges)
+        x_dict.update(atom_msgs)
+
+        # Phase 2: relation-pair embedding pooling.
+        relation_pair_x = self._pool_relation_embeddings(x_dict)
+        if not relation_pair_x:
+            raise RuntimeError(
+                "LGANRelationalGNN could not build relation-pair embeddings. "
+                f"available_node_types={sorted(x_dict.keys())} "
+                f"relation_types={sorted(self._relation_type_ids)}."
+            )
+
+        # Phase 3: RR exchange (relation->relation).
+        rr_edges = self._filter_directional_edges(
+            edge_index_dict,
+            edge_label=self.lgan_rr_edge_pos,
+            relation_to_relation=True,
+        )
+        rr_msgs_dict = self.rr_relations_to_relations_mp(relation_pair_x, rr_edges)
+        for rel_type, rel_prev in relation_pair_x.items():
+            rr_msg = rr_msgs_dict.get(rel_type)
+            if rr_msg is not None:
+                relation_pair_x[rel_type] = rel_prev + rr_msg
+
+        # Phase 4: AGGR_t over TN edges (relation->symbol).
+        tn_edges = self._filter_directional_edges(
+            edge_index_dict,
+            edge_label=self.lgan_tn_edge_pos,
+            relation_to_relation=False,
+        )
+        symbol_aggr_x = dict(relation_pair_x)
+        for symbol_ntype_id in symbol_ntype_ids:
+            symbol_aggr_x[symbol_ntype_id] = x_dict[symbol_ntype_id]
+        tn_msgs_dict = self.tn_relations_to_symbols_mp(symbol_aggr_x, tn_edges)
+
+        # Phase 5: AGGR_n over NN edges (relation->symbol).
+        nn_edges = self._filter_directional_edges(
+            edge_index_dict,
+            edge_label=self.lgan_nn_edge_pos,
+            relation_to_relation=False,
+        )
+        nn_msgs_dict = self.nn_relations_to_symbols_mp(symbol_aggr_x, nn_edges)
+
+        # Phase 6: fuse and residual-update symbols.
+        for symbol_ntype_id in symbol_ntype_ids:
+            prev_emb = x_dict[symbol_ntype_id]
+            tn_msgs = tn_msgs_dict.get(symbol_ntype_id, torch.zeros_like(prev_emb))
+            nn_msgs = nn_msgs_dict.get(symbol_ntype_id, torch.zeros_like(prev_emb))
+            updated_obj_emb = self.fusion_updater(
+                torch.cat([prev_emb, tn_msgs, nn_msgs], dim=1)
+            )
+            x_dict[symbol_ntype_id] = prev_emb + updated_obj_emb
+
+    def forward(
+        self,
+        x_dict: Dict[str, Tensor],
+        edge_index_dict: Dict[EdgeType, Adj],
+        batch_dict: Optional[Dict[str, Tensor]] = None,
+        info_dict: Optional[Dict[str, Tensor]] = None,
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        self._ensure_required_edge_families(edge_index_dict)
+        out, out_batch = super().forward(x_dict, edge_index_dict, batch_dict, info_dict)
+        if not out or all(t.numel() == 0 for t in out.values()):
+            raise RuntimeError(
+                "LGANRelationalGNN produced no symbol outputs for the batch. "
+                f"input_node_types={sorted(x_dict.keys())} "
+                f"input_edge_labels={sorted({str(k[1]) for k in edge_index_dict.keys()})}."
+            )
+        return out, out_batch
