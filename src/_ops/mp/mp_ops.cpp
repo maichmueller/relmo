@@ -1,8 +1,6 @@
-#include <torch/csrc/stable/library.h>
-#include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor.h>
+#include <ATen/ATen.h>
+#include <torch/library.h>
 
-#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -10,41 +8,26 @@
 #include <string>
 #include <vector>
 
-namespace relm::relmp {
+namespace relm::mp {
 
-using ::StableIValue;
-using torch::stable::Tensor;
-using torch::stable::detail::from;
-using torch::stable::detail::to;
+using at::Tensor;
 
 constexpr int64_t kModeSum = 0;
 constexpr int64_t kModeLogSumExp = 1;
 
-template < size_t N >
-void call_dispatcher(const char* opname, const char* overload, std::array< StableIValue, N >& stack)
+at::ScalarType dtype_of(const Tensor& t)
 {
-#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_10_0
-   TORCH_ERROR_CODE_CHECK(torch_call_dispatcher(opname, overload, stack.data(), TORCH_ABI_VERSION));
-#else
-   TORCH_ERROR_CODE_CHECK(aoti_torch_call_dispatcher(opname, overload, stack.data()));
-#endif
+   return t.scalar_type();
 }
 
-int32_t dtype_of(const Tensor& t)
+bool is_fastpath_dtype(at::ScalarType dtype)
 {
-   int32_t dtype = 0;
-   TORCH_ERROR_CODE_CHECK(aoti_torch_get_dtype(t.get(), &dtype));
-   return dtype;
-}
-
-bool is_fastpath_dtype(int32_t dtype)
-{
-   return dtype == aoti_torch_dtype_float32() || dtype == aoti_torch_dtype_float64();
+   return dtype == at::kFloat || dtype == at::kDouble;
 }
 
 void check_rank(const Tensor& t, int64_t expected, const char* name)
 {
-   STD_TORCH_CHECK(
+   TORCH_CHECK(
       t.dim() == expected, name, " must be rank ", expected, ", got rank ", t.dim(), "."
    );
 }
@@ -52,86 +35,27 @@ void check_rank(const Tensor& t, int64_t expected, const char* name)
 void check_int64_index(const Tensor& t, const char* name)
 {
    check_rank(t, 1, name);
-   STD_TORCH_CHECK(dtype_of(t) == aoti_torch_dtype_int64(), name, " must have dtype torch.int64.");
+   TORCH_CHECK(dtype_of(t) == at::kLong, name, " must have dtype torch.int64.");
 }
 
 void check_in_bounds(int64_t idx, int64_t size, const char* name)
 {
-   STD_TORCH_CHECK(
+   TORCH_CHECK(
       idx >= 0 && idx < size, name, " index out of bounds: ", idx, " not in [0, ", size, ")."
    );
 }
 
 Tensor ensure_contiguous(const Tensor& t)
 {
-   return t.is_contiguous() ? t : torch::stable::contiguous(t);
+   return t.is_contiguous() ? t : t.contiguous();
 }
 
-Tensor dispatch_index_select0(const Tensor& self, const Tensor& index)
+Tensor make_scatter_index(const Tensor& idx, int64_t emb)
 {
-   std::array< StableIValue, 3 > stack{from(self), from(static_cast< int64_t >(0)), from(index)};
-   call_dispatcher("aten::index_select", "", stack);
-   return to< Tensor >(stack[0]);
+   return idx.unsqueeze(1).expand({idx.size(0), emb});
 }
 
-Tensor dispatch_index_copy0(const Tensor& self, const Tensor& index, const Tensor& source)
-{
-   std::array< StableIValue, 4 > stack{
-      from(self), from(static_cast< int64_t >(0)), from(index), from(source)
-   };
-   call_dispatcher("aten::index_copy", "", stack);
-   return to< Tensor >(stack[0]);
-}
-
-Tensor dispatch_expand(const Tensor& self, const std::vector< int64_t >& size)
-{
-   std::array< StableIValue, 3 > stack{from(self), from(size), from(false)};
-   call_dispatcher("aten::expand", "", stack);
-   return to< Tensor >(stack[0]);
-}
-
-Tensor dispatch_scatter_reduce0(
-   const Tensor& self,
-   const Tensor& index,
-   const Tensor& src,
-   const char* reduce,
-   bool include_self
-)
-{
-   std::array< StableIValue, 6 > stack{
-      from(self),
-      from(static_cast< int64_t >(0)),
-      from(index),
-      from(src),
-      from(std::string(reduce)),
-      from(include_self)
-   };
-   call_dispatcher("aten::scatter_reduce", "two", stack);
-   return to< Tensor >(stack[0]);
-}
-
-Tensor dispatch_exp(const Tensor& self)
-{
-   std::array< StableIValue, 1 > stack{from(self)};
-   call_dispatcher("aten::exp", "", stack);
-   return to< Tensor >(stack[0]);
-}
-
-Tensor dispatch_log(const Tensor& self)
-{
-   std::array< StableIValue, 1 > stack{from(self)};
-   call_dispatcher("aten::log", "", stack);
-   return to< Tensor >(stack[0]);
-}
-
-Tensor make_scatter_index(const Tensor& dst_idx, int64_t emb)
-{
-   Tensor unsqueezed = torch::stable::unsqueeze(dst_idx, 1);
-   std::vector< int64_t > expanded_shape{dst_idx.size(0), emb};
-   return dispatch_expand(unsqueezed, expanded_shape);
-}
-
-#if defined(RELM_RELMP_HAS_CUDA) && RELM_RELMP_HAS_CUDA
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
 Tensor fanout_scatter_cuda(
    const Tensor& x_cat,
    const Tensor& src_global_idx,
@@ -150,10 +74,24 @@ Tensor fanin_reduce_sum_cuda(
    const Tensor& dst_idx,
    int64_t dim_size
 );
+Tensor fanin_reduce_logsumexp_cuda(
+   const Tensor& rel_flat,
+   const Tensor& flat_src,
+   const Tensor& dst_idx,
+   int64_t dim_size
+);
 Tensor fanin_reduce_sum_backward_cuda(
    const Tensor& grad_out,
    const Tensor& flat_src,
    const Tensor& dst_idx,
+   int64_t rel_rows
+);
+Tensor fanin_reduce_logsumexp_backward_cuda(
+   const Tensor& grad_out,
+   const Tensor& rel_flat,
+   const Tensor& flat_src,
+   const Tensor& dst_idx,
+   const Tensor& out,
    int64_t rel_rows
 );
 #endif
@@ -264,13 +202,13 @@ Tensor fanout_scatter_fallback(
 )
 {
    const int64_t emb = x_cat.size(1);
-   std::vector< int64_t > shape{out_rows, emb};
-   Tensor args_flat = torch::stable::new_zeros(x_cat, shape);
+   Tensor out = at::zeros({out_rows, emb}, x_cat.options());
    if(src_global_idx.numel() == 0 || out_rows == 0) {
-      return args_flat;
+      return out;
    }
-   Tensor vals = dispatch_index_select0(x_cat, src_global_idx);
-   return dispatch_index_copy0(args_flat, flat_dst, vals);
+   Tensor vals = x_cat.index_select(0, src_global_idx);
+   out.index_copy_(0, flat_dst, vals);
+   return out;
 }
 
 Tensor fanout_scatter_backward_fallback(
@@ -281,14 +219,13 @@ Tensor fanout_scatter_backward_fallback(
 )
 {
    const int64_t emb = grad_out.size(1);
-   std::vector< int64_t > shape{x_rows, emb};
-   Tensor grad_x = torch::stable::new_zeros(grad_out, shape);
+   Tensor grad_x = at::zeros({x_rows, emb}, grad_out.options());
    if(flat_dst.numel() == 0 || x_rows == 0) {
       return grad_x;
    }
-   Tensor gathered = dispatch_index_select0(grad_out, flat_dst);
-   Tensor index = make_scatter_index(src_global_idx, emb);
-   return dispatch_scatter_reduce0(grad_x, index, gathered, "sum", true);
+   Tensor gathered = grad_out.index_select(0, flat_dst);
+   grad_x.index_add_(0, src_global_idx, gathered);
+   return grad_x;
 }
 
 Tensor fanin_reduce_sum_fallback(
@@ -299,14 +236,13 @@ Tensor fanin_reduce_sum_fallback(
 )
 {
    const int64_t emb = rel_flat.size(1);
-   std::vector< int64_t > shape{dim_size, emb};
-   Tensor out = torch::stable::new_zeros(rel_flat, shape);
+   Tensor out = at::zeros({dim_size, emb}, rel_flat.options());
    if(flat_src.numel() == 0 || dim_size == 0) {
       return out;
    }
-   Tensor msgs = dispatch_index_select0(rel_flat, flat_src);
-   Tensor index = make_scatter_index(dst_idx, emb);
-   return dispatch_scatter_reduce0(out, index, msgs, "sum", true);
+   Tensor msgs = rel_flat.index_select(0, flat_src);
+   out.index_add_(0, dst_idx, msgs);
+   return out;
 }
 
 Tensor fanin_reduce_sum_backward_fallback(
@@ -317,14 +253,37 @@ Tensor fanin_reduce_sum_backward_fallback(
 )
 {
    const int64_t emb = grad_out.size(1);
-   std::vector< int64_t > shape{rel_rows, emb};
-   Tensor grad_rel = torch::stable::new_zeros(grad_out, shape);
+   Tensor grad_rel = at::zeros({rel_rows, emb}, grad_out.options());
    if(flat_src.numel() == 0 || rel_rows == 0) {
       return grad_rel;
    }
-   Tensor gathered = dispatch_index_select0(grad_out, dst_idx);
-   Tensor index = make_scatter_index(flat_src, emb);
-   return dispatch_scatter_reduce0(grad_rel, index, gathered, "sum", true);
+   Tensor gathered = grad_out.index_select(0, dst_idx);
+   grad_rel.index_add_(0, flat_src, gathered);
+   return grad_rel;
+}
+
+Tensor fanin_reduce_logsumexp_backward_fallback(
+   const Tensor& grad_out,
+   const Tensor& rel_flat,
+   const Tensor& flat_src,
+   const Tensor& dst_idx,
+   const Tensor& out,
+   int64_t rel_rows
+)
+{
+   const int64_t emb = grad_out.size(1);
+   Tensor grad_rel = at::zeros({rel_rows, emb}, rel_flat.options());
+   if(flat_src.numel() == 0 || rel_rows == 0) {
+      return grad_rel;
+   }
+
+   Tensor msgs = rel_flat.index_select(0, flat_src);
+   Tensor out_sel = out.index_select(0, dst_idx);
+   Tensor grad_sel = grad_out.index_select(0, dst_idx);
+   Tensor weights = (msgs - out_sel).exp();
+   Tensor contrib = grad_sel * weights;
+   grad_rel.index_add_(0, flat_src, contrib);
+   return grad_rel;
 }
 
 Tensor fanin_reduce_logsumexp(
@@ -334,26 +293,30 @@ Tensor fanin_reduce_logsumexp(
    int64_t dim_size
 )
 {
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(rel_flat.is_cuda() && flat_src.is_cuda() && dst_idx.is_cuda()
+      && is_fastpath_dtype(dtype_of(rel_flat))) {
+      return fanin_reduce_logsumexp_cuda(rel_flat, flat_src, dst_idx, dim_size);
+   }
+#endif
+
    const int64_t emb = rel_flat.size(1);
-   std::vector< int64_t > shape{dim_size, emb};
-   Tensor max_init = torch::stable::new_zeros(rel_flat, shape);
-   torch::stable::fill_(max_init, -std::numeric_limits< double >::infinity());
+   Tensor max_vals = at::full(
+      {dim_size, emb}, -std::numeric_limits< double >::infinity(), rel_flat.options()
+   );
 
    if(flat_src.numel() == 0 || dim_size == 0) {
-      return max_init;
+      return max_vals;
    }
 
-   Tensor msgs = dispatch_index_select0(rel_flat, flat_src);
+   Tensor msgs = rel_flat.index_select(0, flat_src);
    Tensor index = make_scatter_index(dst_idx, emb);
-   Tensor max_vals = dispatch_scatter_reduce0(max_init, index, msgs, "amax", true);
-   Tensor max_offsets = dispatch_index_select0(max_vals, dst_idx);
-   Tensor centered = torch::stable::subtract(msgs, max_offsets, 1.0);
-   Tensor exps = dispatch_exp(centered);
-
-   Tensor sum_init = torch::stable::new_zeros(rel_flat, shape);
-   Tensor exps_sum = dispatch_scatter_reduce0(sum_init, index, exps, "sum", true);
-   Tensor logs = dispatch_log(exps_sum);
-   return torch::stable::subtract(logs, max_vals, -1.0);
+   max_vals.scatter_reduce_(0, index, msgs, "amax", true);
+   Tensor max_offsets = max_vals.index_select(0, dst_idx);
+   Tensor exps = (msgs - max_offsets).exp();
+   Tensor exps_sum = at::zeros({dim_size, emb}, rel_flat.options());
+   exps_sum.scatter_add_(0, index, exps);
+   return exps_sum.log() + max_vals;
 }
 
 Tensor fanout_scatter(
@@ -366,20 +329,19 @@ Tensor fanout_scatter(
    check_rank(x_cat, 2, "x_cat");
    check_int64_index(src_global_idx, "src_global_idx");
    check_int64_index(flat_dst, "flat_dst");
-   STD_TORCH_CHECK(
+   TORCH_CHECK(
       src_global_idx.size(0) == flat_dst.size(0),
       "src_global_idx and flat_dst must have equal length."
    );
-   STD_TORCH_CHECK(out_rows >= 0, "out_rows must be >= 0.");
+   TORCH_CHECK(out_rows >= 0, "out_rows must be >= 0.");
 
    const int64_t emb = x_cat.size(1);
-   std::vector< int64_t > shape{out_rows, emb};
-   Tensor args_flat = torch::stable::new_zeros(x_cat, shape);
+   Tensor out = at::zeros({out_rows, emb}, x_cat.options());
    if(src_global_idx.numel() == 0 || out_rows == 0) {
-      return args_flat;
+      return out;
    }
 
-#if defined(RELM_RELMP_HAS_CUDA) && RELM_RELMP_HAS_CUDA
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
    if(x_cat.is_cuda() && src_global_idx.is_cuda() && flat_dst.is_cuda()
       && is_fastpath_dtype(dtype_of(x_cat))) {
       return fanout_scatter_cuda(x_cat, src_global_idx, flat_dst, out_rows);
@@ -391,32 +353,32 @@ Tensor fanout_scatter(
       Tensor x_work = ensure_contiguous(x_cat);
       Tensor src_work = ensure_contiguous(src_global_idx);
       Tensor dst_work = ensure_contiguous(flat_dst);
-
       const int64_t num_edges = src_work.size(0);
-      if(dtype_of(x_work) == aoti_torch_dtype_float32()) {
+
+      if(dtype_of(x_work) == at::kFloat) {
          fanout_scatter_cpu_kernel< float >(
-            x_work.const_data_ptr< float >(),
-            src_work.const_data_ptr< int64_t >(),
-            dst_work.const_data_ptr< int64_t >(),
+            x_work.data_ptr< float >(),
+            src_work.data_ptr< int64_t >(),
+            dst_work.data_ptr< int64_t >(),
             num_edges,
             x_work.size(0),
             out_rows,
             emb,
-            args_flat.mutable_data_ptr< float >()
+            out.data_ptr< float >()
          );
-         return args_flat;
+         return out;
       }
       fanout_scatter_cpu_kernel< double >(
-         x_work.const_data_ptr< double >(),
-         src_work.const_data_ptr< int64_t >(),
-         dst_work.const_data_ptr< int64_t >(),
+         x_work.data_ptr< double >(),
+         src_work.data_ptr< int64_t >(),
+         dst_work.data_ptr< int64_t >(),
          num_edges,
          x_work.size(0),
          out_rows,
          emb,
-         args_flat.mutable_data_ptr< double >()
+         out.data_ptr< double >()
       );
-      return args_flat;
+      return out;
    }
 
    return fanout_scatter_fallback(x_cat, src_global_idx, flat_dst, out_rows);
@@ -432,20 +394,19 @@ Tensor fanout_scatter_backward(
    check_rank(grad_out, 2, "grad_out");
    check_int64_index(src_global_idx, "src_global_idx");
    check_int64_index(flat_dst, "flat_dst");
-   STD_TORCH_CHECK(
+   TORCH_CHECK(
       src_global_idx.size(0) == flat_dst.size(0),
       "src_global_idx and flat_dst must have equal length."
    );
-   STD_TORCH_CHECK(x_rows >= 0, "x_rows must be >= 0.");
+   TORCH_CHECK(x_rows >= 0, "x_rows must be >= 0.");
 
    const int64_t emb = grad_out.size(1);
-   std::vector< int64_t > shape{x_rows, emb};
-   Tensor grad_x = torch::stable::new_zeros(grad_out, shape);
+   Tensor grad_x = at::zeros({x_rows, emb}, grad_out.options());
    if(src_global_idx.numel() == 0 || x_rows == 0) {
       return grad_x;
    }
 
-#if defined(RELM_RELMP_HAS_CUDA) && RELM_RELMP_HAS_CUDA
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
    if(grad_out.is_cuda() && src_global_idx.is_cuda() && flat_dst.is_cuda()
       && is_fastpath_dtype(dtype_of(grad_out))) {
       return fanout_scatter_backward_cuda(grad_out, src_global_idx, flat_dst, x_rows);
@@ -459,28 +420,28 @@ Tensor fanout_scatter_backward(
       Tensor dst_work = ensure_contiguous(flat_dst);
       const int64_t num_edges = src_work.size(0);
 
-      if(dtype_of(grad_out_work) == aoti_torch_dtype_float32()) {
+      if(dtype_of(grad_out_work) == at::kFloat) {
          fanout_scatter_backward_cpu_kernel< float >(
-            grad_out_work.const_data_ptr< float >(),
-            src_work.const_data_ptr< int64_t >(),
-            dst_work.const_data_ptr< int64_t >(),
+            grad_out_work.data_ptr< float >(),
+            src_work.data_ptr< int64_t >(),
+            dst_work.data_ptr< int64_t >(),
             num_edges,
             x_rows,
             grad_out_work.size(0),
             emb,
-            grad_x.mutable_data_ptr< float >()
+            grad_x.data_ptr< float >()
          );
          return grad_x;
       }
       fanout_scatter_backward_cpu_kernel< double >(
-         grad_out_work.const_data_ptr< double >(),
-         src_work.const_data_ptr< int64_t >(),
-         dst_work.const_data_ptr< int64_t >(),
+         grad_out_work.data_ptr< double >(),
+         src_work.data_ptr< int64_t >(),
+         dst_work.data_ptr< int64_t >(),
          num_edges,
          x_rows,
          grad_out_work.size(0),
          emb,
-         grad_x.mutable_data_ptr< double >()
+         grad_x.data_ptr< double >()
       );
       return grad_x;
    }
@@ -496,13 +457,12 @@ Tensor fanin_reduce_sum(
 )
 {
    const int64_t emb = rel_flat.size(1);
-   std::vector< int64_t > shape{dim_size, emb};
-   Tensor out = torch::stable::new_zeros(rel_flat, shape);
+   Tensor out = at::zeros({dim_size, emb}, rel_flat.options());
    if(flat_src.numel() == 0 || dim_size == 0) {
       return out;
    }
 
-#if defined(RELM_RELMP_HAS_CUDA) && RELM_RELMP_HAS_CUDA
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
    if(rel_flat.is_cuda() && flat_src.is_cuda() && dst_idx.is_cuda()
       && is_fastpath_dtype(dtype_of(rel_flat))) {
       return fanin_reduce_sum_cuda(rel_flat, flat_src, dst_idx, dim_size);
@@ -516,28 +476,28 @@ Tensor fanin_reduce_sum(
       Tensor dst_work = ensure_contiguous(dst_idx);
       const int64_t num_edges = src_work.size(0);
 
-      if(dtype_of(rel_work) == aoti_torch_dtype_float32()) {
+      if(dtype_of(rel_work) == at::kFloat) {
          fanin_reduce_sum_cpu_kernel< float >(
-            rel_work.const_data_ptr< float >(),
-            src_work.const_data_ptr< int64_t >(),
-            dst_work.const_data_ptr< int64_t >(),
+            rel_work.data_ptr< float >(),
+            src_work.data_ptr< int64_t >(),
+            dst_work.data_ptr< int64_t >(),
             num_edges,
             rel_work.size(0),
             dim_size,
             emb,
-            out.mutable_data_ptr< float >()
+            out.data_ptr< float >()
          );
          return out;
       }
       fanin_reduce_sum_cpu_kernel< double >(
-         rel_work.const_data_ptr< double >(),
-         src_work.const_data_ptr< int64_t >(),
-         dst_work.const_data_ptr< int64_t >(),
+         rel_work.data_ptr< double >(),
+         src_work.data_ptr< int64_t >(),
+         dst_work.data_ptr< int64_t >(),
          num_edges,
          rel_work.size(0),
          dim_size,
          emb,
-         out.mutable_data_ptr< double >()
+         out.data_ptr< double >()
       );
       return out;
    }
@@ -555,19 +515,16 @@ Tensor fanin_reduce_sum_backward(
    check_rank(grad_out, 2, "grad_out");
    check_int64_index(flat_src, "flat_src");
    check_int64_index(dst_idx, "dst_idx");
-   STD_TORCH_CHECK(
-      flat_src.size(0) == dst_idx.size(0), "flat_src and dst_idx must have equal length."
-   );
-   STD_TORCH_CHECK(rel_rows >= 0, "rel_rows must be >= 0.");
+   TORCH_CHECK(flat_src.size(0) == dst_idx.size(0), "flat_src and dst_idx must have equal length.");
+   TORCH_CHECK(rel_rows >= 0, "rel_rows must be >= 0.");
 
    const int64_t emb = grad_out.size(1);
-   std::vector< int64_t > shape{rel_rows, emb};
-   Tensor grad_rel = torch::stable::new_zeros(grad_out, shape);
+   Tensor grad_rel = at::zeros({rel_rows, emb}, grad_out.options());
    if(flat_src.numel() == 0 || rel_rows == 0) {
       return grad_rel;
    }
 
-#if defined(RELM_RELMP_HAS_CUDA) && RELM_RELMP_HAS_CUDA
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
    if(grad_out.is_cuda() && flat_src.is_cuda() && dst_idx.is_cuda()
       && is_fastpath_dtype(dtype_of(grad_out))) {
       return fanin_reduce_sum_backward_cuda(grad_out, flat_src, dst_idx, rel_rows);
@@ -581,33 +538,74 @@ Tensor fanin_reduce_sum_backward(
       Tensor dst_work = ensure_contiguous(dst_idx);
       const int64_t num_edges = src_work.size(0);
 
-      if(dtype_of(grad_out_work) == aoti_torch_dtype_float32()) {
+      if(dtype_of(grad_out_work) == at::kFloat) {
          fanin_reduce_sum_backward_cpu_kernel< float >(
-            grad_out_work.const_data_ptr< float >(),
-            src_work.const_data_ptr< int64_t >(),
-            dst_work.const_data_ptr< int64_t >(),
+            grad_out_work.data_ptr< float >(),
+            src_work.data_ptr< int64_t >(),
+            dst_work.data_ptr< int64_t >(),
             num_edges,
             rel_rows,
             grad_out_work.size(0),
             emb,
-            grad_rel.mutable_data_ptr< float >()
+            grad_rel.data_ptr< float >()
          );
          return grad_rel;
       }
       fanin_reduce_sum_backward_cpu_kernel< double >(
-         grad_out_work.const_data_ptr< double >(),
-         src_work.const_data_ptr< int64_t >(),
-         dst_work.const_data_ptr< int64_t >(),
+         grad_out_work.data_ptr< double >(),
+         src_work.data_ptr< int64_t >(),
+         dst_work.data_ptr< int64_t >(),
          num_edges,
          rel_rows,
          grad_out_work.size(0),
          emb,
-         grad_rel.mutable_data_ptr< double >()
+         grad_rel.data_ptr< double >()
       );
       return grad_rel;
    }
 
    return fanin_reduce_sum_backward_fallback(grad_out, flat_src, dst_idx, rel_rows);
+}
+
+Tensor fanin_reduce_logsumexp_backward(
+   const Tensor& grad_out,
+   const Tensor& rel_flat,
+   const Tensor& flat_src,
+   const Tensor& dst_idx,
+   const Tensor& out,
+   int64_t rel_rows
+)
+{
+   check_rank(grad_out, 2, "grad_out");
+   check_rank(rel_flat, 2, "rel_flat");
+   check_int64_index(flat_src, "flat_src");
+   check_int64_index(dst_idx, "dst_idx");
+   check_rank(out, 2, "out");
+
+   TORCH_CHECK(flat_src.size(0) == dst_idx.size(0), "flat_src and dst_idx must have equal length.");
+   TORCH_CHECK(rel_flat.size(1) == grad_out.size(1), "rel_flat and grad_out must share embedding dim.");
+   TORCH_CHECK(out.size(0) == grad_out.size(0), "out and grad_out must share dim_size.");
+   TORCH_CHECK(out.size(1) == grad_out.size(1), "out and grad_out must share embedding dim.");
+   TORCH_CHECK(rel_rows >= 0, "rel_rows must be >= 0.");
+
+   const int64_t emb = grad_out.size(1);
+   Tensor grad_rel = at::zeros({rel_rows, emb}, rel_flat.options());
+   if(flat_src.numel() == 0 || rel_rows == 0) {
+      return grad_rel;
+   }
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(grad_out.is_cuda() && rel_flat.is_cuda() && flat_src.is_cuda() && dst_idx.is_cuda()
+      && out.is_cuda() && is_fastpath_dtype(dtype_of(grad_out))) {
+      return fanin_reduce_logsumexp_backward_cuda(
+         grad_out, rel_flat, flat_src, dst_idx, out, rel_rows
+      );
+   }
+#endif
+
+   return fanin_reduce_logsumexp_backward_fallback(
+      grad_out, rel_flat, flat_src, dst_idx, out, rel_rows
+   );
 }
 
 Tensor fanin_reduce(
@@ -621,10 +619,8 @@ Tensor fanin_reduce(
    check_rank(rel_flat, 2, "rel_flat");
    check_int64_index(flat_src, "flat_src");
    check_int64_index(dst_idx, "dst_idx");
-   STD_TORCH_CHECK(
-      flat_src.size(0) == dst_idx.size(0), "flat_src and dst_idx must have equal length."
-   );
-   STD_TORCH_CHECK(dim_size >= 0, "dim_size must be >= 0.");
+   TORCH_CHECK(flat_src.size(0) == dst_idx.size(0), "flat_src and dst_idx must have equal length.");
+   TORCH_CHECK(dim_size >= 0, "dim_size must be >= 0.");
 
    if(mode == kModeSum) {
       return fanin_reduce_sum(rel_flat, flat_src, dst_idx, dim_size);
@@ -637,37 +633,39 @@ Tensor fanin_reduce(
 
 std::string build_info()
 {
-   return std::string("build_torch=") + RELM_RELMP_BUILD_TORCH_VERSION + ";build_cuda_tag="
-          + RELM_RELMP_BUILD_CUDA_TAG + ";stable_abi_target=" + RELM_RELMP_STABLE_ABI_TARGET;
+   return std::string("build_torch=") + RELM_MP_BUILD_TORCH_VERSION + ";build_cuda_tag="
+          + RELM_MP_BUILD_CUDA_TAG + ";abi_target=" + RELM_MP_ABI_TARGET + ";abi_lane="
+          + RELM_MP_ABI_LANE;
 }
 
-}  // namespace relm::relmp
+}  // namespace relm::mp
 
-STABLE_TORCH_LIBRARY(relm_relmp, m)
+TORCH_LIBRARY(relm_mp, m)
 {
    m.def(
       "fanout_scatter(Tensor x_cat, Tensor src_global_idx, Tensor flat_dst, int out_rows) -> Tensor"
    );
    m.def(
-      "fanout_scatter_backward(Tensor grad_out, Tensor src_global_idx, Tensor flat_dst, int "
-      "x_rows) -> Tensor"
+      "fanout_scatter_backward(Tensor grad_out, Tensor src_global_idx, Tensor flat_dst, int x_rows) -> Tensor"
    );
    m.def(
-      "fanin_reduce(Tensor rel_flat, Tensor flat_src, Tensor dst_idx, int dim_size, int mode) -> "
-      "Tensor"
+      "fanin_reduce(Tensor rel_flat, Tensor flat_src, Tensor dst_idx, int dim_size, int mode) -> Tensor"
    );
    m.def(
-      "fanin_reduce_sum_backward(Tensor grad_out, Tensor flat_src, Tensor dst_idx, int rel_rows) "
-      "-> Tensor"
+      "fanin_reduce_sum_backward(Tensor grad_out, Tensor flat_src, Tensor dst_idx, int rel_rows) -> Tensor"
+   );
+   m.def(
+      "fanin_reduce_logsumexp_backward(Tensor grad_out, Tensor rel_flat, Tensor flat_src, Tensor dst_idx, Tensor out, int rel_rows) -> Tensor"
    );
    m.def("build_info() -> str");
 }
 
-STABLE_TORCH_LIBRARY_IMPL(relm_relmp, CompositeImplicitAutograd, m)
+TORCH_LIBRARY_IMPL(relm_mp, CompositeImplicitAutograd, m)
 {
-   m.impl("fanout_scatter", TORCH_BOX(relm::relmp::fanout_scatter));
-   m.impl("fanout_scatter_backward", TORCH_BOX(relm::relmp::fanout_scatter_backward));
-   m.impl("fanin_reduce", TORCH_BOX(relm::relmp::fanin_reduce));
-   m.impl("fanin_reduce_sum_backward", TORCH_BOX(relm::relmp::fanin_reduce_sum_backward));
-   m.impl("build_info", TORCH_BOX(relm::relmp::build_info));
+   m.impl("fanout_scatter", relm::mp::fanout_scatter);
+   m.impl("fanout_scatter_backward", relm::mp::fanout_scatter_backward);
+   m.impl("fanin_reduce", relm::mp::fanin_reduce);
+   m.impl("fanin_reduce_sum_backward", relm::mp::fanin_reduce_sum_backward);
+   m.impl("fanin_reduce_logsumexp_backward", relm::mp::fanin_reduce_logsumexp_backward);
+   m.impl("build_info", relm::mp::build_info);
 }

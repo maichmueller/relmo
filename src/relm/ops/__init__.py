@@ -1,5 +1,5 @@
 """relm custom operator wrappers."""
 
-from . import relmp
+from . import mp
 
-__all__ = ["relmp"]
+__all__ = ["mp"]

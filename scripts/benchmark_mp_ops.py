@@ -28,6 +28,7 @@ class BenchRow:
     case: str
     op: str
     pass_kind: str
+    timing_mode: str
     impl: str
     mean_ms: float
     median_ms: float
@@ -74,14 +75,33 @@ def _bench(
     fn: Callable[[], Any],
     *,
     device: torch.device,
+    timer_backend: str,
     warmup: int,
     repeats: int,
     inner_iters: int,
 ) -> list[float]:
+    if timer_backend == "cuda_event" and device.type != "cuda":
+        raise ValueError("cuda_event timer backend requires a CUDA device.")
     inner_iters = max(1, int(inner_iters))
     for _ in range(max(0, warmup)):
         _ = fn()
         _sync_if_cuda(device)
+
+    if timer_backend == "cuda_event":
+        durations_ms: list[float] = []
+        for _ in range(max(1, repeats)):
+            _sync_if_cuda(device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            last = None
+            for __ in range(inner_iters):
+                last = fn()
+            _ = last
+            end.record()
+            end.synchronize()
+            durations_ms.append(start.elapsed_time(end) / inner_iters)
+        return durations_ms
 
     durations_ms: list[float] = []
     for _ in range(max(1, repeats)):
@@ -102,6 +122,7 @@ def _summarize(
     case: str,
     op: str,
     pass_kind: str,
+    timing_mode: str,
     impl: str,
     durations_ms: list[float],
 ) -> BenchRow:
@@ -109,6 +130,7 @@ def _summarize(
         case=case,
         op=op,
         pass_kind=pass_kind,
+        timing_mode=timing_mode,
         impl=impl,
         mean_ms=statistics.fmean(durations_ms),
         median_ms=statistics.median(durations_ms),
@@ -164,7 +186,7 @@ def _fanin_python(
     raise ValueError(f"Unsupported mode: {mode!r}")
 
 
-def _import_relmp(import_mode: str) -> Any:
+def _import_mp(import_mode: str) -> Any:
     if import_mode == "source":
         root = Path(__file__).resolve().parents[1]
         src = root / "src"
@@ -173,15 +195,15 @@ def _import_relmp(import_mode: str) -> Any:
     elif import_mode != "installed":
         raise ValueError(f"Unsupported import mode: {import_mode!r}")
 
-    from relm.ops import relmp
+    from relm.ops import mp
 
-    return relmp
+    return mp
 
 
 def _sample_inputs(
     spec: CaseSpec, device: torch.device, dtype: torch.dtype
 ) -> dict[str, torch.Tensor]:
-    g = torch.Generator()
+    g = torch.Generator(device=device) if device.type == "cuda" else torch.Generator()
     g.manual_seed(0)
     x_cat = torch.randn(
         spec.n_symbols, spec.emb, device=device, dtype=dtype, generator=g
@@ -230,7 +252,7 @@ def _sample_inputs(
 
 
 def _make_forward_fn(
-    op: str, impl: str, relmp: Any, data: dict[str, torch.Tensor], spec: CaseSpec
+    op: str, impl: str, mp: Any, data: dict[str, torch.Tensor], spec: CaseSpec
 ):
     if op == "fanout":
         if impl == "python":
@@ -240,7 +262,7 @@ def _make_forward_fn(
                 data["flat_dst"],
                 spec.total_slots,
             )
-        return lambda: relmp.fanout_scatter(
+        return lambda: mp.fanout_scatter(
             data["x_cat"], data["src_global_idx"], data["flat_dst"], spec.total_slots
         )
 
@@ -249,13 +271,13 @@ def _make_forward_fn(
         return lambda: _fanin_python(
             data["rel_flat"], data["flat_src"], data["dst_idx"], spec.dst_dim_size, mode
         )
-    return lambda: relmp.fanin_reduce(
+    return lambda: mp.fanin_reduce(
         data["rel_flat"], data["flat_src"], data["dst_idx"], spec.dst_dim_size, mode
     )
 
 
 def _make_forward_backward_fn(
-    op: str, impl: str, relmp: Any, data: dict[str, torch.Tensor], spec: CaseSpec
+    op: str, impl: str, mp: Any, data: dict[str, torch.Tensor], spec: CaseSpec
 ):
     if op == "fanout":
 
@@ -266,7 +288,7 @@ def _make_forward_backward_fn(
                     x, data["src_global_idx"], data["flat_dst"], spec.total_slots
                 )
             else:
-                out = relmp.fanout_scatter(
+                out = mp.fanout_scatter(
                     x, data["src_global_idx"], data["flat_dst"], spec.total_slots
                 )
             out.sum().backward()
@@ -283,7 +305,7 @@ def _make_forward_backward_fn(
                 x, data["flat_src"], data["dst_idx"], spec.dst_dim_size, mode
             )
         else:
-            out = relmp.fanin_reduce(
+            out = mp.fanin_reduce(
                 x, data["flat_src"], data["dst_idx"], spec.dst_dim_size, mode
             )
         out.sum().backward()
@@ -292,13 +314,218 @@ def _make_forward_backward_fn(
     return _run
 
 
+def _fanout_backward_ref(
+    grad_out: torch.Tensor,
+    src_global_idx: torch.Tensor,
+    flat_dst: torch.Tensor,
+    x_rows: int,
+) -> torch.Tensor:
+    grad_x = grad_out.new_zeros((int(x_rows), int(grad_out.size(-1))))
+    if src_global_idx.numel() == 0 or int(x_rows) == 0:
+        return grad_x
+    gathered = grad_out.index_select(0, flat_dst)
+    grad_x.index_add_(0, src_global_idx, gathered)
+    return grad_x
+
+
+def _fanin_sum_backward_ref(
+    grad_out: torch.Tensor,
+    flat_src: torch.Tensor,
+    dst_idx: torch.Tensor,
+    rel_rows: int,
+) -> torch.Tensor:
+    grad_rel = grad_out.new_zeros((int(rel_rows), int(grad_out.size(-1))))
+    if flat_src.numel() == 0 or int(rel_rows) == 0:
+        return grad_rel
+    gathered = grad_out.index_select(0, dst_idx)
+    grad_rel.index_add_(0, flat_src, gathered)
+    return grad_rel
+
+
+def _fanin_logsumexp_backward_ref(
+    grad_out: torch.Tensor,
+    rel_flat: torch.Tensor,
+    flat_src: torch.Tensor,
+    dst_idx: torch.Tensor,
+    out: torch.Tensor,
+    rel_rows: int,
+) -> torch.Tensor:
+    grad_rel = grad_out.new_zeros((int(rel_rows), int(grad_out.size(-1))))
+    if flat_src.numel() == 0 or int(rel_rows) == 0:
+        return grad_rel
+    msgs = rel_flat.index_select(0, flat_src)
+    out_sel = out.index_select(0, dst_idx)
+    grad_sel = grad_out.index_select(0, dst_idx)
+    weights = (msgs - out_sel).exp()
+    grad_rel.index_add_(0, flat_src, grad_sel * weights)
+    return grad_rel
+
+
+def _resolve_custom_namespace() -> Any:
+    required = (
+        "fanout_scatter",
+        "fanout_scatter_backward",
+        "fanin_reduce",
+        "fanin_reduce_sum_backward",
+        "fanin_reduce_logsumexp_backward",
+        "build_info",
+    )
+    for name in ("relm_mp", "relm_relmp"):
+        namespace = getattr(torch.ops, name, None)
+        if namespace is None:
+            continue
+        if all(hasattr(namespace, op_name) for op_name in required):
+            return namespace
+    raise RuntimeError("Custom mp op namespace not found in torch.ops.")
+
+
+def _make_kernel_only_forward_backward_fn(
+    op: str, impl: str, mp: Any, data: dict[str, torch.Tensor], spec: CaseSpec
+):
+    if op == "fanout":
+        grad_out = torch.randn(
+            spec.total_slots,
+            spec.emb,
+            device=data["x_cat"].device,
+            dtype=data["x_cat"].dtype,
+        )
+        x_rows = int(data["x_cat"].size(0))
+        custom_ns = _resolve_custom_namespace() if impl == "custom" else None
+
+        @torch.no_grad()
+        def _run() -> torch.Tensor:
+            _ = (
+                _fanout_python(
+                    data["x_cat"], data["src_global_idx"], data["flat_dst"], spec.total_slots
+                )
+                if impl == "python"
+                else mp.fanout_scatter(
+                    data["x_cat"], data["src_global_idx"], data["flat_dst"], spec.total_slots
+                )
+            )
+            if impl == "python":
+                return _fanout_backward_ref(
+                    grad_out, data["src_global_idx"], data["flat_dst"], x_rows
+                )
+            assert custom_ns is not None
+            return custom_ns.fanout_scatter_backward(
+                grad_out, data["src_global_idx"], data["flat_dst"], x_rows
+            )
+
+        return _run
+
+    if op == "fanin_sum":
+        grad_out = torch.randn(
+            spec.dst_dim_size,
+            spec.emb,
+            device=data["rel_flat"].device,
+            dtype=data["rel_flat"].dtype,
+        )
+        rel_rows = int(data["rel_flat"].size(0))
+        custom_ns = _resolve_custom_namespace() if impl == "custom" else None
+
+        @torch.no_grad()
+        def _run() -> torch.Tensor:
+            _ = (
+                _fanin_python(
+                    data["rel_flat"],
+                    data["flat_src"],
+                    data["dst_idx"],
+                    spec.dst_dim_size,
+                    0,
+                )
+                if impl == "python"
+                else mp.fanin_reduce(
+                    data["rel_flat"],
+                    data["flat_src"],
+                    data["dst_idx"],
+                    spec.dst_dim_size,
+                    0,
+                )
+            )
+            if impl == "python":
+                return _fanin_sum_backward_ref(
+                    grad_out, data["flat_src"], data["dst_idx"], rel_rows
+                )
+            assert custom_ns is not None
+            return custom_ns.fanin_reduce_sum_backward(
+                grad_out, data["flat_src"], data["dst_idx"], rel_rows
+            )
+
+        return _run
+
+    if op == "fanin_logsumexp":
+        grad_out = torch.randn(
+            spec.dst_dim_size,
+            spec.emb,
+            device=data["rel_flat"].device,
+            dtype=data["rel_flat"].dtype,
+        )
+        rel_rows = int(data["rel_flat"].size(0))
+        custom_ns = _resolve_custom_namespace() if impl == "custom" else None
+
+        @torch.no_grad()
+        def _run() -> torch.Tensor:
+            out = (
+                _fanin_python(
+                    data["rel_flat"],
+                    data["flat_src"],
+                    data["dst_idx"],
+                    spec.dst_dim_size,
+                    1,
+                )
+                if impl == "python"
+                else mp.fanin_reduce(
+                    data["rel_flat"],
+                    data["flat_src"],
+                    data["dst_idx"],
+                    spec.dst_dim_size,
+                    1,
+                )
+            )
+            if impl == "python":
+                return _fanin_logsumexp_backward_ref(
+                    grad_out,
+                    data["rel_flat"],
+                    data["flat_src"],
+                    data["dst_idx"],
+                    out,
+                    rel_rows,
+                )
+            assert custom_ns is not None
+            return custom_ns.fanin_reduce_logsumexp_backward(
+                grad_out,
+                data["rel_flat"],
+                data["flat_src"],
+                data["dst_idx"],
+                out,
+                rel_rows,
+            )
+
+        return _run
+
+    raise NotImplementedError(
+        "kernel_only forward_backward is only implemented for fanout, fanin_sum, and fanin_logsumexp."
+    )
+
+
+def _resolve_timer_backend(timer: str, device: torch.device) -> str:
+    if timer == "auto":
+        return "cuda_event" if device.type == "cuda" else "wall"
+    if timer == "cuda_event" and device.type != "cuda":
+        raise ValueError("timer=cuda_event requires --device cuda.")
+    return timer
+
+
 def _compute_speedups(rows: list[BenchRow]) -> None:
-    key_to_python: dict[tuple[str, str, str], float] = {}
+    key_to_python: dict[tuple[str, str, str, str], float] = {}
     for row in rows:
         if row.impl == "python":
-            key_to_python[(row.case, row.op, row.pass_kind)] = row.median_ms
+            key_to_python[(row.case, row.op, row.pass_kind, row.timing_mode)] = (
+                row.median_ms
+            )
     for row in rows:
-        base = key_to_python.get((row.case, row.op, row.pass_kind))
+        base = key_to_python.get((row.case, row.op, row.pass_kind, row.timing_mode))
         if base is None or row.median_ms <= 0:
             row.speedup_vs_python = None
         else:
@@ -309,7 +536,7 @@ def _print_rows(rows: list[BenchRow]) -> None:
     if not rows:
         return
     print(
-        "case     op            pass        impl      mean_ms   median_ms  "
+        "case     op            pass        mode         impl      mean_ms   median_ms  "
         "stdev_ms  speedup_vs_python"
     )
     for row in rows:
@@ -319,7 +546,7 @@ def _print_rows(rows: list[BenchRow]) -> None:
             else "    n/a"
         )
         print(
-            f"{row.case:<8} {row.op:<13} {row.pass_kind:<11} {row.impl:<9} "
+            f"{row.case:<8} {row.op:<13} {row.pass_kind:<11} {row.timing_mode:<12} {row.impl:<9} "
             f"{row.mean_ms:>8.4f}  {row.median_ms:>9.4f}  {row.stdev_ms:>8.4f}  {speed}"
         )
 
@@ -327,7 +554,7 @@ def _print_rows(rows: list[BenchRow]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark stable-ABI relmp custom ops vs Python references for fanout/fanin."
+            "Benchmark mp custom ops vs Python references for fanout/fanin."
         )
     )
     parser.add_argument(
@@ -363,18 +590,29 @@ def main() -> None:
         default="forward,forward_backward",
         help="Comma-separated passes: forward,forward_backward",
     )
+    parser.add_argument(
+        "--timing-modes",
+        default="end_to_end,kernel_only",
+        help="Comma-separated timing modes: end_to_end,kernel_only",
+    )
+    parser.add_argument(
+        "--timer",
+        choices=("auto", "wall", "cuda_event"),
+        default="auto",
+        help="Benchmark timer backend. auto uses CUDA events on CUDA, wall clock otherwise.",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=80)
     parser.add_argument("--inner-iters", type=int, default=5)
     parser.add_argument(
         "--require-custom",
         action="store_true",
-        help="Fail if custom relmp ops are not available.",
+        help="Fail if custom mp ops are not available.",
     )
     parser.add_argument("--json-out", type=str, default="")
     args = parser.parse_args()
 
-    relmp = _import_relmp(args.import_mode)
+    mp = _import_mp(args.import_mode)
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -399,18 +637,21 @@ def main() -> None:
     except Exception:
         pass
 
-    os.environ["RELM_RELMP_ENABLE"] = "1"
-    os.environ["RELM_RELMP_FALLBACK"] = "error"
-    custom_available = bool(relmp.available())
+    os.environ["RELM_MP_ENABLE"] = "1"
+    os.environ["RELM_MP_FALLBACK"] = "error"
+    custom_available = bool(mp.available())
     if args.require_custom and not custom_available:
         raise RuntimeError(
-            "Custom relmp ops are unavailable in this environment. "
-            "Use torch>=2.10 and build with RELM_RELMP_OPS enabled."
+            "Custom mp ops are unavailable in this environment. "
+            "Build with RELM_MP_OPS enabled."
         )
 
     requested_cases = [x.strip().lower() for x in args.cases.split(",") if x.strip()]
     requested_ops = [x.strip().lower() for x in args.ops.split(",") if x.strip()]
     requested_passes = [x.strip().lower() for x in args.passes.split(",") if x.strip()]
+    requested_timing_modes = [
+        x.strip().lower() for x in args.timing_modes.split(",") if x.strip()
+    ]
 
     for case_name in requested_cases:
         if case_name not in CASES:
@@ -421,10 +662,16 @@ def main() -> None:
     for pass_kind in requested_passes:
         if pass_kind not in {"forward", "forward_backward"}:
             raise ValueError(f"Unknown pass kind {pass_kind!r}.")
+    for timing_mode in requested_timing_modes:
+        if timing_mode not in {"end_to_end", "kernel_only"}:
+            raise ValueError(f"Unknown timing mode {timing_mode!r}.")
+
+    timer_backend = _resolve_timer_backend(args.timer, device)
 
     print(
-        f"Benchmarking relm relmp on device={device}, dtype={dtype}, "
-        f"torch={torch.__version__}, custom_available={custom_available}"
+        f"Benchmarking relm mp on device={device}, dtype={dtype}, "
+        f"torch={torch.__version__}, custom_available={custom_available}, "
+        f"timer_backend={timer_backend}"
     )
 
     rows: list[BenchRow] = []
@@ -436,27 +683,42 @@ def main() -> None:
 
         for op in requested_ops:
             for pass_kind in requested_passes:
-                for impl in impls:
-                    if pass_kind == "forward":
-                        fn = _make_forward_fn(op, impl, relmp, data, spec)
-                    else:
-                        fn = _make_forward_backward_fn(op, impl, relmp, data, spec)
-                    durations = _bench(
-                        fn,
-                        device=device,
-                        warmup=args.warmup,
-                        repeats=args.repeats,
-                        inner_iters=args.inner_iters,
-                    )
-                    rows.append(
-                        _summarize(
-                            case=case_name,
-                            op=op,
-                            pass_kind=pass_kind,
-                            impl=impl,
-                            durations_ms=durations,
+                for timing_mode in requested_timing_modes:
+                    for impl in impls:
+                        try:
+                            if pass_kind == "forward":
+                                fn = _make_forward_fn(op, impl, mp, data, spec)
+                            elif timing_mode == "end_to_end":
+                                fn = _make_forward_backward_fn(op, impl, mp, data, spec)
+                            else:
+                                fn = _make_kernel_only_forward_backward_fn(
+                                    op, impl, mp, data, spec
+                                )
+                        except NotImplementedError as exc:
+                            print(
+                                f"Skipping case={case_name} op={op} pass={pass_kind} "
+                                f"mode={timing_mode} impl={impl}: {exc}"
+                            )
+                            continue
+
+                        durations = _bench(
+                            fn,
+                            device=device,
+                            timer_backend=timer_backend,
+                            warmup=args.warmup,
+                            repeats=args.repeats,
+                            inner_iters=args.inner_iters,
                         )
-                    )
+                        rows.append(
+                            _summarize(
+                                case=case_name,
+                                op=op,
+                                pass_kind=pass_kind,
+                                timing_mode=timing_mode,
+                                impl=impl,
+                                durations_ms=durations,
+                            )
+                        )
 
     _compute_speedups(rows)
     _print_rows(rows)
@@ -474,6 +736,8 @@ def main() -> None:
                 "cases": requested_cases,
                 "ops": requested_ops,
                 "passes": requested_passes,
+                "timing_modes": requested_timing_modes,
+                "timer_backend": timer_backend,
                 "warmup": args.warmup,
                 "repeats": args.repeats,
                 "inner_iters": args.inner_iters,

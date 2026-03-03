@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from relm.ops import relmp
+from relm.ops import mp
 
 
 def _fanout_ref(
@@ -51,20 +51,20 @@ def _fanin_ref(
 
 @pytest.mark.parametrize("mode", [0, 1])
 def test_python_fallback_path(mode: int, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "0")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "python")
+    monkeypatch.setenv("RELM_MP_ENABLE", "0")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "python")
 
     x_cat = torch.randn(6, 3, dtype=torch.float32)
     src_global_idx = torch.tensor([0, 4, 1], dtype=torch.int64)
     flat_dst = torch.tensor([3, 0, 1], dtype=torch.int64)
-    out = relmp.fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows=5)
+    out = mp.fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows=5)
     ref = _fanout_ref(x_cat, src_global_idx, flat_dst, out_rows=5)
     assert torch.allclose(out, ref)
 
     rel_flat = torch.randn(8, 3, dtype=torch.float32)
     flat_src = torch.tensor([0, 2, 4, 1], dtype=torch.int64)
     dst_idx = torch.tensor([2, 0, 1, 0], dtype=torch.int64)
-    out = relmp.fanin_reduce(rel_flat, flat_src, dst_idx, dim_size=4, mode=mode)
+    out = mp.fanin_reduce(rel_flat, flat_src, dst_idx, dim_size=4, mode=mode)
     ref = _fanin_ref(rel_flat, flat_src, dst_idx, dim_size=4, mode=mode)
     assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5, equal_nan=True)
 
@@ -73,16 +73,16 @@ def test_python_fallback_path(mode: int, monkeypatch: pytest.MonkeyPatch) -> Non
     "device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 )
 def test_fanout_scatter_parity(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    if not relmp.available():
-        pytest.skip("relmp custom ops are not available in this build.")
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "1")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "error")
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
 
     x_cat = torch.randn(7, 5, device=device, dtype=torch.float32, requires_grad=True)
     src_global_idx = torch.tensor([0, 3, 5, 2, 3], dtype=torch.int64, device=device)
     flat_dst = torch.tensor([4, 1, 0, 2, 3], dtype=torch.int64, device=device)
 
-    out = relmp.fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows=6)
+    out = mp.fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows=6)
     ref = _fanout_ref(x_cat, src_global_idx, flat_dst, out_rows=6)
     assert torch.allclose(out, ref)
 
@@ -93,17 +93,17 @@ def test_fanout_scatter_parity(device: str, monkeypatch: pytest.MonkeyPatch) -> 
 def test_fanout_scatter_grad_parity(
     device: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if not relmp.available():
-        pytest.skip("relmp custom ops are not available in this build.")
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "1")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "error")
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
 
     x0 = torch.randn(8, 4, device=device, dtype=torch.float32, requires_grad=True)
     x1 = x0.detach().clone().requires_grad_(True)
     src_global_idx = torch.tensor([0, 5, 2, 6], dtype=torch.int64, device=device)
     flat_dst = torch.tensor([1, 0, 3, 2], dtype=torch.int64, device=device)
 
-    out = relmp.fanout_scatter(x0, src_global_idx, flat_dst, out_rows=5)
+    out = mp.fanout_scatter(x0, src_global_idx, flat_dst, out_rows=5)
     ref = _fanout_ref(x1, src_global_idx, flat_dst, out_rows=5)
     out.sum().backward()
     ref.sum().backward()
@@ -117,10 +117,10 @@ def test_fanout_scatter_grad_parity(
 def test_fanin_reduce_parity(
     mode: int, device: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if not relmp.available():
-        pytest.skip("relmp custom ops are not available in this build.")
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "1")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "error")
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
 
     rel_flat = torch.randn(
         10, 4, device=device, dtype=torch.float32, requires_grad=True
@@ -128,7 +128,7 @@ def test_fanin_reduce_parity(
     flat_src = torch.tensor([0, 2, 7, 5, 2, 1], dtype=torch.int64, device=device)
     dst_idx = torch.tensor([1, 0, 2, 2, 1, 0], dtype=torch.int64, device=device)
 
-    out = relmp.fanin_reduce(rel_flat, flat_src, dst_idx, dim_size=4, mode=mode)
+    out = mp.fanin_reduce(rel_flat, flat_src, dst_idx, dim_size=4, mode=mode)
     ref = _fanin_ref(rel_flat, flat_src, dst_idx, dim_size=4, mode=mode)
     assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5, equal_nan=True)
 
@@ -140,10 +140,10 @@ def test_fanin_reduce_parity(
 def test_fanin_reduce_grad_parity(
     mode: int, device: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if not relmp.available():
-        pytest.skip("relmp custom ops are not available in this build.")
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "1")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "error")
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
 
     rel_flat0 = torch.randn(
         12, 3, device=device, dtype=torch.float32, requires_grad=True
@@ -152,7 +152,7 @@ def test_fanin_reduce_grad_parity(
     flat_src = torch.tensor([0, 1, 8, 4, 9, 10], dtype=torch.int64, device=device)
     dst_idx = torch.tensor([2, 0, 1, 1, 0, 2], dtype=torch.int64, device=device)
 
-    out = relmp.fanin_reduce(rel_flat0, flat_src, dst_idx, dim_size=5, mode=mode)
+    out = mp.fanin_reduce(rel_flat0, flat_src, dst_idx, dim_size=5, mode=mode)
     ref = _fanin_ref(rel_flat1, flat_src, dst_idx, dim_size=5, mode=mode)
 
     out.sum().backward()
@@ -165,48 +165,64 @@ def test_fanin_reduce_grad_parity(
 def test_fanout_scatter_noncontiguous_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not relmp.available():
-        pytest.skip("relmp custom ops are not available in this build.")
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "1")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "error")
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
 
     base = torch.randn(4, 6, dtype=torch.float32, requires_grad=True)
     x_cat = base.transpose(0, 1)  # non-contiguous [6, 4]
     src_global_idx = torch.tensor([0, 4, 2, 5], dtype=torch.int64)
     flat_dst = torch.tensor([2, 1, 0, 3], dtype=torch.int64)
 
-    out = relmp.fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows=5)
+    out = mp.fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows=5)
     ref = _fanout_ref(x_cat, src_global_idx, flat_dst, out_rows=5)
     assert torch.allclose(out, ref)
 
 
 def test_fanout_scatter_gradcheck(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not relmp.available():
-        pytest.skip("relmp custom ops are not available in this build.")
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "1")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "error")
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
 
     x_cat = torch.randn(6, 3, dtype=torch.double, requires_grad=True)
     src_global_idx = torch.tensor([0, 5, 2, 1], dtype=torch.int64)
     flat_dst = torch.tensor([1, 0, 3, 2], dtype=torch.int64)
 
     def fn(inp: torch.Tensor) -> torch.Tensor:
-        return relmp.fanout_scatter(inp, src_global_idx, flat_dst, out_rows=5)
+        return mp.fanout_scatter(inp, src_global_idx, flat_dst, out_rows=5)
 
     assert torch.autograd.gradcheck(fn, (x_cat,), eps=1e-6, atol=1e-4, rtol=1e-3)
 
 
 def test_fanin_reduce_sum_gradcheck(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not relmp.available():
-        pytest.skip("relmp custom ops are not available in this build.")
-    monkeypatch.setenv("RELM_RELMP_ENABLE", "1")
-    monkeypatch.setenv("RELM_RELMP_FALLBACK", "error")
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
 
     rel_flat = torch.randn(8, 4, dtype=torch.double, requires_grad=True)
     flat_src = torch.tensor([0, 2, 5, 7, 1], dtype=torch.int64)
     dst_idx = torch.tensor([1, 0, 3, 2, 0], dtype=torch.int64)
 
     def fn(inp: torch.Tensor) -> torch.Tensor:
-        return relmp.fanin_reduce(inp, flat_src, dst_idx, dim_size=5, mode=0)
+        return mp.fanin_reduce(inp, flat_src, dst_idx, dim_size=5, mode=0)
+
+    assert torch.autograd.gradcheck(fn, (rel_flat,), eps=1e-6, atol=1e-4, rtol=1e-3)
+
+
+def test_fanin_reduce_logsumexp_gradcheck(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not mp.available():
+        pytest.skip("mp custom ops are not available in this build.")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
+
+    rel_flat = torch.randn(8, 4, dtype=torch.double, requires_grad=True)
+    flat_src = torch.tensor([0, 2, 5, 7, 1, 3], dtype=torch.int64)
+    dst_idx = torch.tensor([1, 0, 3, 2, 0, 1], dtype=torch.int64)
+
+    def fn(inp: torch.Tensor) -> torch.Tensor:
+        return mp.fanin_reduce(inp, flat_src, dst_idx, dim_size=4, mode=1)
 
     assert torch.autograd.gradcheck(fn, (rel_flat,), eps=1e-6, atol=1e-4, rtol=1e-3)
