@@ -841,30 +841,64 @@ class LGANRelationalGNN(RelationalGNN):
             **kwargs,
         )
         self._relation_type_ids = tuple(str(k) for k in self.relation_dict.keys())
-        self.tn_relations_to_symbols_mp = FanInMP(
-            embedding_size=self.embedding_size,
-            dst_types=self.symbol_type_ids,
-            src_types=self._relation_type_ids,
-            edge_labels=(self.lgan_tn_edge_pos,),
-            aggr=aggr,
-            strict_filter_mode=self.strict_ntype_filter,
-        )
-        self.nn_relations_to_symbols_mp = FanInMP(
-            embedding_size=self.embedding_size,
-            dst_types=self.symbol_type_ids,
-            src_types=self._relation_type_ids,
-            edge_labels=(self.lgan_nn_edge_pos,),
-            aggr=aggr,
-            strict_filter_mode=self.strict_ntype_filter,
-        )
-        self.rr_relations_to_relations_mp = FanInMP(
-            embedding_size=self.embedding_size,
-            dst_types=self._relation_type_ids,
-            src_types=self._relation_type_ids,
-            edge_labels=(self.lgan_rr_edge_pos,),
-            aggr=aggr,
-            strict_filter_mode=self.strict_ntype_filter,
-        )
+        if self.rel_layer_mode == "batched_cached":
+            from .hetero_mp import BatchedFanInMP
+
+            self.tn_relations_to_symbols_mp = BatchedFanInMP(
+                embedding_size=self.embedding_size,
+                dst_types=self.symbol_type_ids,
+                relation_arities=self.relation_dict,
+                src_types=self._relation_type_ids,
+                edge_labels=(self.lgan_tn_edge_pos,),
+                aggr=aggr,
+                strict_filter_mode=self.strict_ntype_filter,
+                validate_routing=self.rel_validate_routing,
+            )
+            self.nn_relations_to_symbols_mp = BatchedFanInMP(
+                embedding_size=self.embedding_size,
+                dst_types=self.symbol_type_ids,
+                relation_arities=self.relation_dict,
+                src_types=self._relation_type_ids,
+                edge_labels=(self.lgan_nn_edge_pos,),
+                aggr=aggr,
+                strict_filter_mode=self.strict_ntype_filter,
+                validate_routing=self.rel_validate_routing,
+            )
+            self.rr_relations_to_relations_mp = BatchedFanInMP(
+                embedding_size=self.embedding_size,
+                dst_types=self._relation_type_ids,
+                relation_arities=self.relation_dict,
+                src_types=self._relation_type_ids,
+                edge_labels=(self.lgan_rr_edge_pos,),
+                aggr=aggr,
+                strict_filter_mode=self.strict_ntype_filter,
+                validate_routing=self.rel_validate_routing,
+            )
+        else:
+            self.tn_relations_to_symbols_mp = FanInMP(
+                embedding_size=self.embedding_size,
+                dst_types=self.symbol_type_ids,
+                src_types=self._relation_type_ids,
+                edge_labels=(self.lgan_tn_edge_pos,),
+                aggr=aggr,
+                strict_filter_mode=self.strict_ntype_filter,
+            )
+            self.nn_relations_to_symbols_mp = FanInMP(
+                embedding_size=self.embedding_size,
+                dst_types=self.symbol_type_ids,
+                src_types=self._relation_type_ids,
+                edge_labels=(self.lgan_nn_edge_pos,),
+                aggr=aggr,
+                strict_filter_mode=self.strict_ntype_filter,
+            )
+            self.rr_relations_to_relations_mp = FanInMP(
+                embedding_size=self.embedding_size,
+                dst_types=self._relation_type_ids,
+                src_types=self._relation_type_ids,
+                edge_labels=(self.lgan_rr_edge_pos,),
+                aggr=aggr,
+                strict_filter_mode=self.strict_ntype_filter,
+            )
         self.fusion_updater = SimpleMLP(
             in_size=3 * embedding_size,
             embedding_size=2 * embedding_size,
@@ -969,13 +1003,22 @@ class LGANRelationalGNN(RelationalGNN):
                 f"x_dict_keys={sorted(x_dict.keys())}."
             )
 
+        cache = None
+        if self.rel_layer_mode == "batched_cached":
+            if extra is None:
+                extra = {}
+            cache = extra.setdefault("rel_batched_cache", {})
+
         # Phase 1: standard positional symbol->relation updates.
         standard_edges = {
             edge_type: edge_index
             for edge_type, edge_index in edge_index_dict.items()
             if str(edge_type[1]).isdigit()
         }
-        atom_msgs = self.symbols_to_relations_mp(x_dict, standard_edges)
+        if self.rel_layer_mode == "batched_cached":
+            atom_msgs = self.symbols_to_relations_mp(x_dict, standard_edges, cache=cache)
+        else:
+            atom_msgs = self.symbols_to_relations_mp(x_dict, standard_edges)
         x_dict.update(atom_msgs)
 
         # Phase 2: relation-pair embedding pooling.
@@ -993,7 +1036,12 @@ class LGANRelationalGNN(RelationalGNN):
             edge_label=self.lgan_rr_edge_pos,
             relation_to_relation=True,
         )
-        rr_msgs_dict = self.rr_relations_to_relations_mp(relation_pair_x, rr_edges)
+        if self.rel_layer_mode == "batched_cached":
+            rr_msgs_dict = self.rr_relations_to_relations_mp(
+                relation_pair_x, rr_edges, cache=cache
+            )
+        else:
+            rr_msgs_dict = self.rr_relations_to_relations_mp(relation_pair_x, rr_edges)
         for rel_type, rel_prev in relation_pair_x.items():
             rr_msg = rr_msgs_dict.get(rel_type)
             if rr_msg is not None:
@@ -1008,7 +1056,10 @@ class LGANRelationalGNN(RelationalGNN):
         symbol_aggr_x = dict(relation_pair_x)
         for symbol_ntype_id in symbol_ntype_ids:
             symbol_aggr_x[symbol_ntype_id] = x_dict[symbol_ntype_id]
-        tn_msgs_dict = self.tn_relations_to_symbols_mp(symbol_aggr_x, tn_edges)
+        if self.rel_layer_mode == "batched_cached":
+            tn_msgs_dict = self.tn_relations_to_symbols_mp(symbol_aggr_x, tn_edges, cache=cache)
+        else:
+            tn_msgs_dict = self.tn_relations_to_symbols_mp(symbol_aggr_x, tn_edges)
 
         # Phase 5: AGGR_n over NN edges (relation->symbol).
         nn_edges = self._filter_directional_edges(
@@ -1016,7 +1067,10 @@ class LGANRelationalGNN(RelationalGNN):
             edge_label=self.lgan_nn_edge_pos,
             relation_to_relation=False,
         )
-        nn_msgs_dict = self.nn_relations_to_symbols_mp(symbol_aggr_x, nn_edges)
+        if self.rel_layer_mode == "batched_cached":
+            nn_msgs_dict = self.nn_relations_to_symbols_mp(symbol_aggr_x, nn_edges, cache=cache)
+        else:
+            nn_msgs_dict = self.nn_relations_to_symbols_mp(symbol_aggr_x, nn_edges)
 
         # Phase 6: fuse and residual-update symbols.
         for symbol_ntype_id in symbol_ntype_ids:
