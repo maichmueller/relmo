@@ -1,0 +1,32 @@
+nanobind_test.egg-info
+_skbuild
+/dist
+__pycache__
+build
+*.pyd
+*.egg-info
+*.so
+*.dylib
+.vscode
+.vs
+
+.idea/
+
+build_editable/
+
+temp_loki
+
+temp_valla
+
+cmake-build-*
+build-*
+build_*
+!build_backend.py
+!docs/development/build-and-test.md
+**/*.pyi
+
+# MkDocs build output
+/site/
+
+# Generated snippet include fragments (CI artifact, not committed)
+/docs/_includes/

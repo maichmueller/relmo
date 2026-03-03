@@ -1,0 +1,39 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.12.0",
+  "cmake>=3.24",
+  "ninja>=1.11",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "relm"
+version = "0.1.0"
+description = "Relational model ops with C++/CUDA custom kernels and Python fallbacks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "relm contributors" }]
+dependencies = [
+  "torch>=2.10",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+wheel.packages = ["src/relm"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake]
+source-dir = "."
+build-type = "Release"
+
+[tool.scikit-build.cmake.define]
+RELM_RPATH_MODE = "dev"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
