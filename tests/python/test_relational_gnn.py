@@ -5,6 +5,7 @@ import torch
 
 from relm.models import LGANRelationalGNN, RelationalGNN
 from relm.models.hetero_mp import BatchedFanInMP, FanInMP
+from relm.ops import mp as mp_ops
 
 from ._graph_fixtures import add_lgan_edges, build_relation_graph, clone_graph
 
@@ -31,7 +32,19 @@ def _run_backward(model: torch.nn.Module, x_dict, edge_index_dict) -> dict[str, 
     }
 
 
-def test_lgan_relational_gnn_with_custom_label_ported() -> None:
+def _to_device(
+    x_dict: dict[str, torch.Tensor],
+    edge_index_dict: dict[tuple[str, str, str], torch.Tensor],
+    *,
+    device: torch.device,
+) -> tuple[dict[str, torch.Tensor], dict[tuple[str, str, str], torch.Tensor]]:
+    return (
+        {k: v.to(device=device) for k, v in x_dict.items()},
+        {k: v.to(device=device) for k, v in edge_index_dict.items()},
+    )
+
+
+def test_lgan_relational_gnn_with_custom_label() -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     custom_tn = "custom_tn"
@@ -72,7 +85,7 @@ def test_lgan_relational_gnn_with_custom_label_ported() -> None:
     assert tuple(out[symbol_type].shape) == (x_dict[symbol_type].size(0), 8)
 
 
-def test_lgan_relational_gnn_default_labels_ported() -> None:
+def test_lgan_relational_gnn_default_labels() -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
@@ -160,7 +173,10 @@ def test_lgan_relational_gnn_batched_uses_batched_label_fanin_modules() -> None:
     assert isinstance(model_modular.rr_relations_to_relations_mp, FanInMP)
 
 
-def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients() -> None:
+@pytest.mark.parametrize("aggr", ["sum", "logsumexp"])
+def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients(
+    aggr: str,
+) -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
@@ -173,7 +189,7 @@ def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients() -
     modular = RelationalGNN(
         embedding_size=8,
         num_layer=2,
-        aggr="sum",
+        aggr=aggr,
         symbol_type_ids=symbol_type,
         relation_dict=relation_dict,
         rel_layer_mode="modular",
@@ -182,7 +198,7 @@ def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients() -
     batched = RelationalGNN(
         embedding_size=8,
         num_layer=2,
-        aggr="sum",
+        aggr=aggr,
         symbol_type_ids=symbol_type,
         relation_dict=relation_dict,
         rel_layer_mode="batched_cached",
@@ -202,7 +218,10 @@ def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients() -
     assert _nonzero_grads(batched) > 0
 
 
-def test_lgan_relational_gnn_batched_cached_matches_modular_forward_and_gradients() -> None:
+@pytest.mark.parametrize("aggr", ["sum"])
+def test_lgan_relational_gnn_batched_cached_matches_modular_forward_and_gradients(
+    aggr: str,
+) -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
@@ -221,7 +240,7 @@ def test_lgan_relational_gnn_batched_cached_matches_modular_forward_and_gradient
     modular = LGANRelationalGNN(
         embedding_size=8,
         num_layer=2,
-        aggr="sum",
+        aggr=aggr,
         symbol_type_ids=symbol_type,
         relation_dict=relation_dict,
         rel_layer_mode="modular",
@@ -230,7 +249,7 @@ def test_lgan_relational_gnn_batched_cached_matches_modular_forward_and_gradient
     batched = LGANRelationalGNN(
         embedding_size=8,
         num_layer=2,
-        aggr="sum",
+        aggr=aggr,
         symbol_type_ids=symbol_type,
         relation_dict=relation_dict,
         rel_layer_mode="batched_cached",
@@ -248,3 +267,174 @@ def test_lgan_relational_gnn_batched_cached_matches_modular_forward_and_gradient
         assert torch.allclose(grad_mod[name], grad_bat[name], atol=1e-6, rtol=1e-5), name
     assert _nonzero_grads(modular) > 0
     assert _nonzero_grads(batched) > 0
+
+
+def test_lgan_relational_gnn_batched_cached_rejects_logsumexp_string() -> None:
+    with pytest.raises(ValueError, match="Could not resolve 'logsumexp'"):
+        LGANRelationalGNN(
+            embedding_size=8,
+            num_layer=1,
+            aggr="logsumexp",
+            symbol_type_ids="_symbol_",
+            relation_dict={"rel_a": 2, "rel_b": 1},
+            rel_layer_mode="batched_cached",
+        )
+
+
+def test_relational_gnn_batched_cached_schema_churn_matches_fresh_model() -> None:
+    relation_dict = {"rel_a": 2, "rel_b": 1}
+    symbol_type = "_symbol_"
+    x_a, e_a = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+        relation_sizes={"rel_a": 4, "rel_b": 2},
+        num_symbols=6,
+    )
+    x_b, e_b = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+        relation_sizes={"rel_a": 2, "rel_b": 5},
+        num_symbols=5,
+    )
+
+    torch.manual_seed(123)
+    model_a_then_b = RelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        rel_layer_mode="batched_cached",
+    )
+    model_b_only = RelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        rel_layer_mode="batched_cached",
+    )
+    model_b_only.load_state_dict(model_a_then_b.state_dict(), strict=True)
+
+    model_a_then_b(*clone_graph(x_a, e_a))
+    out_after_churn, _ = model_a_then_b(*clone_graph(x_b, e_b))
+    out_fresh, _ = model_b_only(*clone_graph(x_b, e_b))
+
+    assert torch.allclose(
+        out_after_churn[symbol_type], out_fresh[symbol_type], atol=1e-6, rtol=1e-5
+    )
+
+
+def test_lgan_relational_gnn_batched_cached_schema_churn_matches_fresh_model() -> None:
+    relation_dict = {"rel_a": 2, "rel_b": 1}
+    symbol_type = "_symbol_"
+    x_a, e_a = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+        relation_sizes={"rel_a": 4, "rel_b": 2},
+        num_symbols=6,
+    )
+    add_lgan_edges(
+        x_dict=x_a,
+        edge_index_dict=e_a,
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+    )
+    x_b, e_b = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+        relation_sizes={"rel_a": 2, "rel_b": 5},
+        num_symbols=5,
+    )
+    add_lgan_edges(
+        x_dict=x_b,
+        edge_index_dict=e_b,
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+    )
+
+    torch.manual_seed(123)
+    model_a_then_b = LGANRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        rel_layer_mode="batched_cached",
+    )
+    model_b_only = LGANRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        rel_layer_mode="batched_cached",
+    )
+    model_b_only.load_state_dict(model_a_then_b.state_dict(), strict=True)
+
+    model_a_then_b(*clone_graph(x_a, e_a))
+    out_after_churn, _ = model_a_then_b(*clone_graph(x_b, e_b))
+    out_fresh, _ = model_b_only(*clone_graph(x_b, e_b))
+
+    assert torch.allclose(
+        out_after_churn[symbol_type], out_fresh[symbol_type], atol=1e-6, rtol=1e-5
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only model parity check.")
+def test_relational_gnn_batched_cached_cuda_custom_ops_matches_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not mp_ops.available():
+        pytest.skip("mp custom ops are not available in this environment.")
+
+    relation_dict = {"rel_a": 2, "rel_b": 1}
+    symbol_type = "_symbol_"
+    x_dict_cpu, edge_index_cpu = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+        relation_sizes={"rel_a": 5, "rel_b": 4},
+        num_symbols=7,
+    )
+    x_dict, edge_index_dict = _to_device(
+        x_dict_cpu, edge_index_cpu, device=torch.device("cuda")
+    )
+
+    torch.manual_seed(7)
+    model_python = RelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        rel_layer_mode="batched_cached",
+    ).cuda()
+    model_custom = RelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        rel_layer_mode="batched_cached",
+    ).cuda()
+    model_custom.load_state_dict(model_python.state_dict(), strict=True)
+
+    monkeypatch.setenv("RELM_MODELS_MP_OPS", "0")
+    out_py, _ = model_python(*clone_graph(x_dict, edge_index_dict))
+    grad_py = _run_backward(model_python, *clone_graph(x_dict, edge_index_dict))
+
+    monkeypatch.setenv("RELM_MODELS_MP_OPS", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_LOGSUMEXP", "0")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
+    out_custom, _ = model_custom(*clone_graph(x_dict, edge_index_dict))
+    grad_custom = _run_backward(model_custom, *clone_graph(x_dict, edge_index_dict))
+
+    assert torch.allclose(
+        out_py[symbol_type], out_custom[symbol_type], atol=1e-6, rtol=1e-5
+    )
+    assert set(grad_py.keys()) == set(grad_custom.keys())
+    for name in grad_py:
+        assert torch.allclose(grad_py[name], grad_custom[name], atol=1e-6, rtol=1e-5), name

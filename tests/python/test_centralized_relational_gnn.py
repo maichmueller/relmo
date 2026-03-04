@@ -6,6 +6,7 @@ import torch
 from relm.models import ArityMLPFactory, CentralizedRelationalGNN
 from relm.models.film import CentralFiLMFactory, FiLMConcatMLP, FiLMConcatResMLP
 from relm.models.hetero_mp import CentralFanOutMP
+from relm.ops import mp as mp_ops
 from relm.models.relational_gnn import (
     BoundedValueHead,
     CentralRelationModule,
@@ -60,7 +61,49 @@ def _build_relation_dict() -> dict[str, int]:
     return {"relA": 1, "relB": 2}
 
 
-def test_central_fanout_batches_single_call_condition_pre_ported() -> None:
+def _run_backward(model: torch.nn.Module, x_dict, edge_index_dict) -> dict[str, torch.Tensor]:
+    out, _ = model(x_dict, edge_index_dict)
+    loss = torch.stack([value.square().mean() for value in out.values()]).sum()
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    return {
+        name: param.grad.detach().clone()
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    }
+
+
+def _modular_to_fused_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    prefix_map = (
+        ("symbols_to_relations_mp.", "central_fused_layer_mp."),
+        ("relations_to_symbols_mp.", "central_fused_layer_mp."),
+    )
+    for key, value in state_dict.items():
+        mapped_key = key
+        for old_prefix, new_prefix in prefix_map:
+            if key.startswith(old_prefix):
+                mapped_key = new_prefix + key[len(old_prefix) :]
+                break
+        out[mapped_key] = value
+    return out
+
+
+def _to_device(
+    x_dict: dict[str, torch.Tensor],
+    edge_index_dict: dict[tuple[str, str, str], torch.Tensor],
+    *,
+    device: torch.device,
+) -> tuple[dict[str, torch.Tensor], dict[tuple[str, str, str], torch.Tensor]]:
+    return (
+        {k: v.to(device=device) for k, v in x_dict.items()},
+        {k: v.to(device=device) for k, v in edge_index_dict.items()},
+    )
+
+
+def test_central_fanout_batches_single_call_condition_pre() -> None:
     embedding_size = 2
     cond_dim = 2
     relation_arities = {"relA": 1, "relB": 2}
@@ -97,7 +140,7 @@ def test_central_fanout_batches_single_call_condition_pre_ported() -> None:
     assert torch.allclose(central.last_input[1, :cond_dim], condition.weight[1])
 
 
-def test_central_fanout_condition_post_ported() -> None:
+def test_central_fanout_condition_post() -> None:
     embedding_size = 2
     cond_dim = 2
     relation_arities = {"relA": 1, "relB": 2}
@@ -130,7 +173,7 @@ def test_central_fanout_condition_post_ported() -> None:
     assert torch.allclose(central.last_input[1, -cond_dim:], condition.weight[1])
 
 
-def test_central_fanout_raises_on_mismatched_max_arity_ported() -> None:
+def test_central_fanout_raises_on_mismatched_max_arity() -> None:
     with pytest.raises(ValueError):
         CentralFanOutMP(
             central_module=_CountingModule(out_size=2),
@@ -145,7 +188,7 @@ def test_central_fanout_raises_on_mismatched_max_arity_ported() -> None:
         )
 
 
-def test_central_relation_module_pads_and_truncates_ported() -> None:
+def test_central_relation_module_pads_and_truncates() -> None:
     capture = _CaptureModule()
     condition = torch.nn.Embedding(1, 1)
     with torch.no_grad():
@@ -167,7 +210,7 @@ def test_central_relation_module_pads_and_truncates_ported() -> None:
     assert capture.last_input.shape == (1, 5)
 
 
-def test_central_relation_module_rejects_oversize_input_ported() -> None:
+def test_central_relation_module_rejects_oversize_input() -> None:
     module = CentralRelationModule(
         central_module=torch.nn.Identity(),
         condition_embedding=torch.nn.Embedding(1, 1),
@@ -181,7 +224,7 @@ def test_central_relation_module_rejects_oversize_input_ported() -> None:
         module(torch.zeros((1, 3)))
 
 
-def test_centralized_rgnn_rejects_conflicting_central_args_ported() -> None:
+def test_centralized_rgnn_rejects_conflicting_central_args() -> None:
     with pytest.raises(ValueError):
         CentralizedRelationalGNN(
             embedding_size=2,
@@ -194,7 +237,7 @@ def test_centralized_rgnn_rejects_conflicting_central_args_ported() -> None:
         )
 
 
-def test_centralized_rgnn_rejects_invalid_condition_dim_ported() -> None:
+def test_centralized_rgnn_rejects_invalid_condition_dim() -> None:
     with pytest.raises(ValueError):
         CentralizedRelationalGNN(
             embedding_size=2,
@@ -206,7 +249,7 @@ def test_centralized_rgnn_rejects_invalid_condition_dim_ported() -> None:
         )
 
 
-def test_centralized_rgnn_condition_embedding_can_be_static_ported() -> None:
+def test_centralized_rgnn_condition_embedding_can_be_static() -> None:
     model = CentralizedRelationalGNN(
         embedding_size=2,
         num_layer=1,
@@ -218,7 +261,7 @@ def test_centralized_rgnn_condition_embedding_can_be_static_ported() -> None:
     assert model.relation_condition_embedding.weight.requires_grad is False
 
 
-def test_centralized_rgnn_default_central_module_types_ported() -> None:
+def test_centralized_rgnn_default_central_module_types() -> None:
     model_residual = CentralizedRelationalGNN(
         embedding_size=2,
         num_layer=1,
@@ -240,7 +283,7 @@ def test_centralized_rgnn_default_central_module_types_ported() -> None:
     assert isinstance(model_plain.central_module, FiLMConcatMLP)
 
 
-def test_centralized_rgnn_uses_relation_module_factory_alias_ported() -> None:
+def test_centralized_rgnn_uses_relation_module_factory_alias() -> None:
     calls: list[int] = []
 
     def factory(max_arity):
@@ -258,7 +301,7 @@ def test_centralized_rgnn_uses_relation_module_factory_alias_ported() -> None:
     assert calls == [2]
 
 
-def test_centralized_rgnn_resolves_central_module_factories_ported() -> None:
+def test_centralized_rgnn_resolves_central_module_factories() -> None:
     calls: list[tuple] = []
 
     def factory_one(max_arity):
@@ -303,7 +346,7 @@ def test_centralized_rgnn_resolves_central_module_factories_ported() -> None:
     assert calls[2] == ("three", 4, 2, 2)
 
 
-def test_centralized_rgnn_single_central_call_ported() -> None:
+def test_centralized_rgnn_single_central_call() -> None:
     relation_dict = _build_relation_dict()
     embedding_size = 2
     cond_dim = 2
@@ -390,7 +433,152 @@ def test_centralized_relational_gnn_static_condition_embedding_stays_grad_free()
     assert model.relation_condition_embedding.weight.grad is None
 
 
-def test_centralized_rgnn_uses_arity_factory_ported() -> None:
+@pytest.mark.parametrize("aggr", ["sum", "logsumexp"])
+def test_centralized_relational_gnn_fused_matches_modular_forward_and_gradients(
+    aggr: str,
+) -> None:
+    relation_dict = {"relA": 1, "relB": 2}
+    x_dict, edge_index_dict = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type="obj",
+        relation_sizes={"relA": 4, "relB": 3},
+        num_symbols=6,
+    )
+
+    torch.manual_seed(0)
+    modular = CentralizedRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr=aggr,
+        symbol_type_ids="obj",
+        relation_dict=relation_dict,
+        central_layer_mode="modular",
+        central_slot_mask=False,
+    )
+    torch.manual_seed(0)
+    fused = CentralizedRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr=aggr,
+        symbol_type_ids="obj",
+        relation_dict=relation_dict,
+        central_layer_mode="fused",
+        central_slot_mask=False,
+    )
+    fused.load_state_dict(_modular_to_fused_state_dict(modular.state_dict()), strict=True)
+
+    out_mod, _ = modular(*clone_graph(x_dict, edge_index_dict))
+    out_fused, _ = fused(*clone_graph(x_dict, edge_index_dict))
+    assert torch.allclose(out_mod["obj"], out_fused["obj"], atol=1e-6, rtol=1e-5)
+
+    grad_mod = _run_backward(modular, *clone_graph(x_dict, edge_index_dict))
+    grad_fused = _run_backward(fused, *clone_graph(x_dict, edge_index_dict))
+    assert set(grad_mod.keys()) == set(grad_fused.keys())
+    for name in grad_mod:
+        assert torch.allclose(grad_mod[name], grad_fused[name], atol=1e-6, rtol=1e-5), name
+
+
+def test_centralized_relational_gnn_fused_schema_churn_matches_fresh_model() -> None:
+    relation_dict = {"relA": 1, "relB": 2}
+    x_a, e_a = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type="obj",
+        relation_sizes={"relA": 4, "relB": 2},
+        num_symbols=6,
+    )
+    x_b, e_b = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type="obj",
+        relation_sizes={"relA": 2, "relB": 5},
+        num_symbols=5,
+    )
+
+    torch.manual_seed(99)
+    model_a_then_b = CentralizedRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids="obj",
+        relation_dict=relation_dict,
+        central_layer_mode="fused",
+        central_slot_mask=False,
+    )
+    model_b_only = CentralizedRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids="obj",
+        relation_dict=relation_dict,
+        central_layer_mode="fused",
+        central_slot_mask=False,
+    )
+    model_b_only.load_state_dict(model_a_then_b.state_dict(), strict=True)
+
+    model_a_then_b(*clone_graph(x_a, e_a))
+    out_after_churn, _ = model_a_then_b(*clone_graph(x_b, e_b))
+    out_fresh, _ = model_b_only(*clone_graph(x_b, e_b))
+    assert torch.allclose(out_after_churn["obj"], out_fresh["obj"], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only model parity check.")
+def test_centralized_relational_gnn_fused_cuda_custom_ops_matches_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not mp_ops.available():
+        pytest.skip("mp custom ops are not available in this environment.")
+
+    relation_dict = {"relA": 1, "relB": 2}
+    x_dict_cpu, edge_index_cpu = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type="obj",
+        relation_sizes={"relA": 5, "relB": 4},
+        num_symbols=7,
+    )
+    x_dict, edge_index_dict = _to_device(
+        x_dict_cpu, edge_index_cpu, device=torch.device("cuda")
+    )
+
+    torch.manual_seed(11)
+    model_python = CentralizedRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids="obj",
+        relation_dict=relation_dict,
+        central_layer_mode="fused",
+        central_slot_mask=False,
+    ).cuda()
+    model_custom = CentralizedRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr="sum",
+        symbol_type_ids="obj",
+        relation_dict=relation_dict,
+        central_layer_mode="fused",
+        central_slot_mask=False,
+    ).cuda()
+    model_custom.load_state_dict(model_python.state_dict(), strict=True)
+
+    monkeypatch.setenv("RELM_MODELS_MP_OPS", "0")
+    out_py, _ = model_python(*clone_graph(x_dict, edge_index_dict))
+    grad_py = _run_backward(model_python, *clone_graph(x_dict, edge_index_dict))
+
+    monkeypatch.setenv("RELM_MODELS_MP_OPS", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN_FUSED", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_LOGSUMEXP", "0")
+    monkeypatch.setenv("RELM_MP_ENABLE", "1")
+    monkeypatch.setenv("RELM_MP_FALLBACK", "error")
+    out_custom, _ = model_custom(*clone_graph(x_dict, edge_index_dict))
+    grad_custom = _run_backward(model_custom, *clone_graph(x_dict, edge_index_dict))
+
+    assert torch.allclose(out_py["obj"], out_custom["obj"], atol=1e-6, rtol=1e-5)
+    assert set(grad_py.keys()) == set(grad_custom.keys())
+    for name in grad_py:
+        assert torch.allclose(grad_py[name], grad_custom[name], atol=1e-6, rtol=1e-5), name
+
+
+def test_centralized_rgnn_uses_arity_factory() -> None:
     factory = ArityMLPFactory(feature_size=2, layers=1)
     model = CentralizedRelationalGNN(
         embedding_size=2,
@@ -404,7 +592,7 @@ def test_centralized_rgnn_uses_arity_factory_ported() -> None:
     assert isinstance(model.central_module, torch.nn.Module)
 
 
-def test_centralized_rgnn_accepts_central_film_factory_with_mask_ported() -> None:
+def test_centralized_rgnn_accepts_central_film_factory_with_mask() -> None:
     factory = CentralFiLMFactory(layers=["x2"])
     model = CentralizedRelationalGNN(
         embedding_size=2,
@@ -422,7 +610,7 @@ def test_centralized_rgnn_accepts_central_film_factory_with_mask_ported() -> Non
     assert model.central_module.condition_position == "post"
 
 
-def test_centralized_rgnn_default_zero_arity_module_ported() -> None:
+def test_centralized_rgnn_default_zero_arity_module() -> None:
     model = CentralizedRelationalGNN(
         embedding_size=2,
         num_layer=1,
@@ -433,7 +621,7 @@ def test_centralized_rgnn_default_zero_arity_module_ported() -> None:
     assert isinstance(model.central_module, ZeroOut)
 
 
-def test_bounded_value_head_unbounded_path_ported() -> None:
+def test_bounded_value_head_unbounded_path() -> None:
     value_net = torch.nn.Linear(1, 1)
     with torch.no_grad():
         value_net.weight.fill_(2.0)
@@ -443,7 +631,7 @@ def test_bounded_value_head_unbounded_path_ported() -> None:
     assert torch.allclose(head(x), value_net(x))
 
 
-def test_bounded_value_head_bounded_path_ported() -> None:
+def test_bounded_value_head_bounded_path() -> None:
     value_net = torch.nn.Linear(1, 1)
     with torch.no_grad():
         value_net.weight.fill_(0.0)

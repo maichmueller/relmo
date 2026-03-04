@@ -42,12 +42,12 @@ def _manual_fanin_sum(
     return out
 
 
-def test_hetero_routing_unknown_aggr_keeps_string_ported() -> None:
+def test_hetero_routing_unknown_aggr_keeps_string() -> None:
     routing = _DummyRouting(aggr="not_an_aggr")
     assert routing.aggr == "not_an_aggr"
 
 
-def test_hetero_routing_forward_src_equals_dst_uses_tensor_ported() -> None:
+def test_hetero_routing_forward_src_equals_dst_uses_tensor() -> None:
     routing = _DummyRouting(aggr="stack")
     x_dict = {"node": torch.zeros((2, 1))}
     edge_index_dict = {("node", "0", "node"): torch.tensor([[0], [1]])}
@@ -55,7 +55,7 @@ def test_hetero_routing_forward_src_equals_dst_uses_tensor_ported() -> None:
     assert isinstance(routing.last_x, torch.Tensor)
 
 
-def test_hetero_routing_forward_missing_x_raises_ported() -> None:
+def test_hetero_routing_forward_missing_x_raises() -> None:
     routing = _DummyRouting(aggr="stack")
     edge_index_dict = {("src", "0", "dst"): torch.tensor([[0], [1]])}
     try:
@@ -65,20 +65,20 @@ def test_hetero_routing_forward_missing_x_raises_ported() -> None:
     raise AssertionError("Expected KeyError for missing src and dst node types.")
 
 
-def test_hetero_routing_group_output_aggregation_ported() -> None:
+def test_hetero_routing_group_output_aggregation() -> None:
     routing = _DummyRouting(aggr=SumAggregation())
     out = routing._group_output({"dst": [torch.ones((2, 3)), torch.zeros((2, 3))]})
     assert out["dst"].shape == (2, 3)
     assert torch.allclose(out["dst"], torch.ones((2, 3)))
 
 
-def test_hetero_routing_group_output_cat_ported() -> None:
+def test_hetero_routing_group_output_cat() -> None:
     routing = _DummyRouting(aggr="cat")
     out = routing._group_output({"dst": [torch.ones((2, 1)), torch.zeros((2, 1))]})
     assert out["dst"].shape == (2, 2)
 
 
-def test_select_mp_hidden2_ported() -> None:
+def test_select_mp_hidden2() -> None:
     hidden = 2
     selector = SelectMP(hidden)
     aggr = SumAggregation()
