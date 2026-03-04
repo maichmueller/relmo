@@ -425,8 +425,7 @@ def test_relational_gnn_batched_cached_cuda_custom_ops_matches_python(
 
     monkeypatch.setenv("RELM_MODELS_MP_OPS", "1")
     monkeypatch.setenv("RELM_MODELS_MP_FANIN", "1")
-    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED", "1")
-    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_TRAINING", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", "1")
     monkeypatch.setenv("RELM_MODELS_MP_LOGSUMEXP", "0")
     monkeypatch.setenv("RELM_MP_ENABLE", "1")
     monkeypatch.setenv("RELM_MP_FALLBACK", "error")

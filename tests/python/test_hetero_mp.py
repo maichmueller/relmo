@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch_geometric.nn import SumAggregation
 
-from relm.models.hetero_mp import FanInMP, HeteroRouting, SelectMP
+import relm.models.hetero_mp.batched as batched_impl
+import relm.models.hetero_mp._scatter as scatter_impl
+from relm.models.hetero_mp import (
+    BatchedFanInMP,
+    BatchedFanOutMP,
+    FanInMP,
+    HeteroRouting,
+    SelectMP,
+)
 
 
 class _DummyRouting(HeteroRouting):
@@ -142,3 +151,205 @@ def test_fanin_positional_matches_manual_and_gradients() -> None:
     assert torch.allclose(
         relation_x_tst.grad, relation_x_ref.grad, atol=1e-6, rtol=1e-5
     )
+
+
+def test_batched_fanin_uses_pyg_path_even_when_custom_flag_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RaisingOps:
+        @staticmethod
+        def fanin_reduce(*_args, **_kwargs):
+            raise AssertionError("decentralized BatchedFanInMP should not call custom kernels")
+
+    monkeypatch.setattr(batched_impl, "relm_mp_ops", _RaisingOps())
+    monkeypatch.setenv("RELM_MODELS_MP_OPS", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN", "1")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", "0")
+
+    embedding_size = 2
+    mp = BatchedFanInMP(
+        embedding_size=embedding_size,
+        dst_types=("obj",),
+        relation_arities={"rel": 2},
+        aggr="sum",
+        strict_filter_mode=True,
+    )
+    rel_x = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.5, 0.0], [2.0, 1.0, -3.0, 2.0]]
+    )
+    obj_x = torch.zeros((4, embedding_size))
+    edge_pos0 = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long)
+    edge_pos1 = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    edge_index_dict = {
+        ("rel", "0", "obj"): edge_pos0,
+        ("rel", "1", "obj"): edge_pos1,
+    }
+
+    out = mp({"rel": rel_x, "obj": obj_x}, edge_index_dict)["obj"]
+    ref = _manual_fanin_sum(
+        rel_x,
+        edge_pos0,
+        edge_pos1,
+        embedding_size=embedding_size,
+        dim_size=obj_x.size(0),
+    )
+    assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5)
+
+
+def test_batched_fanin_experimental_flag_uses_custom_kernel_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CountingOps:
+        calls = 0
+
+        @staticmethod
+        def fanin_reduce(rel_flat, flat_src, dst_idx, dim_size, mode):
+            _CountingOps.calls += 1
+            assert int(mode) == 0
+            out = rel_flat.new_zeros((int(dim_size), int(rel_flat.size(1))))
+            if int(flat_src.numel()) > 0 and int(dim_size) > 0:
+                msgs = rel_flat.index_select(0, flat_src)
+                out.index_add_(0, dst_idx, msgs)
+            return out
+
+    monkeypatch.setattr(batched_impl, "relm_mp_ops", _CountingOps())
+    monkeypatch.setattr(batched_impl, "_use_model_mp_fanin", lambda _ref: True)
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", "1")
+
+    embedding_size = 2
+    mp = BatchedFanInMP(
+        embedding_size=embedding_size,
+        dst_types=("obj",),
+        relation_arities={"rel": 2},
+        aggr="sum",
+        strict_filter_mode=True,
+    )
+    rel_x = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.5, 0.0], [2.0, 1.0, -3.0, 2.0]]
+    )
+    obj_x = torch.zeros((4, embedding_size))
+    edge_pos0 = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long)
+    edge_pos1 = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    edge_index_dict = {
+        ("rel", "0", "obj"): edge_pos0,
+        ("rel", "1", "obj"): edge_pos1,
+    }
+
+    out = mp({"rel": rel_x, "obj": obj_x}, edge_index_dict)["obj"]
+    ref = _manual_fanin_sum(
+        rel_x,
+        edge_pos0,
+        edge_pos1,
+        embedding_size=embedding_size,
+        dim_size=obj_x.size(0),
+    )
+    assert _CountingOps.calls > 0
+    assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5)
+
+
+def test_batched_fanin_pack_only_path_skips_reduce_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _PackOnlyOps:
+        pack_calls = 0
+        reduce_calls = 0
+
+        @staticmethod
+        def fanin_pack_multi(rel_parts, flat_src_parts, dst_idx_parts):
+            _PackOnlyOps.pack_calls += 1
+            rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
+            src_cat = (
+                flat_src_parts[0]
+                if len(flat_src_parts) == 1
+                else torch.cat(flat_src_parts, dim=0)
+            )
+            dst_cat = (
+                dst_idx_parts[0]
+                if len(dst_idx_parts) == 1
+                else torch.cat(dst_idx_parts, dim=0)
+            )
+            return rel_cat, src_cat, dst_cat
+
+        @staticmethod
+        def fanin_reduce(*_args, **_kwargs):
+            _PackOnlyOps.reduce_calls += 1
+            raise AssertionError("pack-only path must not call fanin_reduce")
+
+    monkeypatch.setattr(batched_impl, "relm_mp_ops", _PackOnlyOps())
+    monkeypatch.setattr(batched_impl, "_use_model_mp_ops", lambda _ref: True)
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", "0")
+    monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL", "1")
+
+    embedding_size = 2
+    mp = BatchedFanInMP(
+        embedding_size=embedding_size,
+        dst_types=("obj",),
+        relation_arities={"rel": 2},
+        aggr="mean",
+        strict_filter_mode=True,
+    )
+    rel_x = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.5, 0.0], [2.0, 1.0, -3.0, 2.0]]
+    )
+    obj_x = torch.zeros((4, embedding_size))
+    edge_pos0 = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long)
+    edge_pos1 = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    edge_index_dict = {
+        ("rel", "0", "obj"): edge_pos0,
+        ("rel", "1", "obj"): edge_pos1,
+    }
+
+    out = mp({"rel": rel_x, "obj": obj_x}, edge_index_dict)["obj"]
+    ref = torch.stack(
+        [
+            rel_x[0, 0:2],
+            rel_x[0, 2:4] + rel_x[1, 0:2],
+            rel_x[1, 2:4] + rel_x[2, 0:2],
+            rel_x[2, 2:4],
+        ],
+        dim=0,
+    )
+    ref = ref / torch.tensor([[1.0], [2.0], [2.0], [1.0]])
+    assert _PackOnlyOps.pack_calls > 0
+    assert _PackOnlyOps.reduce_calls == 0
+    assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5)
+
+
+def test_batched_fanout_experimental_flag_uses_custom_kernel_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CountingOps:
+        calls = 0
+
+        @staticmethod
+        def fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows):
+            _CountingOps.calls += 1
+            out = x_cat.new_zeros((int(out_rows), int(x_cat.size(1))))
+            if int(src_global_idx.numel()) > 0 and int(out_rows) > 0:
+                vals = x_cat.index_select(0, src_global_idx)
+                out.index_copy_(0, flat_dst, vals)
+            return out
+
+    monkeypatch.setattr(batched_impl, "relm_mp_ops", _CountingOps())
+    monkeypatch.setattr(scatter_impl, "relm_mp_ops", _CountingOps())
+    monkeypatch.setattr(batched_impl, "_use_model_mp_ops", lambda _ref: True)
+    monkeypatch.setenv("RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL", "1")
+
+    mp = BatchedFanOutMP(
+        update_modules={"rel": torch.nn.Identity()},
+        relation_arities={"rel": 1},
+        embedding_size=2,
+        src_types=("obj",),
+        strict_filter_mode=True,
+    )
+    x_dict = {
+        "obj": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        "rel": torch.zeros((1, 2)),
+    }
+    edge_index_dict = {
+        ("obj", "0", "rel"): torch.tensor([[1], [0]], dtype=torch.long),
+    }
+
+    out = mp(x_dict, edge_index_dict)["rel"]
+    assert _CountingOps.calls > 0
+    assert torch.allclose(out, torch.tensor([[3.0, 4.0]]))

@@ -19,7 +19,7 @@ from ._ops_env import (
     _resolve_fanin_mode,
     _use_grouped_relation_mlp,
     _use_model_mp_fanin,
-    _use_model_mp_fanout,
+    _use_model_mp_ops,
     relm_mp_ops,
 )
 from ._scatter import (
@@ -182,7 +182,6 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                         raise AssertionError(
                             f"Fanout routing duplicates detected for src={src!r}."
                         )
-            fanout_plan = _build_fanout_scatter_plan(by_src=fanout_by_src, x_dict=x_dict)
 
             pred_exec = []
             for pred, n, arity, slot_offset in pred_meta:
@@ -195,7 +194,10 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                 "pred_exec": pred_exec,
                 "total_slots": int(total_slots),
                 "fanout_by_src": fanout_by_src,
-                "fanout_plan": fanout_plan,
+                "mp_fanout_plan": _build_fanout_scatter_plan(
+                    by_src=fanout_by_src,
+                    x_dict=x_dict,
+                ),
             }
             routing_root["fanout"] = routing
 
@@ -223,8 +225,17 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
         buffers_root = cache.setdefault("buffers", {})
         outputs: Dict[str, Tensor] = {}
         total_slots = int(routing["total_slots"])
-        publish_rel_flat = _use_model_mp_fanin(ref) and _env_bool(
-            "RELM_MODELS_MP_FANIN_BATCHED", True
+        # Experimental toggle for decentralized custom fanout/fanin benchmarking.
+        # Default remains Python/PyG path.
+        use_mp_fanout = (
+            _env_bool("RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL", False)
+            and _use_model_mp_ops(ref)
+        )
+        # Only materialize shared relation-flat handoff when fanin custom reduction lane is enabled.
+        # This avoids unnecessary writes in fanout-only/scaffold modes.
+        publish_rel_flat = bool(
+            use_mp_fanout
+            and _env_bool("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", False)
         )
         rel_flat_all: torch.Tensor | None = None
         if publish_rel_flat:
@@ -250,14 +261,23 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
             args_flat_all = ref.new_zeros((total_slots, self.embedding_size))
 
         fanout_by_src: dict[str, tuple[torch.Tensor, torch.Tensor]] = routing["fanout_by_src"]
-        if fanout_by_src and _use_model_mp_fanout(ref):
-            plan = routing.get("fanout_plan")
-            if plan is not None:
-                args_flat_all = _fanout_scatter_from_plan(
-                    plan=plan,
-                    x_dict=x_dict,
-                    out_rows=total_slots,
-                )
+        if use_mp_fanout and fanout_by_src:
+            fanout_plan = routing.get("mp_fanout_plan")
+            if fanout_plan is not None:
+                try:
+                    args_flat_all = _fanout_scatter_from_plan(
+                        plan=fanout_plan,
+                        x_dict=x_dict,
+                        out_rows=total_slots,
+                    )
+                except Exception:
+                    if self.validate_routing:
+                        raise
+                    args_flat_all = _fanout_scatter_multi_src(
+                        by_src=fanout_by_src,
+                        x_dict=x_dict,
+                        out_rows=total_slots,
+                    )
             else:
                 args_flat_all = _fanout_scatter_multi_src(
                     by_src=fanout_by_src,
@@ -615,19 +635,19 @@ class BatchedFanInMP(torch.nn.Module):
             if dst not in x_dict:
                 continue
             dim_size = int(x_dict[dst].size(0))
-            use_mp_fanin = self._mp_fanin_mode is not None and _use_model_mp_fanin(x_dict[dst])
-            use_mp_fanin = use_mp_fanin and _env_bool("RELM_MODELS_MP_FANIN_BATCHED", True)
-            # Training-first default:
-            # Batched decentralized fanin custom kernels can regress end-to-end training-step
-            # throughput depending on graph mix. Keep them enabled by default for inference
-            # and allow explicit opt-in for training via env override.
-            if self.training and not _env_bool(
-                "RELM_MODELS_MP_FANIN_BATCHED_TRAINING", False
-            ):
-                use_mp_fanin = False
+            use_mp_fanin_reduce = (
+                self._mp_fanin_mode is not None
+                and _env_bool("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", False)
+                and _use_model_mp_fanin(x_dict[dst])
+            )
+            use_mp_fanin_pack = (
+                _env_bool("RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL", False)
+                and _use_model_mp_ops(x_dict[dst])
+            )
+            use_mp_fanin = use_mp_fanin_reduce or use_mp_fanin_pack
 
             if self._label_mode:
-                if use_mp_fanin:
+                if use_mp_fanin_reduce:
                     plan = mp_fanin_label_plans.get(dst)
                     if plan is not None:
                         rel_parts: list[torch.Tensor] = []
@@ -666,7 +686,6 @@ class BatchedFanInMP(torch.nn.Module):
                 rel_parts = []
                 mp_src_parts = []
                 mp_dst_parts = []
-                src_offset = 0
                 for src, (src_idx, dst_idx) in per_src.items():
                     if src not in x_dict:
                         continue
@@ -680,24 +699,34 @@ class BatchedFanInMP(torch.nn.Module):
                         )
                     if use_mp_fanin:
                         rel_parts.append(x_src)
-                        mp_src_parts.append(src_idx + int(src_offset))
+                        mp_src_parts.append(src_idx)
                         mp_dst_parts.append(dst_idx)
-                        src_offset += int(x_src.size(0))
                     else:
                         inputs.append(x_src.index_select(0, src_idx))
                         indices.append(dst_idx)
 
                 if use_mp_fanin and rel_parts:
-                    rel_cat = _cat_or_single(rel_parts, dim=0)
-                    flat_src_all = _cat_or_single(mp_src_parts, dim=0)
-                    dst_all = _cat_or_single(mp_dst_parts, dim=0)
-                    out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
-                        rel_cat,
-                        flat_src_all,
-                        dst_all,
-                        dim_size,
-                        self._mp_fanin_mode,
+                    rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
+                        rel_parts,
+                        mp_src_parts,
+                        mp_dst_parts,
                     )
+                    if use_mp_fanin_reduce:
+                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                            rel_cat,
+                            flat_src_all,
+                            dst_all,
+                            dim_size,
+                            self._mp_fanin_mode,
+                        )
+                    else:
+                        flat_inputs = rel_cat.index_select(0, flat_src_all)
+                        out[dst] = self.aggr(
+                            x=flat_inputs,
+                            index=dst_all,
+                            dim=0,
+                            dim_size=dim_size,
+                        )
                     continue
 
                 if not inputs:
@@ -709,7 +738,7 @@ class BatchedFanInMP(torch.nn.Module):
                 out[dst] = self.aggr(x=flat_inputs, index=flat_indices, dim=0, dim_size=dim_size)
                 continue
 
-            if use_mp_fanin:
+            if use_mp_fanin_reduce:
                 global_plan = mp_fanin_global_plans.get(dst)
                 if global_plan is not None and isinstance(rel_flat_shared, torch.Tensor):
                     if (
@@ -762,7 +791,6 @@ class BatchedFanInMP(torch.nn.Module):
             rel_parts = []
             mp_src_parts = []
             mp_dst_parts = []
-            rel_offset = 0
             for pred, (flat_src, dst_idx) in per_pred.items():
                 if pred not in x_dict:
                     continue
@@ -778,24 +806,34 @@ class BatchedFanInMP(torch.nn.Module):
                 rel_flat = x_pred.view(-1, self.embedding_size)
                 if use_mp_fanin:
                     rel_parts.append(rel_flat)
-                    mp_src_parts.append(flat_src + int(rel_offset))
+                    mp_src_parts.append(flat_src)
                     mp_dst_parts.append(dst_idx)
-                    rel_offset += int(rel_flat.size(0))
                 else:
                     inputs.append(rel_flat.index_select(0, flat_src))
                     indices.append(dst_idx)
 
             if use_mp_fanin and rel_parts:
-                rel_cat = _cat_or_single(rel_parts, dim=0)
-                flat_src_all = _cat_or_single(mp_src_parts, dim=0)
-                dst_all = _cat_or_single(mp_dst_parts, dim=0)
-                out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
-                    rel_cat,
-                    flat_src_all,
-                    dst_all,
-                    dim_size,
-                    self._mp_fanin_mode,
+                rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
+                    rel_parts,
+                    mp_src_parts,
+                    mp_dst_parts,
                 )
+                if use_mp_fanin_reduce:
+                    out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                        rel_cat,
+                        flat_src_all,
+                        dst_all,
+                        dim_size,
+                        self._mp_fanin_mode,
+                    )
+                else:
+                    flat_inputs = rel_cat.index_select(0, flat_src_all)
+                    out[dst] = self.aggr(
+                        x=flat_inputs,
+                        index=dst_all,
+                        dim=0,
+                        dim_size=dim_size,
+                    )
                 continue
 
             if not inputs:

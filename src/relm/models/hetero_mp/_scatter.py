@@ -15,29 +15,21 @@ def _fanout_scatter_multi_src(
     x_dict: Mapping[str, Tensor],
     out_rows: int,
 ) -> torch.Tensor:
-    if len(by_src) == 1:
-        src, (flat_dst, src_idx) = next(iter(by_src.items()))
-        if src not in x_dict:
-            raise KeyError(f"Missing src node type {src!r} in x_dict.")
-        return relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
-            x_dict[src], src_idx, flat_dst, int(out_rows)
-        )
-
     x_parts: list[torch.Tensor] = []
+    src_parts: list[torch.Tensor] = []
     flat_parts: list[torch.Tensor] = []
-    src_global_parts: list[torch.Tensor] = []
-    offset = 0
     for src, (flat_dst, src_idx) in by_src.items():
         if src not in x_dict:
             raise KeyError(f"Missing src node type {src!r} in x_dict.")
         x_src = x_dict[src]
         x_parts.append(x_src)
+        src_parts.append(src_idx)
         flat_parts.append(flat_dst)
-        src_global_parts.append(src_idx + int(offset))
-        offset += int(x_src.size(0))
-    x_cat = _cat_or_single(x_parts, dim=0)
-    flat_dst = _cat_or_single(flat_parts, dim=0)
-    src_global = _cat_or_single(src_global_parts, dim=0)
+    x_cat, src_global, flat_dst = relm_mp_ops.fanout_pack_multi(  # type: ignore[union-attr]
+        x_parts,
+        src_parts,
+        flat_parts,
+    )
     return relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
         x_cat, src_global, flat_dst, int(out_rows)
     )

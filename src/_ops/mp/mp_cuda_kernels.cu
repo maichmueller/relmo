@@ -1,5 +1,6 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -742,6 +743,7 @@ Tensor fanout_scatter_cuda(
    int64_t out_rows
 )
 {
+   c10::cuda::CUDAGuard device_guard(x_cat.device());
    check_same_cuda_device(x_cat, src_global_idx, "x_cat", "src_global_idx");
    check_same_cuda_device(x_cat, flat_dst, "x_cat", "flat_dst");
 
@@ -772,6 +774,7 @@ Tensor fanout_scatter_backward_cuda(
    int64_t x_rows
 )
 {
+   c10::cuda::CUDAGuard device_guard(grad_out.device());
    check_same_cuda_device(grad_out, src_global_idx, "grad_out", "src_global_idx");
    check_same_cuda_device(grad_out, flat_dst, "grad_out", "flat_dst");
 
@@ -810,6 +813,7 @@ Tensor fanin_reduce_sum_cuda(
    int64_t dim_size
 )
 {
+   c10::cuda::CUDAGuard device_guard(rel_flat.device());
    check_same_cuda_device(rel_flat, flat_src, "rel_flat", "flat_src");
    check_same_cuda_device(rel_flat, dst_idx, "rel_flat", "dst_idx");
 
@@ -840,6 +844,7 @@ Tensor fanin_reduce_logsumexp_cuda(
    int64_t dim_size
 )
 {
+   c10::cuda::CUDAGuard device_guard(rel_flat.device());
    check_same_cuda_device(rel_flat, flat_src, "rel_flat", "flat_src");
    check_same_cuda_device(rel_flat, dst_idx, "rel_flat", "dst_idx");
 
@@ -912,6 +917,7 @@ Tensor fanin_reduce_sum_backward_cuda(
    int64_t rel_rows
 )
 {
+   c10::cuda::CUDAGuard device_guard(grad_out.device());
    check_same_cuda_device(grad_out, flat_src, "grad_out", "flat_src");
    check_same_cuda_device(grad_out, dst_idx, "grad_out", "dst_idx");
 
@@ -952,6 +958,7 @@ Tensor fanin_reduce_logsumexp_backward_cuda(
    int64_t rel_rows
 )
 {
+   c10::cuda::CUDAGuard device_guard(grad_out.device());
    check_same_cuda_device(grad_out, rel_flat, "grad_out", "rel_flat");
    check_same_cuda_device(grad_out, flat_src, "grad_out", "flat_src");
    check_same_cuda_device(grad_out, dst_idx, "grad_out", "dst_idx");

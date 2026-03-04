@@ -223,6 +223,16 @@ def _should_use_custom(op_name: str) -> bool:
         return False
 
 
+def _namespace_has_op(op_name: str) -> bool:
+    if torch is None:
+        return False
+    try:
+        _ensure_loaded()
+    except Exception:
+        return False
+    return hasattr(_ops_namespace(), op_name)
+
+
 def _fanout_scatter_python(
     x_cat: torch.Tensor,
     src_global_idx: torch.Tensor,
@@ -268,6 +278,82 @@ def _fanin_reduce_python(
         return exps_sum.log() + amax
 
     raise ValueError(f"Unsupported fanin mode {mode!r}. Supported: 0=sum, 1=logsumexp.")
+
+
+def _fanout_pack_multi_python(
+    x_parts: list[torch.Tensor],
+    src_idx_parts: list[torch.Tensor],
+    flat_dst_parts: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not x_parts:
+        raise ValueError("fanout_pack_multi requires at least one source tensor.")
+    if not (len(x_parts) == len(src_idx_parts) == len(flat_dst_parts)):
+        raise ValueError(
+            "fanout_pack_multi expects x_parts, src_idx_parts, and flat_dst_parts with equal lengths."
+        )
+    row_offset = 0
+    src_global_parts: list[torch.Tensor] = []
+    x_cat_parts: list[torch.Tensor] = []
+    dst_cat_parts: list[torch.Tensor] = []
+    for x, src_idx, flat_dst in zip(x_parts, src_idx_parts, flat_dst_parts):
+        if x.dim() != 2:
+            raise ValueError("fanout_pack_multi expects each source tensor to be rank-2.")
+        if src_idx.dim() != 1 or flat_dst.dim() != 1:
+            raise ValueError("fanout_pack_multi expects rank-1 source/destination index tensors.")
+        if src_idx.dtype != torch.int64 or flat_dst.dtype != torch.int64:
+            raise ValueError("fanout_pack_multi expects int64 source/destination index tensors.")
+        if src_idx.numel() != flat_dst.numel():
+            raise ValueError(
+                "fanout_pack_multi expects src_idx and flat_dst lengths to match per source."
+            )
+        x_cat_parts.append(x)
+        src_global_parts.append(src_idx + int(row_offset))
+        dst_cat_parts.append(flat_dst)
+        row_offset += int(x.size(0))
+    x_cat = x_cat_parts[0] if len(x_cat_parts) == 1 else torch.cat(x_cat_parts, dim=0)
+    src_global = (
+        src_global_parts[0]
+        if len(src_global_parts) == 1
+        else torch.cat(src_global_parts, dim=0)
+    )
+    flat_dst = dst_cat_parts[0] if len(dst_cat_parts) == 1 else torch.cat(dst_cat_parts, dim=0)
+    return x_cat, src_global, flat_dst
+
+
+def _fanin_pack_multi_python(
+    rel_parts: list[torch.Tensor],
+    flat_src_parts: list[torch.Tensor],
+    dst_idx_parts: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not rel_parts:
+        raise ValueError("fanin_pack_multi requires at least one relation tensor.")
+    if not (len(rel_parts) == len(flat_src_parts) == len(dst_idx_parts)):
+        raise ValueError(
+            "fanin_pack_multi expects rel_parts, flat_src_parts, and dst_idx_parts with equal lengths."
+        )
+    row_offset = 0
+    rel_cat_parts: list[torch.Tensor] = []
+    src_cat_parts: list[torch.Tensor] = []
+    dst_cat_parts: list[torch.Tensor] = []
+    for rel, flat_src, dst_idx in zip(rel_parts, flat_src_parts, dst_idx_parts):
+        if rel.dim() != 2:
+            raise ValueError("fanin_pack_multi expects each relation tensor to be rank-2.")
+        if flat_src.dim() != 1 or dst_idx.dim() != 1:
+            raise ValueError("fanin_pack_multi expects rank-1 source/destination index tensors.")
+        if flat_src.dtype != torch.int64 or dst_idx.dtype != torch.int64:
+            raise ValueError("fanin_pack_multi expects int64 source/destination index tensors.")
+        if flat_src.numel() != dst_idx.numel():
+            raise ValueError(
+                "fanin_pack_multi expects flat_src and dst_idx lengths to match per relation tensor."
+            )
+        rel_cat_parts.append(rel)
+        src_cat_parts.append(flat_src + int(row_offset))
+        dst_cat_parts.append(dst_idx)
+        row_offset += int(rel.size(0))
+    rel_cat = rel_cat_parts[0] if len(rel_cat_parts) == 1 else torch.cat(rel_cat_parts, dim=0)
+    flat_src = src_cat_parts[0] if len(src_cat_parts) == 1 else torch.cat(src_cat_parts, dim=0)
+    dst_idx = dst_cat_parts[0] if len(dst_cat_parts) == 1 else torch.cat(dst_cat_parts, dim=0)
+    return rel_cat, flat_src, dst_idx
 
 
 if torch is not None:
@@ -398,9 +484,57 @@ def fanin_reduce(
     return _fanin_reduce_python(rel_flat, flat_src, dst_idx, int(dim_size), mode_int)
 
 
+def fanout_pack_multi(
+    x_parts: list[torch.Tensor],
+    src_idx_parts: list[torch.Tensor],
+    flat_dst_parts: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fanout_pack_multi requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    if _should_use_custom("fanout_pack_multi"):
+        if _namespace_has_op("fanout_pack_multi"):
+            return _ops_namespace().fanout_pack_multi(
+                x_parts,
+                src_idx_parts,
+                flat_dst_parts,
+            )
+        if _fallback_mode() == "error":
+            raise RuntimeError(
+                "Custom mp op fanout_pack_multi is unavailable in the loaded relm_mp library."
+            )
+    return _fanout_pack_multi_python(x_parts, src_idx_parts, flat_dst_parts)
+
+
+def fanin_pack_multi(
+    rel_parts: list[torch.Tensor],
+    flat_src_parts: list[torch.Tensor],
+    dst_idx_parts: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fanin_pack_multi requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    if _should_use_custom("fanin_pack_multi"):
+        if _namespace_has_op("fanin_pack_multi"):
+            return _ops_namespace().fanin_pack_multi(
+                rel_parts,
+                flat_src_parts,
+                dst_idx_parts,
+            )
+        if _fallback_mode() == "error":
+            raise RuntimeError(
+                "Custom mp op fanin_pack_multi is unavailable in the loaded relm_mp library."
+            )
+    return _fanin_pack_multi_python(rel_parts, flat_src_parts, dst_idx_parts)
+
+
 __all__ = [
     "fanout_scatter",
     "fanin_reduce",
+    "fanout_pack_multi",
+    "fanin_pack_multi",
     "available",
     "assert_runtime_compat",
 ]

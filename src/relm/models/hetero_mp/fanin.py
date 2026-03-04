@@ -265,24 +265,24 @@ class IdentityMP(pyg.nn.MessagePassing):
 
 
 class LabelFanInMP(FanInMP):
-    """Backward-compatible alias for label-filtered FanInMP."""
+    """Compatibility wrapper for label-filtered fan-in routing."""
 
     def __init__(
         self,
+        embedding_size: int,
         dst_types: Iterable[str],
-        edge_labels: Iterable[str],
+        aggr: str | torch_geometric.nn.Aggregation | None = None,
         *,
         src_types: Iterable[str] | None = None,
-        embedding_size: int = 1,
-        aggr: str | torch_geometric.nn.Aggregation | None = None,
+        edge_labels: Iterable[str] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(
             embedding_size=embedding_size,
             dst_types=dst_types,
+            aggr=aggr,
             src_types=src_types,
             edge_labels=edge_labels,
-            aggr=aggr,
             **kwargs,
         )
 

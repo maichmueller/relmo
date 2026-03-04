@@ -49,6 +49,50 @@ def _fanin_ref(
     raise ValueError(mode)
 
 
+def _fanout_pack_ref(
+    x_parts: list[torch.Tensor],
+    src_idx_parts: list[torch.Tensor],
+    flat_dst_parts: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_cat_parts = []
+    src_global_parts = []
+    dst_parts = []
+    offset = 0
+    for x, src_idx, flat_dst in zip(x_parts, src_idx_parts, flat_dst_parts):
+        x_cat_parts.append(x)
+        src_global_parts.append(src_idx + int(offset))
+        dst_parts.append(flat_dst)
+        offset += int(x.size(0))
+    x_cat = x_cat_parts[0] if len(x_cat_parts) == 1 else torch.cat(x_cat_parts, dim=0)
+    src_global = (
+        src_global_parts[0]
+        if len(src_global_parts) == 1
+        else torch.cat(src_global_parts, dim=0)
+    )
+    flat_dst = dst_parts[0] if len(dst_parts) == 1 else torch.cat(dst_parts, dim=0)
+    return x_cat, src_global, flat_dst
+
+
+def _fanin_pack_ref(
+    rel_parts: list[torch.Tensor],
+    flat_src_parts: list[torch.Tensor],
+    dst_idx_parts: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rel_cat_parts = []
+    src_parts = []
+    dst_parts = []
+    offset = 0
+    for rel, flat_src, dst_idx in zip(rel_parts, flat_src_parts, dst_idx_parts):
+        rel_cat_parts.append(rel)
+        src_parts.append(flat_src + int(offset))
+        dst_parts.append(dst_idx)
+        offset += int(rel.size(0))
+    rel_cat = rel_cat_parts[0] if len(rel_cat_parts) == 1 else torch.cat(rel_cat_parts, dim=0)
+    flat_src = src_parts[0] if len(src_parts) == 1 else torch.cat(src_parts, dim=0)
+    dst_idx = dst_parts[0] if len(dst_parts) == 1 else torch.cat(dst_parts, dim=0)
+    return rel_cat, flat_src, dst_idx
+
+
 @pytest.mark.parametrize("mode", [0, 1])
 def test_python_fallback_path(mode: int, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RELM_MP_ENABLE", "0")
@@ -226,3 +270,95 @@ def test_fanin_reduce_logsumexp_gradcheck(monkeypatch: pytest.MonkeyPatch) -> No
         return mp.fanin_reduce(inp, flat_src, dst_idx, dim_size=4, mode=1)
 
     assert torch.autograd.gradcheck(fn, (rel_flat,), eps=1e-6, atol=1e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+)
+def test_fanout_pack_multi_parity_and_grad(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if mp.available() and hasattr(torch.ops.relm_mp, "fanout_pack_multi"):
+        monkeypatch.setenv("RELM_MP_ENABLE", "1")
+        monkeypatch.setenv("RELM_MP_FALLBACK", "error")
+    else:
+        monkeypatch.setenv("RELM_MP_ENABLE", "0")
+        monkeypatch.setenv("RELM_MP_FALLBACK", "python")
+
+    x_a = torch.randn(5, 3, device=device, dtype=torch.float32)
+    x_b = torch.randn(4, 3, device=device, dtype=torch.float32)
+    x_a_custom = x_a.detach().clone().requires_grad_(True)
+    x_b_custom = x_b.detach().clone().requires_grad_(True)
+    x_a_ref = x_a.detach().clone().requires_grad_(True)
+    x_b_ref = x_b.detach().clone().requires_grad_(True)
+    src_a = torch.tensor([0, 2, 4], device=device, dtype=torch.int64)
+    src_b = torch.tensor([1, 3], device=device, dtype=torch.int64)
+    dst_a = torch.tensor([3, 1, 5], device=device, dtype=torch.int64)
+    dst_b = torch.tensor([0, 4], device=device, dtype=torch.int64)
+
+    x_cat, src_global, flat_dst = mp.fanout_pack_multi(
+        [x_a_custom, x_b_custom], [src_a, src_b], [dst_a, dst_b]
+    )
+    x_ref, src_ref, dst_ref = _fanout_pack_ref(
+        [x_a_ref, x_b_ref], [src_a, src_b], [dst_a, dst_b]
+    )
+    assert torch.allclose(x_cat, x_ref)
+    assert torch.equal(src_global, src_ref)
+    assert torch.equal(flat_dst, dst_ref)
+
+    out = mp.fanout_scatter(x_cat, src_global, flat_dst, out_rows=6)
+    ref = _fanout_ref(x_ref, src_ref, dst_ref, out_rows=6)
+    assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5)
+
+    out.sum().backward()
+    ref.sum().backward()
+    assert torch.allclose(x_a_custom.grad, x_a_ref.grad, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(x_b_custom.grad, x_b_ref.grad, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+)
+def test_fanin_pack_multi_parity_and_grad(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if mp.available() and hasattr(torch.ops.relm_mp, "fanin_pack_multi"):
+        monkeypatch.setenv("RELM_MP_ENABLE", "1")
+        monkeypatch.setenv("RELM_MP_FALLBACK", "error")
+    else:
+        monkeypatch.setenv("RELM_MP_ENABLE", "0")
+        monkeypatch.setenv("RELM_MP_FALLBACK", "python")
+
+    rel_a = torch.randn(6, 4, device=device, dtype=torch.float32)
+    rel_b = torch.randn(3, 4, device=device, dtype=torch.float32)
+    rel_a_custom = rel_a.detach().clone().requires_grad_(True)
+    rel_b_custom = rel_b.detach().clone().requires_grad_(True)
+    rel_a_ref = rel_a.detach().clone().requires_grad_(True)
+    rel_b_ref = rel_b.detach().clone().requires_grad_(True)
+    src_a = torch.tensor([0, 2, 5], device=device, dtype=torch.int64)
+    src_b = torch.tensor([1, 2], device=device, dtype=torch.int64)
+    dst_a = torch.tensor([1, 0, 2], device=device, dtype=torch.int64)
+    dst_b = torch.tensor([2, 1], device=device, dtype=torch.int64)
+
+    rel_cat, flat_src, dst_idx = mp.fanin_pack_multi(
+        [rel_a_custom, rel_b_custom], [src_a, src_b], [dst_a, dst_b]
+    )
+    rel_ref, src_ref, dst_ref = _fanin_pack_ref(
+        [rel_a_ref, rel_b_ref], [src_a, src_b], [dst_a, dst_b]
+    )
+    assert torch.allclose(rel_cat, rel_ref)
+    assert torch.equal(flat_src, src_ref)
+    assert torch.equal(dst_idx, dst_ref)
+
+    out = mp.fanin_reduce(rel_cat, flat_src, dst_idx, dim_size=4, mode=0)
+    ref = _fanin_ref(rel_ref, src_ref, dst_ref, dim_size=4, mode=0)
+    assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5, equal_nan=True)
+
+    out.sum().backward()
+    ref.sum().backward()
+    assert torch.allclose(
+        rel_a_custom.grad, rel_a_ref.grad, atol=1e-6, rtol=1e-5, equal_nan=True
+    )
+    assert torch.allclose(
+        rel_b_custom.grad, rel_b_ref.grad, atol=1e-6, rtol=1e-5, equal_nan=True
+    )
