@@ -617,6 +617,14 @@ class BatchedFanInMP(torch.nn.Module):
             dim_size = int(x_dict[dst].size(0))
             use_mp_fanin = self._mp_fanin_mode is not None and _use_model_mp_fanin(x_dict[dst])
             use_mp_fanin = use_mp_fanin and _env_bool("RELM_MODELS_MP_FANIN_BATCHED", True)
+            # Training-first default:
+            # Batched decentralized fanin custom kernels can regress end-to-end training-step
+            # throughput depending on graph mix. Keep them enabled by default for inference
+            # and allow explicit opt-in for training via env override.
+            if self.training and not _env_bool(
+                "RELM_MODELS_MP_FANIN_BATCHED_TRAINING", False
+            ):
+                use_mp_fanin = False
 
             if self._label_mode:
                 if use_mp_fanin:

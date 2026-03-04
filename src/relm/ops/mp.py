@@ -125,19 +125,18 @@ def _ensure_loaded() -> None:
     for candidate in _candidate_libraries():
         try:
             torch.ops.load_library(str(candidate))
-            for namespace_name in ("relm_mp", "relm_relmp"):
-                namespace = getattr(torch.ops, namespace_name, None)
-                if namespace is None or any(
-                    not hasattr(namespace, op_name) for op_name in _REQUIRED_NAMESPACE_OPS
-                ):
-                    continue
-                _OPS_NAMESPACE = namespace_name
-                _LIB_LOADED = True
-                _LIB_LOAD_ERROR = None
-                return
-            raise RuntimeError(
-                f"Loaded {candidate} but torch.ops.relm_mp/relm_relmp is incomplete."
-            )
+
+            namespace = getattr(torch.ops, "relm_mp", None)
+            if namespace is None or any(
+                not hasattr(namespace, op_name) for op_name in _REQUIRED_NAMESPACE_OPS
+            ):
+                raise RuntimeError(
+                    f"Loaded {candidate} but torch.ops.relm_mp is incomplete."
+                )
+            _OPS_NAMESPACE = "relm_mp"
+            _LIB_LOADED = True
+            _LIB_LOAD_ERROR = None
+            return
         except Exception as exc:  # pragma: no cover - depends on local build state
             last_error = exc
 

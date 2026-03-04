@@ -66,6 +66,7 @@ PYTHONPATH=src python scripts/benchmark_relational_models.py \
 - `RELM_MODELS_MP_FANIN=1` enables model-side use of `relm.ops.mp` fanin kernels (default: on).
 - `RELM_MODELS_MP_FANIN_FUSED=1` enables fanin kernels in `CentralFusedLayerMP` (default: on).
 - `RELM_MODELS_MP_FANIN_BATCHED=1` enables fanin kernels in `BatchedFanInMP` (default: on).
+- `RELM_MODELS_MP_FANIN_BATCHED_TRAINING=1` re-enables batched fanin kernels during `model.train()` (default: off; inference remains on).
 - `RELM_MODELS_MP_GROUPED_MLP=1` enables grouped execution for compatible per-relation residual MLPs in `BatchedFanOutMP` (default: on, with automatic fallback).
 - `RELM_MODELS_MP_FANOUT=0` enables fanout kernel path in batched/fused MPs (default: off).
 
