@@ -8,7 +8,7 @@ import torch_geometric.nn.aggr
 from torch_geometric.nn.resolver import activation_resolver
 
 class MLP(torch.nn.Module):
-    """Small, torchrl-free MLP with a compatible constructor shape."""
+    """Small MLP with a compatible constructor shape."""
 
     def __init__(
         self,
