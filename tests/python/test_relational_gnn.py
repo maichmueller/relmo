@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from relm.models import LGANRelationalGNN, RelationalGNN
+from relm.models import FastRelationalGNN, LGANRelationalGNN, RelationalGNN
 from relm.models.hetero_mp import BatchedFanInMP, FanInMP
 from relm.ops import mp as mp_ops
 
@@ -30,6 +30,23 @@ def _run_backward(model: torch.nn.Module, x_dict, edge_index_dict) -> dict[str, 
         for name, param in model.named_parameters()
         if param.grad is not None
     }
+
+
+def _map_modular_to_fast_fused_grad_keys(
+    grads: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    for name, grad in grads.items():
+        if name.startswith("symbols_to_relations_mp.update_modules."):
+            suffix = name[len("symbols_to_relations_mp.update_modules.") :]
+            mapped = f"fast_fused_rel_layer_mp.update_modules.{suffix}"
+        elif name.startswith("relations_to_symbols_mp.aggr."):
+            suffix = name[len("relations_to_symbols_mp.aggr.") :]
+            mapped = f"fast_fused_rel_layer_mp.aggr.{suffix}"
+        else:
+            mapped = name
+        out[mapped] = grad
+    return out
 
 
 def _to_device(
@@ -216,6 +233,72 @@ def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients(
         assert torch.allclose(grad_mod[name], grad_bat[name], atol=1e-6, rtol=1e-5), name
     assert _nonzero_grads(modular) > 0
     assert _nonzero_grads(batched) > 0
+
+
+@pytest.mark.parametrize("aggr", ["sum", "logsumexp"])
+def test_relational_gnn_fast_fused_matches_modular_forward_and_gradients(
+    aggr: str,
+) -> None:
+    relation_dict = {"rel_a": 2, "rel_b": 1}
+    symbol_type = "_symbol_"
+    x_dict, edge_index_dict = build_relation_graph(
+        relation_dict=relation_dict,
+        symbol_type=symbol_type,
+        relation_sizes={"rel_a": 4, "rel_b": 3},
+    )
+
+    torch.manual_seed(0)
+    modular = RelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr=aggr,
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        rel_layer_mode="modular",
+    )
+    torch.manual_seed(0)
+    fast = FastRelationalGNN(
+        embedding_size=8,
+        num_layer=2,
+        aggr=aggr,
+        symbol_type_ids=symbol_type,
+        relation_dict=relation_dict,
+        compile_forward=False,
+    )
+    fast.embedding_updater.load_state_dict(modular.embedding_updater.state_dict(), strict=True)
+    fast.fast_fused_rel_layer_mp.update_modules.load_state_dict(
+        modular.symbols_to_relations_mp.update_modules.state_dict(),  # type: ignore[attr-defined]
+        strict=True,
+    )
+    fast.fast_fused_rel_layer_mp.aggr.load_state_dict(  # type: ignore[union-attr]
+        modular.relations_to_symbols_mp.aggr.state_dict(),  # type: ignore[attr-defined]
+        strict=True,
+    )
+
+    out_mod, _ = modular(*clone_graph(x_dict, edge_index_dict))
+    out_fast, _ = fast(*clone_graph(x_dict, edge_index_dict))
+    assert torch.allclose(out_mod[symbol_type], out_fast[symbol_type], atol=1e-6, rtol=1e-5)
+
+    grad_mod = _run_backward(modular, *clone_graph(x_dict, edge_index_dict))
+    grad_fast = _run_backward(fast, *clone_graph(x_dict, edge_index_dict))
+    grad_mod = _map_modular_to_fast_fused_grad_keys(grad_mod)
+    assert set(grad_mod.keys()) == set(grad_fast.keys())
+    for name in grad_mod:
+        assert torch.allclose(grad_mod[name], grad_fast[name], atol=1e-6, rtol=1e-5), name
+    assert _nonzero_grads(modular) > 0
+    assert _nonzero_grads(fast) > 0
+
+
+def test_fast_relational_gnn_rejects_non_fast_mode() -> None:
+    with pytest.raises(ValueError, match="only supports rel_layer_mode='fast_fused'"):
+        FastRelationalGNN(
+            embedding_size=8,
+            num_layer=1,
+            aggr="sum",
+            symbol_type_ids="_symbol_",
+            relation_dict={"rel_a": 2},
+            rel_layer_mode="modular",
+        )
 
 
 @pytest.mark.parametrize("aggr", ["sum"])

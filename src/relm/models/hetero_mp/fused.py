@@ -10,9 +10,9 @@ from torch_geometric.nn.resolver import aggregation_resolver
 from torch_geometric.typing import Adj, EdgeType
 
 from ._ops_env import (
-    _env_bool,
     _resolve_fanin_mode,
     _use_model_mp_fanin,
+    _use_model_mp_fanin_fused,
     _use_model_mp_fanout,
     relm_mp_ops,
 )
@@ -394,8 +394,7 @@ class CentralFusedLayerMP(torch.nn.Module):
             flat_src, dst_index = pair
             if (
                 self._mp_fanin_mode is not None
-                and _use_model_mp_fanin(out_flat)
-                and _env_bool("RELM_MODELS_MP_FANIN_FUSED", True)
+                and _use_model_mp_fanin_fused(out_flat)
             ):
                 symbol_msgs[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                     out_flat, flat_src, dst_index, dim_size, self._mp_fanin_mode

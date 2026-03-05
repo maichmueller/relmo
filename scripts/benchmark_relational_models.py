@@ -281,7 +281,7 @@ def _make_model(
 
 def _sync_if_needed(device: torch.device) -> None:
     if device.type == "cuda":
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
 
 def _run_once(model: torch.nn.Module, batch: Any, *, backward: bool) -> None:
@@ -423,6 +423,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     device = _resolve_device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     torch.manual_seed(int(args.seed))
     if device.type == "cuda":
         torch.cuda.manual_seed_all(int(args.seed))

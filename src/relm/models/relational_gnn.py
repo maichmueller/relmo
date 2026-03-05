@@ -18,6 +18,7 @@ from .film import CentralFilmFactory, FiLMConcatMLP
 from .hetero_mp import (
     CentralFanOutMP,
     CentralFusedLayerMP,
+    FastFusedRelationalLayerMP,
     FanInMP,
     FanOutMP,
 )
@@ -158,6 +159,7 @@ class RelationalGNN(PyGHeteroModule):
         random_init_percent: float | None = None,
         strict_ntype_filter: bool = True,
         compile_forward: bool = False,
+        compile_forward_kwargs: dict | None = None,
         compile_prudent: bool = False,
         compile_prudent_kwargs: dict | None = None,
         rel_layer_mode: str = "modular",
@@ -189,6 +191,8 @@ class RelationalGNN(PyGHeteroModule):
         :param compile_forward: If True, wraps `forward` in `torch.compile`. This can be
             very beneficial on stable graph schemas, but may lead to frequent
             recompilations if the set of node/edge types varies across calls.
+        :param compile_forward_kwargs: Optional kwargs merged into `torch.compile(...)`
+            for `forward` when `compile_forward=True`, e.g. `{\"mode\": \"reduce-overhead\"}`.
         :param compile_prudent: If True, compiles only the dense, schema-stable MLP
             submodules (e.g. embedding updater; and for centralized variants the
             central module). This is typically more robust for highly variable
@@ -198,11 +202,14 @@ class RelationalGNN(PyGHeteroModule):
         """
         super().__init__()
         self._compile_forward = compile_forward
+        self._compile_forward_kwargs = (
+            dict(compile_forward_kwargs) if isinstance(compile_forward_kwargs, dict) else None
+        )
         self._compile_prudent = bool(compile_prudent)
         self._compile_prudent_kwargs = compile_prudent_kwargs
-        if rel_layer_mode not in ("modular", "batched_cached"):
+        if rel_layer_mode not in ("modular", "batched_cached", "fast_fused"):
             raise ValueError(
-                "rel_layer_mode must be one of {'modular','batched_cached'}, "
+                "rel_layer_mode must be one of {'modular','batched_cached','fast_fused'}, "
                 f"got {rel_layer_mode!r}."
             )
         self.rel_layer_mode = rel_layer_mode
@@ -238,6 +245,8 @@ class RelationalGNN(PyGHeteroModule):
         self.symbols_to_relations_mp: torch.nn.Module
         # the module to pass created messages from relations back to symbols
         self.relations_to_symbols_mp: torch.nn.Module
+        # fused non-modular fast relation layer (optional).
+        self.fast_fused_rel_layer_mp: torch.nn.Module | None = None
         # the module to update object embeddings based on the final object messages
         self.embedding_updater: torch.nn.Module
         # resolve activation
@@ -340,6 +349,25 @@ class RelationalGNN(PyGHeteroModule):
                 strict_filter_mode=self.strict_ntype_filter,
                 validate_routing=self.rel_validate_routing,
             )
+        elif self.rel_layer_mode == "fast_fused":
+            relation_arities = {
+                pred: arity
+                for pred, arity in self.relation_dict.items()
+                if arity > 0 or not ignore_zero_arity_relations
+            }
+            self.fast_fused_rel_layer_mp = FastFusedRelationalLayerMP(
+                update_modules=relation_module_dict,
+                relation_arities=relation_arities,
+                embedding_size=embedding_size,
+                src_types=self.symbol_type_ids,
+                dst_types=self.symbol_type_ids,
+                aggr=aggr,
+                strict_filter_mode=self.strict_ntype_filter,
+                validate_routing=self.rel_validate_routing,
+            )
+            # Keep valid nn.Module attributes for compatibility with existing code paths.
+            self.symbols_to_relations_mp = torch.nn.Identity()
+            self.relations_to_symbols_mp = torch.nn.Identity()
         else:
             self.symbols_to_relations_mp = FanOutMP(
                 relation_module_dict,
@@ -384,6 +412,8 @@ class RelationalGNN(PyGHeteroModule):
             x_dict[key] = init_embed
         if self.rel_layer_mode == "batched_cached":
             return x_dict, {"rel_batched_cache": {}}
+        if self.rel_layer_mode == "fast_fused":
+            return x_dict, {"rel_fast_fused_cache": {}}
         return x_dict, None
 
     def symbol_ntype_filter(self, key: str) -> bool:
@@ -402,30 +432,37 @@ class RelationalGNN(PyGHeteroModule):
         """
         # Spread the object embeddings to the atoms via message passing.
         # Note: unlike symbol embeddings, relation embeddings are always simply replaced, instead of updated.
-        if self.rel_layer_mode == "batched_cached":
+        if self.rel_layer_mode == "fast_fused":
+            if self.fast_fused_rel_layer_mp is None:
+                raise RuntimeError(
+                    "rel_layer_mode='fast_fused' requested but fast fused layer is not initialized."
+                )
+            if extra is None:
+                extra = {}
+            cache = extra.setdefault("rel_fast_fused_cache", {})
+            atom_msgs, symbol_msgs_dict = self.fast_fused_rel_layer_mp(
+                x_dict, edge_index_dict, cache=cache
+            )
+        elif self.rel_layer_mode == "batched_cached":
             if extra is None:
                 extra = {}
             cache = extra.setdefault("rel_batched_cache", {})
             atom_msgs = self.symbols_to_relations_mp(
                 x_dict, edge_index_dict, cache=cache
             )
+            symbol_msgs_dict = self.relations_to_symbols_mp(
+                x_dict,
+                edge_index_dict,
+                cache=cache,
+                relation_messages=atom_msgs,
+            )
         else:
             atom_msgs = self.symbols_to_relations_mp(x_dict, edge_index_dict)
-        x_dict.update(atom_msgs)
+            x_dict.update(atom_msgs)
+            symbol_msgs_dict = self.relations_to_symbols_mp(x_dict, edge_index_dict)
 
         for symbol_ntype_id in symbol_ntype_ids:
-            # Distribute the relation embeddings back to the corresponding symbols via message passing.
-            if self.rel_layer_mode == "batched_cached":
-                if extra is None:
-                    extra = {}
-                cache = extra.setdefault("rel_batched_cache", {})
-                symbol_msgs = self.relations_to_symbols_mp(
-                    x_dict, edge_index_dict, cache=cache
-                )[symbol_ntype_id]
-            else:
-                symbol_msgs = self.relations_to_symbols_mp(x_dict, edge_index_dict)[
-                    symbol_ntype_id
-                ]
+            symbol_msgs = symbol_msgs_dict[symbol_ntype_id]
             # perform update step of message passing, but for symbol-nodes only.
             # The symbol/object embeddings are updated based on the previous embedding `X_o` and final symbol message `m_o`.
             # In formula: `X_o = comb([X_o, m_o])`
@@ -496,6 +533,21 @@ class RelationalGNN(PyGHeteroModule):
         x_dict = {k: v for k, v in x_dict.items() if v.numel() != 0}
         edge_index_dict = {k: v for k, v in edge_index_dict.items() if v.numel() != 0}
         return x_dict, edge_index_dict
+
+
+class FastRelationalGNN(RelationalGNN):
+    """
+    Convenience wrapper around RelationalGNN with rel_layer_mode='fast_fused'.
+    """
+
+    def __init__(self, *args, **kwargs):
+        mode = kwargs.pop("rel_layer_mode", "fast_fused")
+        if mode != "fast_fused":
+            raise ValueError(
+                "FastRelationalGNN only supports rel_layer_mode='fast_fused', "
+                f"got {mode!r}."
+            )
+        super().__init__(*args, rel_layer_mode="fast_fused", **kwargs)
 
 
 class CentralizedRelationalGNN(RelationalGNN):
@@ -1017,12 +1069,14 @@ class LGANRelationalGNN(RelationalGNN):
         }
         if self.rel_layer_mode == "batched_cached":
             atom_msgs = self.symbols_to_relations_mp(x_dict, standard_edges, cache=cache)
+            relation_source = atom_msgs
         else:
             atom_msgs = self.symbols_to_relations_mp(x_dict, standard_edges)
-        x_dict.update(atom_msgs)
+            x_dict.update(atom_msgs)
+            relation_source = x_dict
 
         # Phase 2: relation-pair embedding pooling.
-        relation_pair_x = self._pool_relation_embeddings(x_dict)
+        relation_pair_x = self._pool_relation_embeddings(relation_source)
         if not relation_pair_x:
             raise RuntimeError(
                 "LGANRelationalGNN could not build relation-pair embeddings. "

@@ -15,11 +15,11 @@ from ..mixins import DeviceAwareMixin
 from ..patched_module_dict import PatchedModuleDict
 from ._grouped_exec import _apply_residual_truncate, _extract_grouped_residual_mlp_info
 from ._ops_env import (
-    _env_bool,
     _resolve_fanin_mode,
     _use_grouped_relation_mlp,
-    _use_model_mp_fanin,
-    _use_model_mp_ops,
+    _use_model_mp_batched_fanin_pack,
+    _use_model_mp_batched_fanin_reduce,
+    _use_model_mp_batched_fanout,
     relm_mp_ops,
 )
 from ._scatter import (
@@ -60,6 +60,7 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
         self._cuda_streams = None
         self._cuda_pool = None
         self._grouped_mlp_info_cache: dict[int, dict[str, Any] | None] = {}
+        self._persistent_grouped_param_stacks: dict[tuple[Any, ...], dict[str, Any]] = {}
 
     def _match_src(self, src: str) -> bool:
         return _match_ntype(src, self.src_types, self.strict_filter_mode)
@@ -96,6 +97,43 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
         info = _extract_grouped_residual_mlp_info(module)
         self._grouped_mlp_info_cache[key] = info
         return info
+
+    def _get_grouped_param_stack(
+        self,
+        *,
+        cache_key: tuple[Any, ...],
+        tensors: list[Tensor],
+        forward_cache: dict[tuple[Any, ...], Tensor],
+        allow_persistent: bool,
+    ) -> Tensor:
+        cached_forward = forward_cache.get(cache_key)
+        if cached_forward is not None:
+            return cached_forward
+
+        if allow_persistent and tensors:
+            versions = tuple(int(getattr(tensor, "_version", -1)) for tensor in tensors)
+            persistent = self._persistent_grouped_param_stacks.get(cache_key)
+            if persistent is not None:
+                stacked = persistent.get("tensor")
+                if (
+                    torch.is_tensor(stacked)
+                    and persistent.get("versions") == versions
+                    and tuple(stacked.shape) == tuple(persistent.get("shape", ()))
+                    and stacked.device == tensors[0].device
+                    and stacked.dtype == tensors[0].dtype
+                ):
+                    forward_cache[cache_key] = stacked
+                    return stacked
+
+        stacked = torch.stack(tensors, dim=0)
+        forward_cache[cache_key] = stacked
+        if allow_persistent and tensors:
+            self._persistent_grouped_param_stacks[cache_key] = {
+                "tensor": stacked,
+                "versions": tuple(int(getattr(tensor, "_version", -1)) for tensor in tensors),
+                "shape": tuple(stacked.shape),
+            }
+        return stacked
 
     def forward(
         self,
@@ -156,6 +194,12 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
             # Global routed scatter by source type into one flattened slot tensor.
             tmp_flat_by_src: dict[str, list[torch.Tensor]] = defaultdict(list)
             tmp_src_by_src: dict[str, list[torch.Tensor]] = defaultdict(list)
+            mp_edge_src_parts: list[torch.Tensor] = []
+            mp_edge_dst_parts: list[torch.Tensor] = []
+            mp_edge_src_labels: list[str] = []
+            mp_arity_parts: list[int] = []
+            mp_pos_parts: list[int] = []
+            mp_slot_offset_parts: list[int] = []
             for edge_type, edge_index in edge_index_dict.items():
                 src, rel, dst = edge_type
                 if dst not in slot_offsets:
@@ -174,6 +218,12 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                 flat_dst = slot_offset + edge_index[1] * arity + pos
                 tmp_flat_by_src[src].append(flat_dst)
                 tmp_src_by_src[src].append(edge_index[0])
+                mp_edge_src_parts.append(edge_index[0])
+                mp_edge_dst_parts.append(edge_index[1])
+                mp_edge_src_labels.append(src)
+                mp_arity_parts.append(int(arity))
+                mp_pos_parts.append(int(pos))
+                mp_slot_offset_parts.append(int(slot_offset))
 
             fanout_by_src = _finalize_pair_lists(tmp_flat_by_src, tmp_src_by_src)
             if self.validate_routing:
@@ -189,6 +239,40 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                     continue
                 pred_exec.append((pred, n, arity, slot_offset, self.update_modules[pred]))
 
+            mp_src_order = tuple(sorted(set(mp_edge_src_labels)))
+            mp_src_part_index = {src: idx for idx, src in enumerate(mp_src_order)}
+            mp_src_part_ids = [int(mp_src_part_index[src]) for src in mp_edge_src_labels]
+            mp_fanout_packed_plan: dict[str, Any] | None = None
+            if mp_edge_src_parts:
+                try:
+                    x_parts: list[Tensor] = []
+                    src_rows: list[int] = []
+                    for src in mp_src_order:
+                        x_src = x_dict.get(src)
+                        if x_src is None:
+                            raise KeyError(f"Missing src node type {src!r} in x_dict for fanout.")
+                        x_parts.append(x_src)
+                        src_rows.append(int(x_src.size(0)))
+                    x_cat_pre, src_global_pre, flat_dst_pre = relm_mp_ops.fanout_pack_from_edges(  # type: ignore[union-attr]
+                        x_parts,
+                        mp_edge_src_parts,
+                        mp_edge_dst_parts,
+                        mp_src_part_ids,
+                        mp_arity_parts,
+                        mp_pos_parts,
+                        mp_slot_offset_parts,
+                    )
+                    mp_fanout_packed_plan = {
+                        "src_order": mp_src_order,
+                        "src_rows": tuple(src_rows),
+                        "x_rows": int(x_cat_pre.size(0)),
+                        "src_global": src_global_pre,
+                        "flat_dst": flat_dst_pre,
+                    }
+                except Exception:
+                    if self.validate_routing:
+                        raise
+                    mp_fanout_packed_plan = None
             routing = {
                 "pred_meta": pred_meta,
                 "pred_exec": pred_exec,
@@ -198,6 +282,16 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                     by_src=fanout_by_src,
                     x_dict=x_dict,
                 ),
+                "mp_fanout_edge_plan": {
+                    "src_order": mp_src_order,
+                    "edge_src_parts": tuple(mp_edge_src_parts),
+                    "edge_dst_parts": tuple(mp_edge_dst_parts),
+                    "src_part_ids": tuple(mp_src_part_ids),
+                    "arity_parts": tuple(mp_arity_parts),
+                    "pos_parts": tuple(mp_pos_parts),
+                    "slot_offset_parts": tuple(mp_slot_offset_parts),
+                },
+                "mp_fanout_packed_plan": mp_fanout_packed_plan,
             }
             routing_root["fanout"] = routing
 
@@ -225,18 +319,9 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
         buffers_root = cache.setdefault("buffers", {})
         outputs: Dict[str, Tensor] = {}
         total_slots = int(routing["total_slots"])
-        # Experimental toggle for decentralized custom fanout/fanin benchmarking.
-        # Default remains Python/PyG path.
-        use_mp_fanout = (
-            _env_bool("RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL", False)
-            and _use_model_mp_ops(ref)
-        )
-        # Only materialize shared relation-flat handoff when fanin custom reduction lane is enabled.
-        # This avoids unnecessary writes in fanout-only/scaffold modes.
-        publish_rel_flat = bool(
-            use_mp_fanout
-            and _env_bool("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", False)
-        )
+        use_mp_fanout = _use_model_mp_batched_fanout(ref)
+        # Canonical handoff: always publish flattened relation slots for fanin.
+        publish_rel_flat = True
         rel_flat_all: torch.Tensor | None = None
         if publish_rel_flat:
             if reuse_buffers:
@@ -262,28 +347,85 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
 
         fanout_by_src: dict[str, tuple[torch.Tensor, torch.Tensor]] = routing["fanout_by_src"]
         if use_mp_fanout and fanout_by_src:
-            fanout_plan = routing.get("mp_fanout_plan")
-            if fanout_plan is not None:
+            packed_plan = routing.get("mp_fanout_packed_plan")
+            if packed_plan is not None:
+                x_parts: list[Tensor] = []
+                src_rows_actual: list[int] = []
                 try:
-                    args_flat_all = _fanout_scatter_from_plan(
-                        plan=fanout_plan,
-                        x_dict=x_dict,
-                        out_rows=total_slots,
+                    for src in packed_plan["src_order"]:
+                        if src not in x_dict:
+                            raise KeyError(f"Missing src node type {src!r} in x_dict for fanout.")
+                        x_src = x_dict[src]
+                        x_parts.append(x_src)
+                        src_rows_actual.append(int(x_src.size(0)))
+                    if tuple(src_rows_actual) != tuple(packed_plan["src_rows"]):
+                        raise ValueError(
+                            "Fanout packed plan source row sizes changed: "
+                            f"expected {packed_plan['src_rows']}, got {tuple(src_rows_actual)}."
+                        )
+                    x_cat = _cat_or_single(x_parts, dim=0)
+                    if int(x_cat.size(0)) != int(packed_plan["x_rows"]):
+                        raise ValueError(
+                            f"Fanout packed plan x_rows mismatch: expected {packed_plan['x_rows']}, got {int(x_cat.size(0))}."
+                        )
+                    args_flat_all = relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
+                        x_cat,
+                        packed_plan["src_global"],
+                        packed_plan["flat_dst"],
+                        int(total_slots),
                     )
                 except Exception:
                     if self.validate_routing:
                         raise
-                    args_flat_all = _fanout_scatter_multi_src(
-                        by_src=fanout_by_src,
-                        x_dict=x_dict,
-                        out_rows=total_slots,
-                    )
-            else:
-                args_flat_all = _fanout_scatter_multi_src(
-                    by_src=fanout_by_src,
-                    x_dict=x_dict,
-                    out_rows=total_slots,
-                )
+                    packed_plan = None
+            if packed_plan is None:
+                edge_plan = routing.get("mp_fanout_edge_plan")
+                if edge_plan is not None and len(edge_plan["edge_src_parts"]) > 0:
+                    try:
+                        x_parts = []
+                        for src in edge_plan["src_order"]:
+                            if src not in x_dict:
+                                raise KeyError(f"Missing src node type {src!r} in x_dict for fanout.")
+                            x_parts.append(x_dict[src])
+                        x_cat, src_global, flat_dst = relm_mp_ops.fanout_pack_from_edges(  # type: ignore[union-attr]
+                            x_parts,
+                            list(edge_plan["edge_src_parts"]),
+                            list(edge_plan["edge_dst_parts"]),
+                            list(edge_plan["src_part_ids"]),
+                            list(edge_plan["arity_parts"]),
+                            list(edge_plan["pos_parts"]),
+                            list(edge_plan["slot_offset_parts"]),
+                        )
+                        args_flat_all = relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
+                            x_cat, src_global, flat_dst, int(total_slots)
+                        )
+                    except Exception:
+                        if self.validate_routing:
+                            raise
+                        edge_plan = None
+                if edge_plan is None:
+                    fanout_plan = routing.get("mp_fanout_plan")
+                    if fanout_plan is not None:
+                        try:
+                            args_flat_all = _fanout_scatter_from_plan(
+                                plan=fanout_plan,
+                                x_dict=x_dict,
+                                out_rows=total_slots,
+                            )
+                        except Exception:
+                            if self.validate_routing:
+                                raise
+                            args_flat_all = _fanout_scatter_multi_src(
+                                by_src=fanout_by_src,
+                                x_dict=x_dict,
+                                out_rows=total_slots,
+                            )
+                    else:
+                        args_flat_all = _fanout_scatter_multi_src(
+                            by_src=fanout_by_src,
+                            x_dict=x_dict,
+                            out_rows=total_slots,
+                        )
         else:
             for src, (flat_dst, src_idx) in fanout_by_src.items():
                 if src not in x_dict:
@@ -305,6 +447,10 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                     (pred, n, arity, slot_offset, update_module, info)
                 )
 
+            grouped_param_stacks: dict[tuple[Any, ...], Tensor] = cache.setdefault(
+                "grouped_param_stacks", {}
+            )
+            allow_persistent_stacks = reuse_buffers
             for group_items in grouped_exec.values():
                 if len(group_items) <= 1:
                     pred, n, arity, slot_offset, update_module, _info = group_items[0]
@@ -335,20 +481,46 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                 out_stack = x_stack
                 template_info = batch_items[0][5]
                 ops = template_info["ops"]
+                group_pred_key = tuple(item[0] for item in batch_items)
+                linear_indices = sorted(
+                    {
+                        int(payload)
+                        for kind, payload in ops
+                        if kind == "linear"
+                    }
+                )
+                linear_index_map = {lin_idx: i for i, lin_idx in enumerate(linear_indices)}
+                weight_stacks: list[Tensor] = []
+                bias_stacks: list[Tensor] = []
+                for lin_idx in linear_indices:
+                    linears = [item[5]["linears"][lin_idx] for item in batch_items]
+                    weight_stacks.append(
+                        self._get_grouped_param_stack(
+                            cache_key=("w", group_pred_key, int(lin_idx)),
+                            tensors=[linear.weight for linear in linears],
+                            forward_cache=grouped_param_stacks,
+                            allow_persistent=allow_persistent_stacks,
+                        )
+                    )
+                    if linears[0].bias is None:
+                        bias_stacks.append(weight_stacks[-1].new_empty((0,)))
+                    else:
+                        bias_stacks.append(
+                            self._get_grouped_param_stack(
+                                cache_key=("b", group_pred_key, int(lin_idx)),
+                                tensors=[linear.bias for linear in linears if linear.bias is not None],
+                                forward_cache=grouped_param_stacks,
+                                allow_persistent=allow_persistent_stacks,
+                            )
+                        )
                 for op_kind, op_payload in ops:
                     if op_kind == "linear":
                         lin_idx = int(op_payload)
-                        weight_stack = torch.stack(
-                            [item[5]["linears"][lin_idx].weight for item in batch_items],
-                            dim=0,
-                        )
+                        mapped_idx = linear_index_map[lin_idx]
+                        weight_stack = weight_stacks[mapped_idx]
                         out_stack = torch.matmul(out_stack, weight_stack.transpose(1, 2))
-                        bias_ref = template_info["linears"][lin_idx].bias
-                        if bias_ref is not None:
-                            bias_stack = torch.stack(
-                                [item[5]["linears"][lin_idx].bias for item in batch_items],
-                                dim=0,
-                            )
+                        bias_stack = bias_stacks[mapped_idx]
+                        if bias_stack.numel() > 0:
                             out_stack = out_stack + bias_stack[:, None, :]
                     else:
                         out_stack = op_payload(out_stack)
@@ -466,250 +638,100 @@ class BatchedFanInMP(torch.nn.Module):
             return True
         return str(rel) in self.edge_labels
 
-    def forward(
+    def _forward_label_lane(
         self,
-        x_dict: Dict[str, Tensor],
-        edge_index_dict: Dict[EdgeType, Adj],
         *,
-        cache: dict | None = None,
-        **_: Any,
+        x_dict: Dict[str, Tensor],
+        fanin_by_dst: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]],
+        mp_fanin_label_plans: dict[str, dict[str, Any]],
+        mp_fanin_edge_plans: dict[str, dict[str, Any]],
+        mp_fanin_packed_plans: dict[str, dict[str, Any]],
     ) -> Dict[str, Tensor]:
-        if not edge_index_dict:
-            return {}
-        cache = cache if cache is not None else {}
-
-        # See BatchedFanOutMP for the shared cache layout. We store fanin routing under
-        # a per-instance key in cache["routing"] to avoid collisions with fanout routing
-        # and with other BatchedFanInMP modules sharing one cache dict.
-        routing_root = cache.setdefault("routing", {})
-        routing = routing_root.get(self._routing_cache_key)
-        if routing is None:
-            # fanin_by_dst[dst][pred] = (flat_src, dst_idx)
-            tmp: dict[tuple[str, str], list[tuple[torch.Tensor, torch.Tensor]]] = defaultdict(list)
-            for edge_type, edge_index in edge_index_dict.items():
-                src, rel, dst = edge_type
-                if not self._match_dst(dst):
-                    continue
-                if edge_index is None or edge_index.numel() == 0:
-                    continue
-
-                if self._label_mode:
-                    if not self._match_src(src):
-                        continue
-                    if not self._match_edge_label(rel):
-                        continue
-                    tmp[(dst, src)].append((edge_index[0], edge_index[1]))
-                    continue
-
-                if src not in self.relation_arities:
-                    continue
-                try:
-                    pos = int(rel)
-                except (TypeError, ValueError):
-                    if self.validate_routing:
-                        raise AssertionError(
-                            f"Fanin routing expects integer edge positions, got rel={rel!r} for pred={src!r}."
-                        )
-                    continue
-                arity = int(self.relation_arities.get(src, 0))
-                if pos < 0 or pos >= arity:
-                    if self.validate_routing and arity > 0:
-                        raise AssertionError(
-                            f"Fanin routing pos out of range: pred={src!r} pos={pos} arity={arity}."
-                        )
-                    continue
-                flat_src = edge_index[0] * arity + pos
-                tmp[(dst, src)].append((flat_src, edge_index[1]))
-
-            fanin_by_dst: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = defaultdict(dict)
-            for (dst, pred), parts in tmp.items():
-                flat_srcs = [p[0] for p in parts]
-                dst_idxs = [p[1] for p in parts]
-                flat_src = _cat_or_single(flat_srcs, dim=0)
-                dst_idx = _cat_or_single(dst_idxs, dim=0)
-                fanin_by_dst[dst][pred] = (flat_src, dst_idx)
-
-            mp_fanin_plans: dict[str, dict[str, Any]] = {}
-            mp_fanin_global_plans: dict[str, dict[str, Any]] = {}
-            mp_fanin_label_plans: dict[str, dict[str, Any]] = {}
-            if self._label_mode:
-                for dst, per_src in fanin_by_dst.items():
-                    src_order: list[str] = []
-                    src_rows: list[int] = []
-                    flat_src_parts: list[torch.Tensor] = []
-                    dst_parts: list[torch.Tensor] = []
-                    src_offset = 0
-                    for src in sorted(per_src.keys()):
-                        if src not in x_dict:
-                            continue
-                        x_src = x_dict[src]
-                        if x_src.numel() == 0:
-                            continue
-                        rows = int(x_src.size(0))
-                        src_idx, dst_idx = per_src[src]
-                        src_order.append(src)
-                        src_rows.append(rows)
-                        flat_src_parts.append(src_idx + int(src_offset))
-                        dst_parts.append(dst_idx)
-                        src_offset += rows
-                    if src_order:
-                        mp_fanin_label_plans[dst] = {
-                            "src_order": tuple(src_order),
-                            "src_rows": tuple(src_rows),
-                            "total_src_rows": int(src_offset),
-                            "flat_src": _cat_or_single(flat_src_parts, dim=0),
-                            "dst_idx": _cat_or_single(dst_parts, dim=0),
-                        }
-            else:
-                for dst, per_pred in fanin_by_dst.items():
-                    pred_order: list[str] = []
-                    rel_rows: list[int] = []
-                    flat_src_parts: list[torch.Tensor] = []
-                    dst_parts: list[torch.Tensor] = []
-                    rel_offset = 0
-                    for pred in sorted(per_pred.keys()):
-                        if pred not in x_dict:
-                            continue
-                        x_pred = x_dict[pred]
-                        if x_pred.numel() == 0:
-                            continue
-                        arity = int(self.relation_arities.get(pred, 0))
-                        rows = int(x_pred.size(0) * arity)
-                        flat_src, dst_idx = per_pred[pred]
-                        pred_order.append(pred)
-                        rel_rows.append(rows)
-                        flat_src_parts.append(flat_src + int(rel_offset))
-                        dst_parts.append(dst_idx)
-                        rel_offset += rows
-                    if pred_order:
-                        mp_fanin_plans[dst] = {
-                            "pred_order": tuple(pred_order),
-                            "rel_rows": tuple(rel_rows),
-                            "total_rel_rows": int(rel_offset),
-                            "flat_src": _cat_or_single(flat_src_parts, dim=0),
-                            "dst_idx": _cat_or_single(dst_parts, dim=0),
-                        }
-
-                fanout_routing = routing_root.get("fanout")
-                pred_slot_offsets: dict[str, int] = {}
-                total_slots = 0
-                if fanout_routing is not None:
-                    total_slots = int(fanout_routing.get("total_slots", 0))
-                    for pred, _n, _arity, slot_offset in fanout_routing.get("pred_meta", []):
-                        pred_slot_offsets[str(pred)] = int(slot_offset)
-                if pred_slot_offsets:
-                    for dst, per_pred in fanin_by_dst.items():
-                        flat_src_parts: list[torch.Tensor] = []
-                        dst_parts: list[torch.Tensor] = []
-                        for pred in sorted(per_pred.keys()):
-                            slot_offset = pred_slot_offsets.get(pred)
-                            if slot_offset is None:
-                                continue
-                            flat_src, dst_idx = per_pred[pred]
-                            flat_src_parts.append(flat_src + int(slot_offset))
-                            dst_parts.append(dst_idx)
-                        if flat_src_parts:
-                            mp_fanin_global_plans[dst] = {
-                                "flat_src": _cat_or_single(flat_src_parts, dim=0),
-                                "dst_idx": _cat_or_single(dst_parts, dim=0),
-                                "total_slots": int(total_slots),
-                            }
-
-            routing = {
-                "fanin_by_dst": dict(fanin_by_dst),
-                "mp_fanin_plans": mp_fanin_plans,
-                "mp_fanin_global_plans": mp_fanin_global_plans,
-                "mp_fanin_label_plans": mp_fanin_label_plans,
-            }
-            routing_root[self._routing_cache_key] = routing
-
-        fanin_by_dst = routing["fanin_by_dst"]
-        mp_fanin_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_plans", {})
-        mp_fanin_global_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_global_plans", {})
-        mp_fanin_label_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_label_plans", {})
-        layer_state = cache.get("layer_state")
-        rel_flat_shared = layer_state.get("fanout_rel_flat_all") if isinstance(layer_state, dict) else None
         out: Dict[str, Tensor] = {}
-
         for dst in self.dst_types:
             if dst not in x_dict:
                 continue
             dim_size = int(x_dict[dst].size(0))
             use_mp_fanin_reduce = (
                 self._mp_fanin_mode is not None
-                and _env_bool("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", False)
-                and _use_model_mp_fanin(x_dict[dst])
+                and _use_model_mp_batched_fanin_reduce(x_dict[dst])
             )
-            use_mp_fanin_pack = (
-                _env_bool("RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL", False)
-                and _use_model_mp_ops(x_dict[dst])
-            )
+            use_mp_fanin_pack = _use_model_mp_batched_fanin_pack(x_dict[dst])
             use_mp_fanin = use_mp_fanin_reduce or use_mp_fanin_pack
 
-            if self._label_mode:
-                if use_mp_fanin_reduce:
-                    plan = mp_fanin_label_plans.get(dst)
-                    if plan is not None:
-                        rel_parts: list[torch.Tensor] = []
-                        plan_ok = True
-                        for src in plan["src_order"]:
-                            rel_src = x_dict.get(src)
-                            if rel_src is None:
-                                plan_ok = False
-                                break
-                            if int(rel_src.size(-1)) != self.embedding_size:
-                                raise ValueError(
-                                    f"Label fanin source {src!r} has embedding dim {int(rel_src.size(-1))} "
-                                    f"(expected {self.embedding_size})."
-                                )
-                            rel_parts.append(rel_src)
-                        if plan_ok and rel_parts:
-                            rel_cat = _cat_or_single(rel_parts, dim=0)
-                            if (not self.validate_routing) or int(rel_cat.size(0)) == int(
-                                plan["total_src_rows"]
-                            ):
-                                out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
-                                    rel_cat,
-                                    plan["flat_src"],
-                                    plan["dst_idx"],
-                                    dim_size,
-                                    self._mp_fanin_mode,
-                                )
-                                continue
-
-                per_src = fanin_by_dst.get(dst)
-                if not per_src:
-                    out[dst] = x_dict[dst].new_zeros((dim_size, self.embedding_size))
-                    continue
-                inputs = []
-                indices = []
-                rel_parts = []
-                mp_src_parts = []
-                mp_dst_parts = []
-                for src, (src_idx, dst_idx) in per_src.items():
-                    if src not in x_dict:
-                        continue
-                    x_src = x_dict[src]
-                    if x_src.numel() == 0:
-                        continue
-                    if int(x_src.size(-1)) != self.embedding_size:
+            packed_plan = mp_fanin_packed_plans.get(dst)
+            if use_mp_fanin and packed_plan is not None:
+                rel_parts: list[Tensor] = []
+                plan_ok = True
+                for src, expected_rows in zip(
+                    packed_plan["rel_order"], packed_plan["rel_rows"]
+                ):
+                    rel_src = x_dict.get(src)
+                    if rel_src is None:
+                        plan_ok = False
+                        break
+                    if int(rel_src.size(-1)) != self.embedding_size:
                         raise ValueError(
-                            f"Label fanin source {src!r} has embedding dim {int(x_src.size(-1))} "
+                            f"Label fanin source {src!r} has embedding dim {int(rel_src.size(-1))} "
                             f"(expected {self.embedding_size})."
                         )
-                    if use_mp_fanin:
-                        rel_parts.append(x_src)
-                        mp_src_parts.append(src_idx)
-                        mp_dst_parts.append(dst_idx)
+                    if self.validate_routing and int(rel_src.size(0)) != int(expected_rows):
+                        raise ValueError(
+                            f"Label fanin packed plan size changed for {src!r}: "
+                            f"expected {int(expected_rows)}, got {int(rel_src.size(0))}."
+                        )
+                    rel_parts.append(rel_src)
+                if plan_ok and rel_parts:
+                    rel_cat = _cat_or_single(rel_parts, dim=0)
+                    if self.validate_routing and int(rel_cat.size(0)) != int(
+                        packed_plan["rel_cat_rows"]
+                    ):
+                        raise ValueError(
+                            "Label fanin packed plan row mismatch: "
+                            f"expected {int(packed_plan['rel_cat_rows'])}, got {int(rel_cat.size(0))}."
+                        )
+                    if use_mp_fanin_reduce:
+                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                            rel_cat,
+                            packed_plan["flat_src"],
+                            packed_plan["dst_idx"],
+                            dim_size,
+                            self._mp_fanin_mode,
+                        )
                     else:
-                        inputs.append(x_src.index_select(0, src_idx))
-                        indices.append(dst_idx)
+                        flat_inputs = rel_cat.index_select(0, packed_plan["flat_src"])
+                        out[dst] = self.aggr(
+                            x=flat_inputs,
+                            index=packed_plan["dst_idx"],
+                            dim=0,
+                            dim_size=dim_size,
+                        )
+                    continue
 
-                if use_mp_fanin and rel_parts:
-                    rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
+            edge_plan = mp_fanin_edge_plans.get(dst)
+            if use_mp_fanin and edge_plan is not None and len(edge_plan["edge_src_parts"]) > 0:
+                rel_parts = []
+                plan_ok = True
+                for src in edge_plan["rel_order"]:
+                    rel_src = x_dict.get(src)
+                    if rel_src is None:
+                        plan_ok = False
+                        break
+                    if int(rel_src.size(-1)) != self.embedding_size:
+                        raise ValueError(
+                            f"Label fanin source {src!r} has embedding dim {int(rel_src.size(-1))} "
+                            f"(expected {self.embedding_size})."
+                        )
+                    rel_parts.append(rel_src)
+                if plan_ok and rel_parts:
+                    rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
                         rel_parts,
-                        mp_src_parts,
-                        mp_dst_parts,
+                        list(edge_plan["edge_src_parts"]),
+                        list(edge_plan["edge_dst_parts"]),
+                        list(edge_plan["rel_part_ids"]),
+                        list(edge_plan["arity_parts"]),
+                        list(edge_plan["pos_parts"]),
+                        int(edge_plan["mode"]),
                     )
                     if use_mp_fanin_reduce:
                         out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
@@ -729,26 +751,132 @@ class BatchedFanInMP(torch.nn.Module):
                         )
                     continue
 
-                if not inputs:
-                    out[dst] = x_dict[dst].new_zeros((dim_size, self.embedding_size))
-                    continue
+            if use_mp_fanin_reduce:
+                plan = mp_fanin_label_plans.get(dst)
+                if plan is not None:
+                    rel_parts: list[torch.Tensor] = []
+                    plan_ok = True
+                    for src in plan["src_order"]:
+                        rel_src = x_dict.get(src)
+                        if rel_src is None:
+                            plan_ok = False
+                            break
+                        if int(rel_src.size(-1)) != self.embedding_size:
+                            raise ValueError(
+                                f"Label fanin source {src!r} has embedding dim {int(rel_src.size(-1))} "
+                                f"(expected {self.embedding_size})."
+                            )
+                        rel_parts.append(rel_src)
+                    if plan_ok and rel_parts:
+                        rel_cat = _cat_or_single(rel_parts, dim=0)
+                        if (not self.validate_routing) or int(rel_cat.size(0)) == int(
+                            plan["total_src_rows"]
+                        ):
+                            out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                                rel_cat,
+                                plan["flat_src"],
+                                plan["dst_idx"],
+                                dim_size,
+                                self._mp_fanin_mode,
+                            )
+                            continue
 
-                flat_inputs = inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=0)
-                flat_indices = indices[0] if len(indices) == 1 else torch.cat(indices, dim=0)
-                out[dst] = self.aggr(x=flat_inputs, index=flat_indices, dim=0, dim_size=dim_size)
+            per_src = fanin_by_dst.get(dst)
+            if not per_src:
+                out[dst] = x_dict[dst].new_zeros((dim_size, self.embedding_size))
+                continue
+            inputs = []
+            indices = []
+            rel_parts = []
+            mp_src_parts = []
+            mp_dst_parts = []
+            for src, (src_idx, dst_idx) in per_src.items():
+                if src not in x_dict:
+                    continue
+                x_src = x_dict[src]
+                if x_src.numel() == 0:
+                    continue
+                if int(x_src.size(-1)) != self.embedding_size:
+                    raise ValueError(
+                        f"Label fanin source {src!r} has embedding dim {int(x_src.size(-1))} "
+                        f"(expected {self.embedding_size})."
+                    )
+                if use_mp_fanin:
+                    rel_parts.append(x_src)
+                    mp_src_parts.append(src_idx)
+                    mp_dst_parts.append(dst_idx)
+                else:
+                    inputs.append(x_src.index_select(0, src_idx))
+                    indices.append(dst_idx)
+
+            if use_mp_fanin and rel_parts:
+                rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
+                    rel_parts,
+                    mp_src_parts,
+                    mp_dst_parts,
+                )
+                if use_mp_fanin_reduce:
+                    out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                        rel_cat,
+                        flat_src_all,
+                        dst_all,
+                        dim_size,
+                        self._mp_fanin_mode,
+                    )
+                else:
+                    flat_inputs = rel_cat.index_select(0, flat_src_all)
+                    out[dst] = self.aggr(
+                        x=flat_inputs,
+                        index=dst_all,
+                        dim=0,
+                        dim_size=dim_size,
+                    )
                 continue
 
-            if use_mp_fanin_reduce:
-                global_plan = mp_fanin_global_plans.get(dst)
-                if global_plan is not None and isinstance(rel_flat_shared, torch.Tensor):
-                    if (
-                        rel_flat_shared.device == x_dict[dst].device
-                        and int(rel_flat_shared.size(-1)) == self.embedding_size
-                        and (
-                            (not self.validate_routing)
-                            or int(rel_flat_shared.size(0)) == int(global_plan["total_slots"])
-                        )
-                    ):
+            if not inputs:
+                out[dst] = x_dict[dst].new_zeros((dim_size, self.embedding_size))
+                continue
+
+            flat_inputs = inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=0)
+            flat_indices = indices[0] if len(indices) == 1 else torch.cat(indices, dim=0)
+            out[dst] = self.aggr(x=flat_inputs, index=flat_indices, dim=0, dim_size=dim_size)
+        return out
+
+    def _forward_relation_lane(
+        self,
+        *,
+        x_dict: Dict[str, Tensor],
+        fanin_by_dst: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]],
+        mp_fanin_plans: dict[str, dict[str, Any]],
+        mp_fanin_global_plans: dict[str, dict[str, Any]],
+        mp_fanin_edge_plans: dict[str, dict[str, Any]],
+        mp_fanin_packed_plans: dict[str, dict[str, Any]],
+        rel_flat_shared: torch.Tensor | None,
+    ) -> Dict[str, Tensor]:
+        out: Dict[str, Tensor] = {}
+        for dst in self.dst_types:
+            if dst not in x_dict:
+                continue
+            dim_size = int(x_dict[dst].size(0))
+            use_mp_fanin_reduce = (
+                self._mp_fanin_mode is not None
+                and _use_model_mp_batched_fanin_reduce(x_dict[dst])
+            )
+            use_mp_fanin_pack = _use_model_mp_batched_fanin_pack(x_dict[dst])
+            use_mp_fanin = use_mp_fanin_reduce or use_mp_fanin_pack
+
+            # Prefer the canonical flattened fanout handoff when available.
+            global_plan = mp_fanin_global_plans.get(dst)
+            if global_plan is not None and isinstance(rel_flat_shared, torch.Tensor):
+                if (
+                    rel_flat_shared.device == x_dict[dst].device
+                    and int(rel_flat_shared.size(-1)) == self.embedding_size
+                    and (
+                        (not self.validate_routing)
+                        or int(rel_flat_shared.size(0)) == int(global_plan["total_slots"])
+                    )
+                ):
+                    if use_mp_fanin_reduce:
                         out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                             rel_flat_shared,
                             global_plan["flat_src"],
@@ -756,7 +884,110 @@ class BatchedFanInMP(torch.nn.Module):
                             dim_size,
                             self._mp_fanin_mode,
                         )
-                        continue
+                    else:
+                        flat_inputs = rel_flat_shared.index_select(0, global_plan["flat_src"])
+                        out[dst] = self.aggr(
+                            x=flat_inputs,
+                            index=global_plan["dst_idx"],
+                            dim=0,
+                            dim_size=dim_size,
+                        )
+                    continue
+
+            packed_plan = mp_fanin_packed_plans.get(dst)
+            if use_mp_fanin and packed_plan is not None:
+                rel_parts: list[Tensor] = []
+                plan_ok = True
+                for pred, expected_rows in zip(packed_plan["rel_order"], packed_plan["rel_rows"]):
+                    rel_pred = x_dict.get(pred)
+                    if rel_pred is None:
+                        plan_ok = False
+                        break
+                    arity = int(self.relation_arities.get(pred, 0))
+                    exp = arity * self.embedding_size
+                    if int(rel_pred.size(-1)) != exp:
+                        raise ValueError(
+                            f"Predicate {pred!r} has arity {arity}, but embedding dim is {int(rel_pred.size(-1))} (expected {exp})."
+                        )
+                    rel_flat = rel_pred.view(-1, self.embedding_size)
+                    if self.validate_routing and int(rel_flat.size(0)) != int(expected_rows):
+                        raise ValueError(
+                            f"Relation fanin packed plan size changed for {pred!r}: "
+                            f"expected {int(expected_rows)}, got {int(rel_flat.size(0))}."
+                        )
+                    rel_parts.append(rel_flat)
+                if plan_ok and rel_parts:
+                    rel_cat = _cat_or_single(rel_parts, dim=0)
+                    if self.validate_routing and int(rel_cat.size(0)) != int(
+                        packed_plan["rel_cat_rows"]
+                    ):
+                        raise ValueError(
+                            "Relation fanin packed plan row mismatch: "
+                            f"expected {int(packed_plan['rel_cat_rows'])}, got {int(rel_cat.size(0))}."
+                        )
+                    if use_mp_fanin_reduce:
+                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                            rel_cat,
+                            packed_plan["flat_src"],
+                            packed_plan["dst_idx"],
+                            dim_size,
+                            self._mp_fanin_mode,
+                        )
+                    else:
+                        flat_inputs = rel_cat.index_select(0, packed_plan["flat_src"])
+                        out[dst] = self.aggr(
+                            x=flat_inputs,
+                            index=packed_plan["dst_idx"],
+                            dim=0,
+                            dim_size=dim_size,
+                        )
+                    continue
+
+            edge_plan = mp_fanin_edge_plans.get(dst)
+            if use_mp_fanin and edge_plan is not None and len(edge_plan["edge_src_parts"]) > 0:
+                rel_parts = []
+                plan_ok = True
+                for pred in edge_plan["rel_order"]:
+                    rel_pred = x_dict.get(pred)
+                    if rel_pred is None:
+                        plan_ok = False
+                        break
+                    arity = int(self.relation_arities.get(pred, 0))
+                    exp = arity * self.embedding_size
+                    if int(rel_pred.size(-1)) != exp:
+                        raise ValueError(
+                            f"Predicate {pred!r} has arity {arity}, but embedding dim is {int(rel_pred.size(-1))} (expected {exp})."
+                        )
+                    rel_parts.append(rel_pred.view(-1, self.embedding_size))
+                if plan_ok and rel_parts:
+                    rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
+                        rel_parts,
+                        list(edge_plan["edge_src_parts"]),
+                        list(edge_plan["edge_dst_parts"]),
+                        list(edge_plan["rel_part_ids"]),
+                        list(edge_plan["arity_parts"]),
+                        list(edge_plan["pos_parts"]),
+                        int(edge_plan["mode"]),
+                    )
+                    if use_mp_fanin_reduce:
+                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                            rel_cat,
+                            flat_src_all,
+                            dst_all,
+                            dim_size,
+                            self._mp_fanin_mode,
+                        )
+                    else:
+                        flat_inputs = rel_cat.index_select(0, flat_src_all)
+                        out[dst] = self.aggr(
+                            x=flat_inputs,
+                            index=dst_all,
+                            dim=0,
+                            dim_size=dim_size,
+                        )
+                    continue
+
+            if use_mp_fanin_reduce:
                 plan = mp_fanin_plans.get(dst)
                 if plan is not None:
                     rel_parts: list[torch.Tensor] = []
@@ -845,3 +1076,281 @@ class BatchedFanInMP(torch.nn.Module):
             out[dst] = self.aggr(x=flat_inputs, index=flat_indices, dim=0, dim_size=dim_size)
 
         return out
+
+    def forward(
+        self,
+        x_dict: Dict[str, Tensor],
+        edge_index_dict: Dict[EdgeType, Adj],
+        *,
+        cache: dict | None = None,
+        relation_messages: Mapping[str, Tensor] | None = None,
+        **_: Any,
+    ) -> Dict[str, Tensor]:
+        if not edge_index_dict:
+            return {}
+        if relation_messages:
+            merged_x_dict = dict(x_dict)
+            merged_x_dict.update(relation_messages)
+            x_dict = merged_x_dict
+        cache = cache if cache is not None else {}
+
+        # See BatchedFanOutMP for the shared cache layout. We store fanin routing under
+        # a per-instance key in cache["routing"] to avoid collisions with fanout routing
+        # and with other BatchedFanInMP modules sharing one cache dict.
+        routing_root = cache.setdefault("routing", {})
+        routing = routing_root.get(self._routing_cache_key)
+        if routing is None:
+            # fanin_by_dst[dst][pred] = (flat_src, dst_idx)
+            tmp: dict[tuple[str, str], list[tuple[torch.Tensor, torch.Tensor]]] = defaultdict(list)
+            tmp_cpp_edges: dict[
+                tuple[str, str], list[tuple[torch.Tensor, torch.Tensor, int, int]]
+            ] = defaultdict(list)
+            for edge_type, edge_index in edge_index_dict.items():
+                src, rel, dst = edge_type
+                if not self._match_dst(dst):
+                    continue
+                if edge_index is None or edge_index.numel() == 0:
+                    continue
+
+                if self._label_mode:
+                    if not self._match_src(src):
+                        continue
+                    if not self._match_edge_label(rel):
+                        continue
+                    tmp[(dst, src)].append((edge_index[0], edge_index[1]))
+                    tmp_cpp_edges[(dst, src)].append((edge_index[0], edge_index[1], 1, 0))
+                    continue
+
+                if src not in self.relation_arities:
+                    continue
+                try:
+                    pos = int(rel)
+                except (TypeError, ValueError):
+                    if self.validate_routing:
+                        raise AssertionError(
+                            f"Fanin routing expects integer edge positions, got rel={rel!r} for pred={src!r}."
+                        )
+                    continue
+                arity = int(self.relation_arities.get(src, 0))
+                if pos < 0 or pos >= arity:
+                    if self.validate_routing and arity > 0:
+                        raise AssertionError(
+                            f"Fanin routing pos out of range: pred={src!r} pos={pos} arity={arity}."
+                        )
+                    continue
+                flat_src = edge_index[0] * arity + pos
+                tmp[(dst, src)].append((flat_src, edge_index[1]))
+                tmp_cpp_edges[(dst, src)].append((edge_index[0], edge_index[1], arity, pos))
+
+            fanin_by_dst: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = defaultdict(dict)
+            for (dst, pred), parts in tmp.items():
+                flat_srcs = [p[0] for p in parts]
+                dst_idxs = [p[1] for p in parts]
+                flat_src = _cat_or_single(flat_srcs, dim=0)
+                dst_idx = _cat_or_single(dst_idxs, dim=0)
+                fanin_by_dst[dst][pred] = (flat_src, dst_idx)
+
+            mp_fanin_plans: dict[str, dict[str, Any]] = {}
+            mp_fanin_global_plans: dict[str, dict[str, Any]] = {}
+            mp_fanin_label_plans: dict[str, dict[str, Any]] = {}
+            mp_fanin_edge_plans: dict[str, dict[str, Any]] = {}
+            mp_fanin_packed_plans: dict[str, dict[str, Any]] = {}
+            if self._label_mode:
+                for dst, per_src in fanin_by_dst.items():
+                    src_order: list[str] = []
+                    src_rows: list[int] = []
+                    flat_src_parts: list[torch.Tensor] = []
+                    dst_parts: list[torch.Tensor] = []
+                    src_offset = 0
+                    for src in sorted(per_src.keys()):
+                        if src not in x_dict:
+                            continue
+                        x_src = x_dict[src]
+                        if x_src.numel() == 0:
+                            continue
+                        rows = int(x_src.size(0))
+                        src_idx, dst_idx = per_src[src]
+                        src_order.append(src)
+                        src_rows.append(rows)
+                        flat_src_parts.append(src_idx + int(src_offset))
+                        dst_parts.append(dst_idx)
+                        src_offset += rows
+                    if src_order:
+                        mp_fanin_label_plans[dst] = {
+                            "src_order": tuple(src_order),
+                            "src_rows": tuple(src_rows),
+                            "total_src_rows": int(src_offset),
+                            "flat_src": _cat_or_single(flat_src_parts, dim=0),
+                            "dst_idx": _cat_or_single(dst_parts, dim=0),
+                        }
+            else:
+                for dst, per_pred in fanin_by_dst.items():
+                    pred_order: list[str] = []
+                    rel_rows: list[int] = []
+                    flat_src_parts: list[torch.Tensor] = []
+                    dst_parts: list[torch.Tensor] = []
+                    rel_offset = 0
+                    for pred in sorted(per_pred.keys()):
+                        if pred not in x_dict:
+                            continue
+                        x_pred = x_dict[pred]
+                        if x_pred.numel() == 0:
+                            continue
+                        arity = int(self.relation_arities.get(pred, 0))
+                        rows = int(x_pred.size(0) * arity)
+                        flat_src, dst_idx = per_pred[pred]
+                        pred_order.append(pred)
+                        rel_rows.append(rows)
+                        flat_src_parts.append(flat_src + int(rel_offset))
+                        dst_parts.append(dst_idx)
+                        rel_offset += rows
+                    if pred_order:
+                        mp_fanin_plans[dst] = {
+                            "pred_order": tuple(pred_order),
+                            "rel_rows": tuple(rel_rows),
+                            "total_rel_rows": int(rel_offset),
+                            "flat_src": _cat_or_single(flat_src_parts, dim=0),
+                            "dst_idx": _cat_or_single(dst_parts, dim=0),
+                        }
+
+                fanout_routing = routing_root.get("fanout")
+                pred_slot_offsets: dict[str, int] = {}
+                total_slots = 0
+                if fanout_routing is not None:
+                    total_slots = int(fanout_routing.get("total_slots", 0))
+                    for pred, _n, _arity, slot_offset in fanout_routing.get("pred_meta", []):
+                        pred_slot_offsets[str(pred)] = int(slot_offset)
+                if pred_slot_offsets:
+                    for dst, per_pred in fanin_by_dst.items():
+                        flat_src_parts: list[torch.Tensor] = []
+                        dst_parts: list[torch.Tensor] = []
+                        for pred in sorted(per_pred.keys()):
+                            slot_offset = pred_slot_offsets.get(pred)
+                            if slot_offset is None:
+                                continue
+                            flat_src, dst_idx = per_pred[pred]
+                            flat_src_parts.append(flat_src + int(slot_offset))
+                            dst_parts.append(dst_idx)
+                        if flat_src_parts:
+                            mp_fanin_global_plans[dst] = {
+                                "flat_src": _cat_or_single(flat_src_parts, dim=0),
+                                "dst_idx": _cat_or_single(dst_parts, dim=0),
+                                "total_slots": int(total_slots),
+                            }
+
+            by_dst_cpp_edges: dict[str, dict[str, list[tuple[Tensor, Tensor, int, int]]]] = defaultdict(dict)
+            for (dst, rel_name), entries in tmp_cpp_edges.items():
+                by_dst_cpp_edges[dst][rel_name] = entries
+            for dst, per_rel in by_dst_cpp_edges.items():
+                rel_order = tuple(sorted(per_rel.keys()))
+                rel_part_index = {rel_name: idx for idx, rel_name in enumerate(rel_order)}
+                edge_src_parts: list[Tensor] = []
+                edge_dst_parts: list[Tensor] = []
+                rel_part_ids: list[int] = []
+                arity_parts: list[int] = []
+                pos_parts: list[int] = []
+                for rel_name in rel_order:
+                    for src_idx, dst_idx, arity, pos in per_rel[rel_name]:
+                        edge_src_parts.append(src_idx)
+                        edge_dst_parts.append(dst_idx)
+                        rel_part_ids.append(int(rel_part_index[rel_name]))
+                        arity_parts.append(int(arity))
+                        pos_parts.append(int(pos))
+                mp_fanin_edge_plans[dst] = {
+                    "rel_order": rel_order,
+                    "edge_src_parts": tuple(edge_src_parts),
+                    "edge_dst_parts": tuple(edge_dst_parts),
+                    "rel_part_ids": tuple(rel_part_ids),
+                    "arity_parts": tuple(arity_parts),
+                    "pos_parts": tuple(pos_parts),
+                    "mode": int(1 if self._label_mode else 0),
+                }
+
+            for dst, edge_plan in mp_fanin_edge_plans.items():
+                if len(edge_plan["edge_src_parts"]) == 0:
+                    continue
+                rel_parts: list[Tensor] = []
+                rel_rows: list[int] = []
+                plan_ok = True
+                for rel_name in edge_plan["rel_order"]:
+                    rel_tensor = x_dict.get(rel_name)
+                    if rel_tensor is None:
+                        plan_ok = False
+                        break
+                    if self._label_mode:
+                        if int(rel_tensor.size(-1)) != self.embedding_size:
+                            raise ValueError(
+                                f"Label fanin source {rel_name!r} has embedding dim {int(rel_tensor.size(-1))} "
+                                f"(expected {self.embedding_size})."
+                            )
+                        rel_flat = rel_tensor
+                    else:
+                        arity = int(self.relation_arities.get(rel_name, 0))
+                        exp = arity * self.embedding_size
+                        if int(rel_tensor.size(-1)) != exp:
+                            raise ValueError(
+                                f"Predicate {rel_name!r} has arity {arity}, but embedding dim is {int(rel_tensor.size(-1))} (expected {exp})."
+                            )
+                        rel_flat = rel_tensor.view(-1, self.embedding_size)
+                    rel_parts.append(rel_flat)
+                    rel_rows.append(int(rel_flat.size(0)))
+                if not plan_ok or not rel_parts:
+                    continue
+                try:
+                    rel_cat_pre, flat_src_pre, dst_pre = relm_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
+                        rel_parts,
+                        list(edge_plan["edge_src_parts"]),
+                        list(edge_plan["edge_dst_parts"]),
+                        list(edge_plan["rel_part_ids"]),
+                        list(edge_plan["arity_parts"]),
+                        list(edge_plan["pos_parts"]),
+                        int(edge_plan["mode"]),
+                    )
+                except Exception:
+                    if self.validate_routing:
+                        raise
+                    continue
+                mp_fanin_packed_plans[dst] = {
+                    "rel_order": edge_plan["rel_order"],
+                    "rel_rows": tuple(rel_rows),
+                    "rel_cat_rows": int(rel_cat_pre.size(0)),
+                    "flat_src": flat_src_pre,
+                    "dst_idx": dst_pre,
+                }
+
+            routing = {
+                "fanin_by_dst": dict(fanin_by_dst),
+                "mp_fanin_plans": mp_fanin_plans,
+                "mp_fanin_global_plans": mp_fanin_global_plans,
+                "mp_fanin_label_plans": mp_fanin_label_plans,
+                "mp_fanin_edge_plans": mp_fanin_edge_plans,
+                "mp_fanin_packed_plans": mp_fanin_packed_plans,
+            }
+            routing_root[self._routing_cache_key] = routing
+
+        fanin_by_dst = routing["fanin_by_dst"]
+        mp_fanin_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_plans", {})
+        mp_fanin_global_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_global_plans", {})
+        mp_fanin_label_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_label_plans", {})
+        mp_fanin_edge_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_edge_plans", {})
+        mp_fanin_packed_plans: dict[str, dict[str, Any]] = routing.get("mp_fanin_packed_plans", {})
+        layer_state = cache.get("layer_state")
+        rel_flat_shared = layer_state.get("fanout_rel_flat_all") if isinstance(layer_state, dict) else None
+        if self._label_mode:
+            return self._forward_label_lane(
+                x_dict=x_dict,
+                fanin_by_dst=fanin_by_dst,
+                mp_fanin_label_plans=mp_fanin_label_plans,
+                mp_fanin_edge_plans=mp_fanin_edge_plans,
+                mp_fanin_packed_plans=mp_fanin_packed_plans,
+            )
+
+        return self._forward_relation_lane(
+            x_dict=x_dict,
+            fanin_by_dst=fanin_by_dst,
+            mp_fanin_plans=mp_fanin_plans,
+            mp_fanin_global_plans=mp_fanin_global_plans,
+            mp_fanin_edge_plans=mp_fanin_edge_plans,
+            mp_fanin_packed_plans=mp_fanin_packed_plans,
+            rel_flat_shared=rel_flat_shared,
+        )

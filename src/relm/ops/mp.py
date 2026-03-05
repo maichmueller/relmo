@@ -27,6 +27,14 @@ _VERSION_RE = re.compile(r"^(\d+)\.(\d+)")
 _MODE_SUM = 0
 _MODE_LOGSUMEXP = 1
 
+_PW_IDENTITY = 0
+_PW_RELU = 1
+_PW_MISH = 2
+_PW_GELU_NONE = 3
+_PW_GELU_TANH = 4
+_PW_SILU = 5
+_PW_TANH = 6
+
 _REQUIRED_NAMESPACE_OPS = (
     "fanout_scatter",
     "fanout_scatter_backward",
@@ -356,6 +364,331 @@ def _fanin_pack_multi_python(
     return rel_cat, flat_src, dst_idx
 
 
+def _grouped_stack_from_flat_python(
+    flat: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+) -> torch.Tensor:
+    if flat.dim() != 2:
+        raise ValueError("grouped_stack_from_flat expects flat to be rank-2.")
+    if len(slot_offsets) != len(row_sizes):
+        raise ValueError(
+            "grouped_stack_from_flat expects slot_offsets and row_sizes with equal lengths."
+        )
+    arity_i = int(arity)
+    if arity_i <= 0:
+        raise ValueError("grouped_stack_from_flat expects arity > 0.")
+    groups = len(slot_offsets)
+    emb = int(flat.size(1))
+    in_dim = int(arity_i * emb)
+    max_rows = max((int(n) for n in row_sizes), default=0)
+    out = flat.new_zeros((groups, max_rows, in_dim))
+    if groups == 0 or max_rows == 0:
+        return out
+    flat_rows = int(flat.size(0))
+    for i, (slot, rows) in enumerate(zip(slot_offsets, row_sizes)):
+        n = int(rows)
+        if n <= 0:
+            continue
+        start = int(slot)
+        span = int(n * arity_i)
+        if start < 0:
+            raise ValueError("grouped_stack_from_flat expects non-negative slot offsets.")
+        if start + span > flat_rows:
+            raise ValueError(
+                "grouped_stack_from_flat slice out of bounds: "
+                f"start={start} span={span} flat_rows={flat_rows}."
+            )
+        src = flat.narrow(0, start, span).view(n, in_dim)
+        out[i, :n, :].copy_(src)
+    return out
+
+
+def _apply_pointwise_code(x: torch.Tensor, code: int) -> torch.Tensor:
+    code_i = int(code)
+    if code_i == _PW_IDENTITY:
+        return x
+    if code_i == _PW_RELU:
+        return torch.relu(x)
+    if code_i == _PW_MISH:
+        return torch.nn.functional.mish(x)
+    if code_i == _PW_GELU_NONE:
+        return torch.nn.functional.gelu(x, approximate="none")
+    if code_i == _PW_GELU_TANH:
+        return torch.nn.functional.gelu(x, approximate="tanh")
+    if code_i == _PW_SILU:
+        return torch.nn.functional.silu(x)
+    if code_i == _PW_TANH:
+        return torch.tanh(x)
+    raise ValueError(f"Unsupported pointwise code: {code_i!r}.")
+
+
+def _grouped_residual_mlp_from_flat_python(
+    flat: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    weight_stacks: list[torch.Tensor],
+    bias_stacks: list[torch.Tensor],
+    op_kinds: list[int],
+    op_indices: list[int],
+    pointwise_codes: list[int],
+    truncated_dim: int,
+    truncate_right: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if flat.dim() != 2:
+        raise ValueError("grouped_residual_mlp_from_flat expects flat to be rank-2.")
+    if len(slot_offsets) != len(row_sizes):
+        raise ValueError(
+            "grouped_residual_mlp_from_flat expects slot_offsets and row_sizes with equal lengths."
+        )
+    if len(op_kinds) != len(op_indices):
+        raise ValueError(
+            "grouped_residual_mlp_from_flat expects op_kinds and op_indices with equal lengths."
+        )
+    arity_i = int(arity)
+    if arity_i <= 0:
+        raise ValueError("grouped_residual_mlp_from_flat expects arity > 0.")
+    groups = len(slot_offsets)
+    emb = int(flat.size(1))
+    in_dim = int(emb * arity_i)
+    max_rows = max((int(n) for n in row_sizes), default=0)
+    x_stack = flat.new_zeros((groups, max_rows, in_dim))
+    flat_rows = int(flat.size(0))
+    for i, (slot, rows) in enumerate(zip(slot_offsets, row_sizes)):
+        n = int(rows)
+        if n <= 0:
+            continue
+        start = int(slot)
+        span = int(n * arity_i)
+        if start < 0:
+            raise ValueError(
+                "grouped_residual_mlp_from_flat expects non-negative slot offsets."
+            )
+        if start + span > flat_rows:
+            raise ValueError(
+                "grouped_residual_mlp_from_flat slice out of bounds: "
+                f"start={start} span={span} flat_rows={flat_rows}."
+            )
+        x_stack[i, :n, :] = flat.narrow(0, start, span).view(n, in_dim)
+
+    out_stack = x_stack
+    for kind, op_idx in zip(op_kinds, op_indices):
+        kind_i = int(kind)
+        idx_i = int(op_idx)
+        if kind_i == 0:
+            if idx_i < 0 or idx_i >= len(weight_stacks):
+                raise ValueError(
+                    f"Linear op index out of range in grouped_residual_mlp_from_flat: {idx_i}."
+                )
+            w = weight_stacks[idx_i]
+            out_stack = torch.matmul(out_stack, w.transpose(1, 2))
+            if idx_i < len(bias_stacks):
+                b = bias_stacks[idx_i]
+                if b.numel() > 0:
+                    out_stack = out_stack + b[:, None, :]
+        elif kind_i == 1:
+            if idx_i < 0 or idx_i >= len(pointwise_codes):
+                raise ValueError(
+                    f"Pointwise op index out of range in grouped_residual_mlp_from_flat: {idx_i}."
+                )
+            out_stack = _apply_pointwise_code(out_stack, int(pointwise_codes[idx_i]))
+        else:
+            raise ValueError(
+                f"Unsupported op kind in grouped_residual_mlp_from_flat: {kind_i}."
+            )
+
+    trunc_dim = int(truncated_dim)
+    if trunc_dim >= 0 and int(x_stack.size(-1)) != trunc_dim:
+        if bool(truncate_right):
+            out_stack = x_stack[..., :trunc_dim] + out_stack
+        else:
+            out_stack = x_stack[..., -trunc_dim:] + out_stack
+    else:
+        out_stack = x_stack + out_stack
+
+    rel_parts: list[torch.Tensor] = []
+    flat_parts: list[torch.Tensor] = []
+    for i, (slot, rows) in enumerate(zip(slot_offsets, row_sizes)):
+        n = int(rows)
+        if n <= 0:
+            continue
+        rel_i = out_stack[i, :n, :].contiguous().view(n * arity_i, emb)
+        flat_i = torch.arange(
+            n * arity_i, device=flat.device, dtype=torch.int64
+        ) + int(slot)
+        rel_parts.append(rel_i)
+        flat_parts.append(flat_i)
+    if not rel_parts:
+        return flat.new_empty((0, emb)), torch.empty(
+            0, device=flat.device, dtype=torch.int64
+        )
+    rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
+    flat_dst = flat_parts[0] if len(flat_parts) == 1 else torch.cat(flat_parts, dim=0)
+    return rel_cat, flat_dst
+
+
+def _fanout_pack_from_edges_python(
+    x_parts: list[torch.Tensor],
+    edge_src_parts: list[torch.Tensor],
+    edge_dst_parts: list[torch.Tensor],
+    src_part_ids: list[int],
+    arity_parts: list[int],
+    pos_parts: list[int],
+    slot_offset_parts: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not x_parts:
+        raise ValueError("fanout_pack_from_edges requires at least one source tensor.")
+    n = len(edge_src_parts)
+    if not (
+        len(edge_dst_parts)
+        == len(src_part_ids)
+        == len(arity_parts)
+        == len(pos_parts)
+        == len(slot_offset_parts)
+        == n
+    ):
+        raise ValueError(
+            "fanout_pack_from_edges expects edge parts and metadata with equal lengths."
+        )
+    ref = x_parts[0]
+    x_offsets: list[int] = []
+    row_offset = 0
+    for x in x_parts:
+        if x.dim() != 2:
+            raise ValueError("fanout_pack_from_edges expects each source tensor to be rank-2.")
+        x_offsets.append(int(row_offset))
+        row_offset += int(x.size(0))
+    x_cat = x_parts[0] if len(x_parts) == 1 else torch.cat(x_parts, dim=0)
+
+    src_global_parts: list[torch.Tensor] = []
+    flat_dst_parts: list[torch.Tensor] = []
+    for edge_src, edge_dst, src_part, arity, pos, slot_offset in zip(
+        edge_src_parts,
+        edge_dst_parts,
+        src_part_ids,
+        arity_parts,
+        pos_parts,
+        slot_offset_parts,
+    ):
+        if edge_src.dim() != 1 or edge_dst.dim() != 1:
+            raise ValueError("fanout_pack_from_edges expects rank-1 edge src/dst tensors.")
+        if edge_src.dtype != torch.int64 or edge_dst.dtype != torch.int64:
+            raise ValueError("fanout_pack_from_edges expects int64 edge src/dst tensors.")
+        if edge_src.numel() != edge_dst.numel():
+            raise ValueError("fanout_pack_from_edges expects edge src/dst lengths to match.")
+        if int(src_part) < 0 or int(src_part) >= len(x_parts):
+            raise ValueError(f"fanout_pack_from_edges src_part_ids out of range: {src_part!r}.")
+        arity_i = int(arity)
+        pos_i = int(pos)
+        if arity_i <= 0:
+            raise ValueError("fanout_pack_from_edges expects arity > 0.")
+        if pos_i < 0 or pos_i >= arity_i:
+            raise ValueError(
+                f"fanout_pack_from_edges expects pos in [0, arity), got pos={pos_i} arity={arity_i}."
+            )
+        src_global_parts.append(edge_src + int(x_offsets[int(src_part)]))
+        flat_dst_parts.append(int(slot_offset) + edge_dst * arity_i + pos_i)
+
+    if src_global_parts:
+        src_global = (
+            src_global_parts[0]
+            if len(src_global_parts) == 1
+            else torch.cat(src_global_parts, dim=0)
+        )
+        flat_dst = (
+            flat_dst_parts[0] if len(flat_dst_parts) == 1 else torch.cat(flat_dst_parts, dim=0)
+        )
+    else:
+        src_global = torch.empty(0, device=ref.device, dtype=torch.int64)
+        flat_dst = torch.empty(0, device=ref.device, dtype=torch.int64)
+    return x_cat, src_global, flat_dst
+
+
+def _fanin_pack_from_edges_python(
+    rel_parts: list[torch.Tensor],
+    edge_src_parts: list[torch.Tensor],
+    edge_dst_parts: list[torch.Tensor],
+    rel_part_ids: list[int],
+    arity_parts: list[int],
+    pos_parts: list[int],
+    mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not rel_parts:
+        raise ValueError("fanin_pack_from_edges requires at least one relation tensor.")
+    mode_i = int(mode)
+    if mode_i not in (0, 1):
+        raise ValueError(f"fanin_pack_from_edges expects mode in {{0,1}}, got {mode_i!r}.")
+    n = len(edge_src_parts)
+    if not (
+        len(edge_dst_parts)
+        == len(rel_part_ids)
+        == len(arity_parts)
+        == len(pos_parts)
+        == n
+    ):
+        raise ValueError(
+            "fanin_pack_from_edges expects edge parts and metadata with equal lengths."
+        )
+    ref = rel_parts[0]
+    rel_offsets: list[int] = []
+    row_offset = 0
+    for rel in rel_parts:
+        if rel.dim() != 2:
+            raise ValueError("fanin_pack_from_edges expects each relation tensor to be rank-2.")
+        rel_offsets.append(int(row_offset))
+        row_offset += int(rel.size(0))
+    rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
+
+    flat_src_parts: list[torch.Tensor] = []
+    dst_cat_parts: list[torch.Tensor] = []
+    for edge_src, edge_dst, rel_part, arity, pos in zip(
+        edge_src_parts,
+        edge_dst_parts,
+        rel_part_ids,
+        arity_parts,
+        pos_parts,
+    ):
+        if edge_src.dim() != 1 or edge_dst.dim() != 1:
+            raise ValueError("fanin_pack_from_edges expects rank-1 edge src/dst tensors.")
+        if edge_src.dtype != torch.int64 or edge_dst.dtype != torch.int64:
+            raise ValueError("fanin_pack_from_edges expects int64 edge src/dst tensors.")
+        if edge_src.numel() != edge_dst.numel():
+            raise ValueError("fanin_pack_from_edges expects edge src/dst lengths to match.")
+        rel_part_i = int(rel_part)
+        if rel_part_i < 0 or rel_part_i >= len(rel_parts):
+            raise ValueError(
+                f"fanin_pack_from_edges rel_part_ids out of range: {rel_part_i!r}."
+            )
+        if mode_i == 1:
+            flat_src_local = edge_src
+        else:
+            arity_i = int(arity)
+            pos_i = int(pos)
+            if arity_i <= 0:
+                raise ValueError("fanin_pack_from_edges expects arity > 0 in relation mode.")
+            if pos_i < 0 or pos_i >= arity_i:
+                raise ValueError(
+                    f"fanin_pack_from_edges expects pos in [0, arity), got pos={pos_i} arity={arity_i}."
+                )
+            flat_src_local = edge_src * arity_i + pos_i
+        flat_src_parts.append(flat_src_local + int(rel_offsets[rel_part_i]))
+        dst_cat_parts.append(edge_dst)
+
+    if flat_src_parts:
+        flat_src = (
+            flat_src_parts[0] if len(flat_src_parts) == 1 else torch.cat(flat_src_parts, dim=0)
+        )
+        dst_idx = (
+            dst_cat_parts[0] if len(dst_cat_parts) == 1 else torch.cat(dst_cat_parts, dim=0)
+        )
+    else:
+        flat_src = torch.empty(0, device=ref.device, dtype=torch.int64)
+        dst_idx = torch.empty(0, device=ref.device, dtype=torch.int64)
+    return rel_cat, flat_src, dst_idx
+
+
 if torch is not None:
 
     class _FanoutScatterFunction(torch.autograd.Function):
@@ -530,11 +863,166 @@ def fanin_pack_multi(
     return _fanin_pack_multi_python(rel_parts, flat_src_parts, dst_idx_parts)
 
 
+def fanout_pack_from_edges(
+    x_parts: list[torch.Tensor],
+    edge_src_parts: list[torch.Tensor],
+    edge_dst_parts: list[torch.Tensor],
+    src_part_ids: list[int],
+    arity_parts: list[int],
+    pos_parts: list[int],
+    slot_offset_parts: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fanout_pack_from_edges requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    if _should_use_custom("fanout_pack_from_edges"):
+        if _namespace_has_op("fanout_pack_from_edges"):
+            return _ops_namespace().fanout_pack_from_edges(
+                x_parts,
+                edge_src_parts,
+                edge_dst_parts,
+                src_part_ids,
+                arity_parts,
+                pos_parts,
+                slot_offset_parts,
+            )
+        if _fallback_mode() == "error":
+            raise RuntimeError(
+                "Custom mp op fanout_pack_from_edges is unavailable in the loaded relm_mp library."
+            )
+    return _fanout_pack_from_edges_python(
+        x_parts,
+        edge_src_parts,
+        edge_dst_parts,
+        src_part_ids,
+        arity_parts,
+        pos_parts,
+        slot_offset_parts,
+    )
+
+
+def fanin_pack_from_edges(
+    rel_parts: list[torch.Tensor],
+    edge_src_parts: list[torch.Tensor],
+    edge_dst_parts: list[torch.Tensor],
+    rel_part_ids: list[int],
+    arity_parts: list[int],
+    pos_parts: list[int],
+    mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fanin_pack_from_edges requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    if _should_use_custom("fanin_pack_from_edges"):
+        if _namespace_has_op("fanin_pack_from_edges"):
+            return _ops_namespace().fanin_pack_from_edges(
+                rel_parts,
+                edge_src_parts,
+                edge_dst_parts,
+                rel_part_ids,
+                arity_parts,
+                pos_parts,
+                int(mode),
+            )
+        if _fallback_mode() == "error":
+            raise RuntimeError(
+                "Custom mp op fanin_pack_from_edges is unavailable in the loaded relm_mp library."
+            )
+    return _fanin_pack_from_edges_python(
+        rel_parts,
+        edge_src_parts,
+        edge_dst_parts,
+        rel_part_ids,
+        arity_parts,
+        pos_parts,
+        int(mode),
+    )
+
+
+def grouped_stack_from_flat(
+    flat: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+) -> torch.Tensor:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "grouped_stack_from_flat requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    if _should_use_custom("grouped_stack_from_flat"):
+        if _namespace_has_op("grouped_stack_from_flat"):
+            return _ops_namespace().grouped_stack_from_flat(
+                flat, slot_offsets, row_sizes, int(arity)
+            )
+        if _fallback_mode() == "error":
+            raise RuntimeError(
+                "Custom mp op grouped_stack_from_flat is unavailable in the loaded relm_mp library."
+            )
+    return _grouped_stack_from_flat_python(flat, slot_offsets, row_sizes, int(arity))
+
+
+def grouped_residual_mlp_from_flat(
+    flat: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    weight_stacks: list[torch.Tensor],
+    bias_stacks: list[torch.Tensor],
+    op_kinds: list[int],
+    op_indices: list[int],
+    pointwise_codes: list[int],
+    truncated_dim: int,
+    truncate_right: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "grouped_residual_mlp_from_flat requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    if _should_use_custom("grouped_residual_mlp_from_flat"):
+        if _namespace_has_op("grouped_residual_mlp_from_flat"):
+            return _ops_namespace().grouped_residual_mlp_from_flat(
+                flat,
+                slot_offsets,
+                row_sizes,
+                int(arity),
+                weight_stacks,
+                bias_stacks,
+                op_kinds,
+                op_indices,
+                pointwise_codes,
+                int(truncated_dim),
+                bool(truncate_right),
+            )
+        if _fallback_mode() == "error":
+            raise RuntimeError(
+                "Custom mp op grouped_residual_mlp_from_flat is unavailable in the loaded relm_mp library."
+            )
+    return _grouped_residual_mlp_from_flat_python(
+        flat,
+        slot_offsets,
+        row_sizes,
+        int(arity),
+        weight_stacks,
+        bias_stacks,
+        op_kinds,
+        op_indices,
+        pointwise_codes,
+        int(truncated_dim),
+        bool(truncate_right),
+    )
+
+
 __all__ = [
     "fanout_scatter",
     "fanin_reduce",
     "fanout_pack_multi",
     "fanin_pack_multi",
+    "fanout_pack_from_edges",
+    "fanin_pack_from_edges",
+    "grouped_stack_from_flat",
+    "grouped_residual_mlp_from_flat",
     "available",
     "assert_runtime_compat",
 ]

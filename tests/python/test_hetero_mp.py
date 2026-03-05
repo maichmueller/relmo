@@ -51,6 +51,81 @@ def _manual_fanin_sum(
     return out
 
 
+def _fanout_pack_edges_ref(
+    x_parts,
+    edge_src_parts,
+    edge_dst_parts,
+    src_part_ids,
+    arity_parts,
+    pos_parts,
+    slot_offset_parts,
+):
+    x_cat = x_parts[0] if len(x_parts) == 1 else torch.cat(x_parts, dim=0)
+    offsets = []
+    offset = 0
+    for x in x_parts:
+        offsets.append(int(offset))
+        offset += int(x.size(0))
+    src_global_parts = []
+    flat_dst_parts = []
+    for edge_src, edge_dst, src_part, arity, pos, slot_offset in zip(
+        edge_src_parts,
+        edge_dst_parts,
+        src_part_ids,
+        arity_parts,
+        pos_parts,
+        slot_offset_parts,
+    ):
+        src_global_parts.append(edge_src + int(offsets[int(src_part)]))
+        flat_dst_parts.append(int(slot_offset) + edge_dst * int(arity) + int(pos))
+    src_global = (
+        src_global_parts[0]
+        if len(src_global_parts) == 1
+        else torch.cat(src_global_parts, dim=0)
+    )
+    flat_dst = (
+        flat_dst_parts[0] if len(flat_dst_parts) == 1 else torch.cat(flat_dst_parts, dim=0)
+    )
+    return x_cat, src_global, flat_dst
+
+
+def _fanin_pack_edges_ref(
+    rel_parts,
+    edge_src_parts,
+    edge_dst_parts,
+    rel_part_ids,
+    arity_parts,
+    pos_parts,
+    mode,
+):
+    rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
+    offsets = []
+    offset = 0
+    for rel in rel_parts:
+        offsets.append(int(offset))
+        offset += int(rel.size(0))
+    flat_src_parts = []
+    dst_parts = []
+    for edge_src, edge_dst, rel_part, arity, pos in zip(
+        edge_src_parts,
+        edge_dst_parts,
+        rel_part_ids,
+        arity_parts,
+        pos_parts,
+    ):
+        if int(mode) == 1:
+            local_src = edge_src
+        else:
+            local_src = edge_src * int(arity) + int(pos)
+        flat_src_parts.append(local_src + int(offsets[int(rel_part)]))
+        dst_parts.append(edge_dst)
+    flat_src = (
+        flat_src_parts[0] if len(flat_src_parts) == 1 else torch.cat(flat_src_parts, dim=0)
+    )
+    dst_idx = dst_parts[0] if len(dst_parts) == 1 else torch.cat(dst_parts, dim=0)
+    return rel_cat, flat_src, dst_idx
+
+
 def test_hetero_routing_unknown_aggr_keeps_string() -> None:
     routing = _DummyRouting(aggr="not_an_aggr")
     assert routing.aggr == "not_an_aggr"
@@ -203,6 +278,26 @@ def test_batched_fanin_experimental_flag_uses_custom_kernel_path(
         calls = 0
 
         @staticmethod
+        def fanin_pack_from_edges(
+            rel_parts,
+            edge_src_parts,
+            edge_dst_parts,
+            rel_part_ids,
+            arity_parts,
+            pos_parts,
+            mode,
+        ):
+            return _fanin_pack_edges_ref(
+                rel_parts,
+                edge_src_parts,
+                edge_dst_parts,
+                rel_part_ids,
+                arity_parts,
+                pos_parts,
+                int(mode),
+            )
+
+        @staticmethod
         def fanin_reduce(rel_flat, flat_src, dst_idx, dim_size, mode):
             _CountingOps.calls += 1
             assert int(mode) == 0
@@ -213,7 +308,9 @@ def test_batched_fanin_experimental_flag_uses_custom_kernel_path(
             return out
 
     monkeypatch.setattr(batched_impl, "relm_mp_ops", _CountingOps())
-    monkeypatch.setattr(batched_impl, "_use_model_mp_fanin", lambda _ref: True)
+    monkeypatch.setattr(
+        batched_impl, "_use_model_mp_batched_fanin_reduce", lambda _ref: True
+    )
     monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", "1")
 
     embedding_size = 2
@@ -255,6 +352,27 @@ def test_batched_fanin_pack_only_path_skips_reduce_kernel(
         reduce_calls = 0
 
         @staticmethod
+        def fanin_pack_from_edges(
+            rel_parts,
+            edge_src_parts,
+            edge_dst_parts,
+            rel_part_ids,
+            arity_parts,
+            pos_parts,
+            mode,
+        ):
+            _PackOnlyOps.pack_calls += 1
+            return _fanin_pack_edges_ref(
+                rel_parts,
+                edge_src_parts,
+                edge_dst_parts,
+                rel_part_ids,
+                arity_parts,
+                pos_parts,
+                int(mode),
+            )
+
+        @staticmethod
         def fanin_pack_multi(rel_parts, flat_src_parts, dst_idx_parts):
             _PackOnlyOps.pack_calls += 1
             rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
@@ -276,7 +394,9 @@ def test_batched_fanin_pack_only_path_skips_reduce_kernel(
             raise AssertionError("pack-only path must not call fanin_reduce")
 
     monkeypatch.setattr(batched_impl, "relm_mp_ops", _PackOnlyOps())
-    monkeypatch.setattr(batched_impl, "_use_model_mp_ops", lambda _ref: True)
+    monkeypatch.setattr(
+        batched_impl, "_use_model_mp_batched_fanin_pack", lambda _ref: True
+    )
     monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL", "0")
     monkeypatch.setenv("RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL", "1")
 
@@ -322,6 +442,26 @@ def test_batched_fanout_experimental_flag_uses_custom_kernel_path(
         calls = 0
 
         @staticmethod
+        def fanout_pack_from_edges(
+            x_parts,
+            edge_src_parts,
+            edge_dst_parts,
+            src_part_ids,
+            arity_parts,
+            pos_parts,
+            slot_offset_parts,
+        ):
+            return _fanout_pack_edges_ref(
+                x_parts,
+                edge_src_parts,
+                edge_dst_parts,
+                src_part_ids,
+                arity_parts,
+                pos_parts,
+                slot_offset_parts,
+            )
+
+        @staticmethod
         def fanout_scatter(x_cat, src_global_idx, flat_dst, out_rows):
             _CountingOps.calls += 1
             out = x_cat.new_zeros((int(out_rows), int(x_cat.size(1))))
@@ -332,7 +472,7 @@ def test_batched_fanout_experimental_flag_uses_custom_kernel_path(
 
     monkeypatch.setattr(batched_impl, "relm_mp_ops", _CountingOps())
     monkeypatch.setattr(scatter_impl, "relm_mp_ops", _CountingOps())
-    monkeypatch.setattr(batched_impl, "_use_model_mp_ops", lambda _ref: True)
+    monkeypatch.setattr(batched_impl, "_use_model_mp_batched_fanout", lambda _ref: True)
     monkeypatch.setenv("RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL", "1")
 
     mp = BatchedFanOutMP(
