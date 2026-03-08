@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct parity benchmark: FastRelationalGNN vs pymimir-rgnn on real PDDL states.
+"""Direct parity benchmark: FlatRelationalGNN vs pymimir-rgnn on real PDDL states.
 
 By default this harness enforces strict apples-to-apples parity:
 - same active relation set
@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 import torch
 
-from relm.models import ArityMLPFactory, FastRelationalGNN
+from relm.models import ArityMLPFactory, FlatRelationalGNN
 
 
 @dataclass(frozen=True)
@@ -79,11 +79,12 @@ def _benchmark(
     backward: bool,
 ) -> BenchStats:
     cudagraph_mark = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+    should_zero_grad = backward and zero_grad is not None
 
     for _ in range(int(warmup)):
         if callable(cudagraph_mark):
             cudagraph_mark()
-        if zero_grad is not None:
+        if should_zero_grad:
             zero_grad()
         out = run_once()
         if backward:
@@ -94,7 +95,7 @@ def _benchmark(
     for _ in range(int(rounds)):
         if callable(cudagraph_mark):
             cudagraph_mark()
-        if zero_grad is not None:
+        if should_zero_grad:
             zero_grad()
         t0 = time.perf_counter()
         out = run_once()
@@ -196,18 +197,24 @@ def _canonical_pymimir_relation_name(name: str) -> str:
     return text.lower()
 
 
-def _canonical_relm_relation_name(name: str) -> str:
+def _relm_relation_base_name(name: str) -> str:
     text = str(name).strip()
-    lowered = text.lower()
-    tags = {tag.strip().lower() for tag in re.findall(r"\[([^\]]*)\]", lowered)}
     base = re.sub(r"\[[^\]]*\]", "", text)
-    base = base.replace("+", "").replace("-", "").strip().lower()
+    return base.replace("+", "").replace("-", "").strip().lower()
+
+
+def _canonical_relm_relation_name(name: str) -> str:
+    lowered = str(name).strip().lower()
+    tags = {tag.strip().lower() for tag in re.findall(r"\[([^\]]*)\]", lowered)}
+    base = _relm_relation_base_name(name)
     if not base:
         return base
-    is_goal = ("g" in tags) or ("goal" in tags)
-    if is_goal:
-        is_goal_true = ("sat" in tags) or ("true" in tags)
-        return f"{base}_goal_{'true' if is_goal_true else 'false'}"
+    if ("unsat" in tags) or ("false" in tags):
+        return f"{base}_goal_false"
+    if ("sat" in tags) or ("true" in tags):
+        return f"{base}_goal_true"
+    if ("g" in tags) or ("goal" in tags):
+        return f"{base}_goal_all"
     return base
 
 
@@ -253,8 +260,10 @@ def _select_relm_parity_relations(
                 penalty += 10
             if "+" in name or "-" in name:
                 penalty += 5
+            if "unsat" in name:
+                penalty -= 3
             if "sat" in name:
-                penalty += 3
+                penalty -= 2
             if int(arity) != int(pymimir_arity):
                 penalty += 50
             return (penalty, len(name), name)
@@ -380,6 +389,201 @@ def _build_relm_inputs_from_pymimir_encoded(
     return x_dict, edge_index_dict, batch_dict
 
 
+def _build_flat_relm_inputs_from_pymimir_encoded(
+    *,
+    encoded: Any,
+    relation_arities: dict[str, int],
+) -> dict[str, Any]:
+    relations = getattr(encoded, "flattened_relations", {})
+    node_sizes = getattr(encoded, "node_sizes", None)
+    if torch.is_tensor(node_sizes) and node_sizes.numel() > 0:
+        node_sizes_t = node_sizes.to(dtype=torch.long)
+        node_count = int(node_sizes_t.sum().item())
+    else:
+        node_count = int(getattr(encoded, "node_count", 0))
+        node_sizes_t = torch.tensor([node_count], dtype=torch.long)
+
+    device = (
+        next(iter(relations.values())).device
+        if relations
+        else node_sizes_t.device
+    )
+    relation_names = tuple(str(name) for name in relation_arities.keys())
+    arities_t = torch.as_tensor(
+        tuple(int(arity) for arity in relation_arities.values()),
+        dtype=torch.long,
+        device=device,
+    )
+    counts: list[int] = []
+    arg_chunks: list[torch.Tensor] = []
+    for relation_name, relation_arity in relation_arities.items():
+        arity = int(relation_arity)
+        if arity <= 0:
+            counts.append(0)
+            continue
+        flat_ids = relations.get(str(relation_name))
+        if flat_ids is None:
+            counts.append(0)
+            continue
+        flat_ids = flat_ids.to(device=device, dtype=torch.long).view(-1)
+        if flat_ids.numel() % arity != 0:
+            raise ValueError(
+                f"Relation {relation_name!r} has {int(flat_ids.numel())} flattened ids, "
+                f"which is not divisible by its arity {arity}."
+            )
+        counts.append(int(flat_ids.numel() // arity))
+        if flat_ids.numel() > 0:
+            arg_chunks.append(flat_ids)
+
+    relation_counts = torch.tensor([counts], dtype=torch.long, device=device)
+    relation_args = (
+        torch.cat(arg_chunks, dim=0)
+        if arg_chunks
+        else torch.empty((0,), dtype=torch.long, device=device)
+    )
+    return {
+        "x": torch.zeros((node_count, 1), dtype=torch.float, device=device),
+        "relation_counts": relation_counts,
+        "relation_args": relation_args,
+        "relation_arities": arities_t,
+        "relation_names": relation_names,
+        "node_sizes": node_sizes_t.to(device=device),
+    }
+
+
+def _build_flat_relm_inputs_from_flat_data(
+    *,
+    data: Any,
+    keep_relations: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    relation_names_full = tuple(str(name) for name in data.relation_names)
+    relation_arities_full = tuple(int(arity) for arity in data.relation_arities)
+    relation_counts_full = data.relation_counts
+    if relation_counts_full.dim() == 1:
+        relation_counts_full = relation_counts_full.unsqueeze(0)
+    relation_counts_full = relation_counts_full.to(dtype=torch.long)
+    relation_args_full = data.relation_args.to(dtype=torch.long).view(-1)
+
+    if keep_relations is None:
+        keep_indices = list(range(len(relation_names_full)))
+    else:
+        name_to_index = {
+            relation_name: idx for idx, relation_name in enumerate(relation_names_full)
+        }
+        keep_indices = [
+            name_to_index[str(relation_name)]
+            for relation_name in keep_relations
+            if str(relation_name) in name_to_index
+        ]
+
+    counts_total = relation_counts_full.sum(dim=0)
+    slot_offsets = [0]
+    cursor = 0
+    for count_t, arity in zip(counts_total.tolist(), relation_arities_full):
+        cursor += int(count_t) * int(arity)
+        slot_offsets.append(cursor)
+
+    relation_names = tuple(relation_names_full[idx] for idx in keep_indices)
+    relation_arities = torch.as_tensor(
+        [relation_arities_full[idx] for idx in keep_indices],
+        dtype=torch.long,
+        device=relation_args_full.device,
+    )
+    relation_counts = relation_counts_full.index_select(
+        1,
+        torch.as_tensor(keep_indices, dtype=torch.long, device=relation_counts_full.device),
+    )
+    arg_chunks = [
+        relation_args_full[slot_offsets[idx] : slot_offsets[idx + 1]]
+        for idx in keep_indices
+        if slot_offsets[idx + 1] > slot_offsets[idx]
+    ]
+    relation_args = (
+        torch.cat(arg_chunks, dim=0)
+        if arg_chunks
+        else torch.empty((0,), dtype=torch.long, device=relation_args_full.device)
+    )
+
+    x_value = getattr(data, "x", None)
+    if x_value is None:
+        node_sizes = getattr(data, "node_sizes", None)
+        if torch.is_tensor(node_sizes) and node_sizes.numel() > 0:
+            node_count = int(node_sizes.sum().item())
+            x_device = node_sizes.device
+        else:
+            node_count = int(getattr(data, "num_nodes", 0))
+            x_device = relation_args_full.device
+        x_value = torch.zeros((node_count, 1), dtype=torch.float, device=x_device)
+
+    payload: dict[str, Any] = {
+        "x": x_value,
+        "relation_counts": relation_counts,
+        "relation_args": relation_args,
+        "relation_arities": relation_arities,
+        "relation_names": relation_names,
+    }
+    for key in (
+        "relation_sources",
+        "batch",
+        "node_sizes",
+        "object_indices",
+        "object_sizes",
+        "history_entity_indices",
+        "history_entity_sizes",
+        "history_entity_dt",
+        "target_entity_indices",
+        "target_entity_group_ids",
+        "target_entity_sizes",
+        "target_positions",
+        "target_group_ids",
+        "target_sizes",
+        "target_indices",
+        "target_candidate_ids",
+    ):
+        if hasattr(data, key):
+            payload[key] = getattr(data, key)
+    return payload
+
+
+def _append_zero_count_relations_to_flat_payload(
+    *,
+    payload: dict[str, Any],
+    extra_relations: dict[str, int],
+) -> dict[str, Any]:
+    if not extra_relations:
+        return payload
+
+    relation_counts = payload["relation_counts"]
+    if relation_counts.dim() == 1:
+        relation_counts = relation_counts.unsqueeze(0)
+    relation_counts = relation_counts.to(dtype=torch.long)
+    device = relation_counts.device
+    extra_names = tuple(str(name) for name in extra_relations.keys())
+    extra_arities = torch.as_tensor(
+        [int(extra_relations[name]) for name in extra_names],
+        dtype=torch.long,
+        device=device,
+    )
+    extra_counts = torch.zeros(
+        (int(relation_counts.size(0)), len(extra_names)),
+        dtype=torch.long,
+        device=device,
+    )
+
+    out = dict(payload)
+    out["relation_counts"] = torch.cat([relation_counts, extra_counts], dim=1)
+    out["relation_arities"] = torch.cat(
+        [payload["relation_arities"].to(device=device, dtype=torch.long), extra_arities],
+        dim=0,
+    )
+    out["relation_names"] = tuple(payload["relation_names"]) + extra_names
+    if "relation_sources" in out:
+        out["relation_sources"] = tuple(out["relation_sources"]) + tuple(
+            "synthetic_zero" for _ in extra_names
+        )
+    return out
+
+
 def _make_pymimir_model(
     *,
     domain: Any,
@@ -433,7 +637,12 @@ def _extract_relation_linear_shapes(
     relation_modules: Any,
 ) -> dict[str, list[tuple[int, int]]]:
     out: dict[str, list[tuple[int, int]]] = {}
-    for relation_name, module in relation_modules.items():
+    iterator = (
+        relation_modules.items()
+        if hasattr(relation_modules, "items")
+        else enumerate(relation_modules)
+    )
+    for relation_name, module in iterator:
         shapes: list[tuple[int, int]] = []
         for submodule in module.modules():
             if isinstance(submodule, torch.nn.Linear):
@@ -443,10 +652,19 @@ def _extract_relation_linear_shapes(
 
 
 def _extract_relm_relation_linear_shapes(relm_model: torch.nn.Module) -> dict[str, list[tuple[int, int]]]:
-    try:
-        relation_modules = relm_model.fast_fused_rel_layer_mp.update_modules  # type: ignore[attr-defined]
-    except Exception:
+    relation_modules = getattr(getattr(relm_model, "relational_layer", None), "update_modules", None)
+    if relation_modules is None:
         return {}
+    relation_names = getattr(relm_model, "relation_names", ())
+    if relation_names and not hasattr(relation_modules, "items"):
+        out: dict[str, list[tuple[int, int]]] = {}
+        for relation_name, module in zip(relation_names, relation_modules):
+            shapes: list[tuple[int, int]] = []
+            for submodule in module.modules():
+                if isinstance(submodule, torch.nn.Linear):
+                    shapes.append((int(submodule.in_features), int(submodule.out_features)))
+            out[str(relation_name)] = shapes
+        return out
     return _extract_relation_linear_shapes(relation_modules)
 
 
@@ -490,6 +708,40 @@ def _build_relation_instance_counts(
         pymimir_counts[str(relation_name)] = int(tensor.numel() // arity)
 
     return relm_counts, pymimir_counts
+
+
+def _build_flat_relation_instance_counts(
+    *,
+    flat_payload: dict[str, Any],
+) -> dict[str, int]:
+    relation_names = tuple(str(name) for name in flat_payload["relation_names"])
+    relation_counts = flat_payload["relation_counts"]
+    if relation_counts.dim() == 1:
+        relation_counts = relation_counts.unsqueeze(0)
+    counts_total = relation_counts.sum(dim=0).tolist()
+    return {
+        relation_name: int(count)
+        for relation_name, count in zip(relation_names, counts_total)
+    }
+
+
+def _build_pymimir_relation_instance_counts(
+    *,
+    pymimir_relations: dict[str, torch.Tensor],
+    pymimir_relation_arities: dict[str, int],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for relation_name, relation_arity in pymimir_relation_arities.items():
+        tensor = pymimir_relations.get(str(relation_name))
+        if tensor is None:
+            counts[str(relation_name)] = 0
+            continue
+        arity = int(relation_arity)
+        if arity <= 0:
+            counts[str(relation_name)] = 0
+            continue
+        counts[str(relation_name)] = int(tensor.numel() // arity)
+    return counts
 
 
 def _compare_mapped_relation_values(
@@ -721,10 +973,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--domain-case", default="blocks")
     parser.add_argument("--problem-case", default="probBLOCKS-4-0")
     parser.add_argument("--max-states", type=int, default=16)
-    parser.add_argument("--relm-grouped-mlp", type=int, default=None)
-    parser.add_argument("--relm-fanout-exp", type=int, default=None)
-    parser.add_argument("--relm-fanin-reduce-exp", type=int, default=None)
+    parser.add_argument("--relm-fused-two-layer-mish", type=int, default=None)
+    parser.add_argument("--relm-fused-relation-gather", type=int, default=None)
     parser.add_argument("--relm-mlp-layers", type=int, default=1)
+    parser.add_argument(
+        "--encoder-mode",
+        choices=("native", "shared_pymimir"),
+        default="native",
+        help=(
+            "Use native encoders for each stack (`native`) or force both stacks "
+            "to consume a shared pymimir flat encoding (`shared_pymimir`)."
+        ),
+    )
     parser.add_argument(
         "--strict-parity",
         action=argparse.BooleanOptionalAction,
@@ -760,18 +1020,6 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(int(args.seed))
 
-    # Optional env toggles for relm fast path.
-    if args.relm_grouped_mlp is not None:
-        os.environ["RELM_MODELS_MP_GROUPED_MLP"] = str(int(args.relm_grouped_mlp))
-    if args.relm_fanout_exp is not None:
-        os.environ["RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL"] = str(
-            int(args.relm_fanout_exp)
-        )
-    if args.relm_fanin_reduce_exp is not None:
-        os.environ["RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL"] = str(
-            int(args.relm_fanin_reduce_exp)
-        )
-
     domain, problem, states = _build_states(
         pddl_root=args.pddl_root,
         domain_case=args.domain_case,
@@ -783,12 +1031,6 @@ def main() -> int:
     import mifrost  # type: ignore
     import pymimir_rgnn as pr  # type: ignore
     from pymimir_rgnn.encoders import get_input_from_encoders  # type: ignore
-
-    relm_encoder = mifrost.HGraphEncoder(domain)
-    relm_batch = relm_encoder.encode_batch(states=states)
-    relm_batch = relm_batch.to(device)
-    relm_relation_dict_full = {str(k): int(v) for k, v in relm_encoder.relation_dict.items()}
-    symbol_types = _split_symbol_types(relm_encoder.symbol_type_id)
 
     pymimir_model, input_spec = _make_pymimir_model(
         domain=domain,
@@ -804,29 +1046,31 @@ def main() -> int:
         embedding_size=int(args.embedding_size),
     )
 
-    relation_dict = dict(relm_relation_dict_full)
+    relation_dict: dict[str, int]
     parity_meta: dict[str, Any] = {
         "enabled": bool(args.strict_parity),
-        "relm_relation_count_full": int(len(relm_relation_dict_full)),
+        "relm_relation_count_full": None,
         "pymimir_relation_count": int(len(pymimir_relation_arities)),
-        "parity_mode": (
-            "identity_from_pymimir_encoding" if bool(args.strict_parity) else "canonical_mapping"
-        ),
+        "parity_mode": None,
+        "encoder_mode": str(args.encoder_mode),
     }
 
     goal_condition = problem.get_goal_condition()
+    relm_goals = list(goal_condition.get_literals()) if args.include_goal else None
     if args.include_goal:
         pymimir_inputs = [(state, goal_condition) for state in states]
     else:
         pymimir_inputs = [(state,) for state in states]
     pymimir_encoded = get_input_from_encoders(pymimir_inputs, input_spec, pymimir_model.get_device())
-    if args.strict_parity:
+    relm_encoder = None
+    relm_batch_pyg = None
+    relm_native_keep_relations: list[str] = []
+    relm_native_zero_pad_relations: dict[str, int] = {}
+
+    if args.encoder_mode == "shared_pymimir":
         relation_dict = {str(k): int(v) for k, v in sorted(pymimir_relation_arities.items())}
-        pymimir_encoded.flattened_relations = {
-            str(k): v
-            for k, v in pymimir_encoded.flattened_relations.items()
-            if str(k) in relation_dict
-        }
+        parity_meta["relm_relation_count_full"] = int(len(relation_dict))
+        parity_meta["parity_mode"] = "identity_from_common_pymimir_flat_encoding"
         parity_meta["selected_count"] = int(len(relation_dict))
         parity_meta["target_count"] = int(len(relation_dict))
         parity_meta["missing"] = []
@@ -835,62 +1079,153 @@ def main() -> int:
             for name, arity in sorted(relation_dict.items())
         ]
         print(
-            "[parity] identity relation mapping from pymimir encoding: "
+            "[parity] identity relation mapping from shared pymimir flat encoding: "
             f"relations={len(relation_dict)}"
         )
-        try:
-            pymimir_relation_mlps = (
-                pymimir_model._mpnn_module._relation_network._message._relation_mlps  # type: ignore[attr-defined]
-            )
-            for relation_name in list(pymimir_relation_mlps.keys()):
-                if str(relation_name) not in relation_dict:
-                    del pymimir_relation_mlps[relation_name]
-        except Exception:
-            pass
-        relm_x_dict, relm_edge_index_dict, relm_batch_dict = _build_relm_inputs_from_pymimir_encoded(
+        relm_flat_payload = _build_flat_relm_inputs_from_pymimir_encoded(
             encoded=pymimir_encoded,
             relation_arities=relation_dict,
-            symbol_type=str(symbol_types[0]),
         )
     else:
+        relm_encoder = mifrost.FlatRelationEncoder(
+            domain,
+            goal_satisfaction_derivations={
+                mifrost.GoalSatisfaction.satisfied,
+                mifrost.GoalSatisfaction.unsatisfied,
+            },
+        )
+        relm_batch_pyg = relm_encoder.encode_batch(states=states, goals=relm_goals).to(device)
+        relm_relation_dict_full = {
+            str(name): int(arity)
+            for name, arity in zip(relm_batch_pyg.relation_names, relm_batch_pyg.relation_arities)
+        }
+        parity_meta["relm_relation_count_full"] = int(len(relm_relation_dict_full))
+        parity_meta["parity_mode"] = "canonical_mapping_native_encoders_with_goal_sat_unsat"
         relation_dict, selection_meta = _select_relm_parity_relations(
             relm_relation_dict=relm_relation_dict_full,
             pymimir_relation_arities=pymimir_relation_arities,
         )
+        pymimir_initial_counts = _build_pymimir_relation_instance_counts(
+            pymimir_relations=pymimir_encoded.flattened_relations,
+            pymimir_relation_arities=pymimir_relation_arities,
+        )
+        zero_pad_relations = {
+            str(row["pymimir_relation"]): int(row["expected_arity"])
+            for row in selection_meta.get("missing", [])
+            if int(pymimir_initial_counts.get(str(row["pymimir_relation"]), 0)) == 0
+        }
+        if zero_pad_relations:
+            relation_dict.update(zero_pad_relations)
+            padded_mappings = list(selection_meta.get("mappings", []))
+            padded_mappings.extend(
+                {
+                    "pymimir_relation": relation_name,
+                    "relm_relation": relation_name,
+                    "arity": int(relation_arity),
+                }
+                for relation_name, relation_arity in zero_pad_relations.items()
+            )
+            padded_missing = [
+                row
+                for row in selection_meta.get("missing", [])
+                if str(row["pymimir_relation"]) not in zero_pad_relations
+            ]
+            selection_meta = dict(selection_meta)
+            selection_meta["mappings"] = padded_mappings
+            selection_meta["missing"] = padded_missing
+            selection_meta["selected_count"] = int(len(relation_dict))
         parity_meta.update(selection_meta)
         parity_meta["selected_count"] = int(len(relation_dict))
         parity_meta["target_count"] = int(len(pymimir_relation_arities))
-        relm_x_dict, relm_edge_index_dict, relm_batch_dict = _build_relm_inputs(
-            batch=relm_batch,
-            keep_relations=set(relation_dict.keys()),
-            symbol_types=symbol_types,
+        print(
+            "[parity] canonical mapping between native encoders: "
+            f"shared_relations={len(relation_dict)} "
+            f"relm_full={len(relm_relation_dict_full)} "
+            f"pymimir_full={len(pymimir_relation_arities)}"
         )
+        relm_native_keep_relations = [
+            name for name in relation_dict.keys() if name in relm_relation_dict_full
+        ]
+        relm_native_zero_pad_relations = {
+            relation_name: relation_arity
+            for relation_name, relation_arity in relation_dict.items()
+            if relation_name not in relm_relation_dict_full
+        }
+        relm_flat_payload = _build_flat_relm_inputs_from_flat_data(
+            data=relm_batch_pyg,
+            keep_relations=relm_native_keep_relations,
+        )
+        relm_flat_payload = _append_zero_count_relations_to_flat_payload(
+            payload=relm_flat_payload,
+            extra_relations=relm_native_zero_pad_relations,
+        )
+
+    pymimir_selected_relation_arities = {
+        str(mapping["pymimir_relation"]): int(mapping["arity"])
+        for mapping in parity_meta.get("mappings", [])
+    }
+    if not pymimir_selected_relation_arities:
+        pymimir_selected_relation_arities = {
+            str(k): int(v) for k, v in sorted(pymimir_relation_arities.items())
+        }
+    pymimir_encoded.flattened_relations = {
+        str(k): v
+        for k, v in pymimir_encoded.flattened_relations.items()
+        if str(k) in pymimir_selected_relation_arities
+    }
+    try:
+        pymimir_relation_mlps = (
+            pymimir_model._mpnn_module._relation_network._message._relation_mlps  # type: ignore[attr-defined]
+        )
+        for relation_name in list(pymimir_relation_mlps.keys()):
+            if str(relation_name) not in pymimir_selected_relation_arities:
+                del pymimir_relation_mlps[relation_name]
+    except Exception:
+        pass
 
     relation_factory = ArityMLPFactory(
         feature_size=int(args.embedding_size),
-        residual=True,
+        residual=False,
         layers=int(args.relm_mlp_layers),
         activation="mish",
     )
-    relm_eager = FastRelationalGNN(
+    relm_eager = FlatRelationalGNN(
         embedding_size=int(args.embedding_size),
         num_layer=int(args.num_layers),
         aggr=args.aggr,
-        symbol_type_ids=relm_encoder.symbol_type_id,
         relation_dict=relation_dict,
         relation_module_factory=relation_factory,
         compile_forward=False,
+        fused_two_layer_mish_execution=(
+            None
+            if args.relm_fused_two_layer_mish is None
+            else bool(int(args.relm_fused_two_layer_mish))
+        ),
+        fused_relation_gather=(
+            None
+            if args.relm_fused_relation_gather is None
+            else bool(int(args.relm_fused_relation_gather))
+        ),
     ).to(device)
     relm_compile = None
     if args.include_compile_lane:
-        relm_compile = FastRelationalGNN(
+        relm_compile = FlatRelationalGNN(
             embedding_size=int(args.embedding_size),
             num_layer=int(args.num_layers),
             aggr=args.aggr,
-            symbol_type_ids=relm_encoder.symbol_type_id,
             relation_dict=relation_dict,
             relation_module_factory=relation_factory,
             compile_forward=True,
+            fused_two_layer_mish_execution=(
+                None
+                if args.relm_fused_two_layer_mish is None
+                else bool(int(args.relm_fused_two_layer_mish))
+            ),
+            fused_relation_gather=(
+                None
+                if args.relm_fused_relation_gather is None
+                else bool(int(args.relm_fused_relation_gather))
+            ),
         ).to(device)
     relm_linear_shapes = _extract_relm_relation_linear_shapes(relm_eager)
     pymimir_linear_shapes = _extract_pymimir_relation_linear_shapes(pymimir_model)
@@ -907,11 +1242,10 @@ def main() -> int:
         relm_values=mapped_linear_shapes_relm,
         pymimir_values=mapped_linear_shapes_pymimir,
     )
-    relm_relation_counts, pymimir_relation_counts = _build_relation_instance_counts(
-        relm_x_dict=relm_x_dict,
-        relm_relation_dict=relation_dict,
+    relm_relation_counts = _build_flat_relation_instance_counts(flat_payload=relm_flat_payload)
+    pymimir_relation_counts = _build_pymimir_relation_instance_counts(
         pymimir_relations=pymimir_encoded.flattened_relations,
-        pymimir_relation_arities=pymimir_relation_arities,
+        pymimir_relation_arities=pymimir_selected_relation_arities,
     )
     relation_count_rows, relation_count_mismatches = _compare_mapped_relation_values(
         mappings=parity_meta.get("mappings", []),
@@ -919,35 +1253,33 @@ def main() -> int:
         pymimir_values=pymimir_relation_counts,
     )
 
-    if bool(args.strict_parity) and linear_shape_mismatches:
+    strict_enforced = bool(args.strict_parity) and args.encoder_mode == "shared_pymimir"
+    if strict_enforced and linear_shape_mismatches:
         raise RuntimeError(
             "Strict parity requested but relation MLP linear shapes do not match: "
             f"{linear_shape_mismatches}"
         )
-    if bool(args.strict_parity) and relation_count_mismatches:
+    if strict_enforced and relation_count_mismatches:
         raise RuntimeError(
             "Strict parity requested but mapped encoded relation instance counts do not match: "
             f"{relation_count_mismatches}"
         )
 
+    relm_prepared = relm_eager.prepare(relm_flat_payload)
+    relm_prepared_compile = relm_compile.prepare(relm_flat_payload) if relm_compile is not None else None
+
     def relm_compute() -> Any:
-        return relm_eager(
-            dict(relm_x_dict),
-            dict(relm_edge_index_dict),
-            dict(relm_batch_dict),
-        )
+        return relm_eager.forward_prepared_entity_embeddings(relm_prepared)
 
     def relm_compute_compile() -> Any:
         if relm_compile is None:
             raise RuntimeError("Compile lane disabled.")
-        return relm_compile(
-            dict(relm_x_dict),
-            dict(relm_edge_index_dict),
-            dict(relm_batch_dict),
-        )
+        if relm_prepared_compile is None:
+            raise RuntimeError("Compile prepared inputs missing.")
+        return relm_compile.forward_prepared_entity_embeddings(relm_prepared_compile)
 
     def relm_full() -> Any:
-        if args.strict_parity:
+        if args.encoder_mode == "shared_pymimir":
             encoded = get_input_from_encoders(
                 pymimir_inputs, input_spec, pymimir_model.get_device()
             )
@@ -956,24 +1288,29 @@ def main() -> int:
                 for k, v in encoded.flattened_relations.items()
                 if str(k) in relation_dict
             }
-            x_dict, edge_index_dict, batch_dict = _build_relm_inputs_from_pymimir_encoded(
+            payload = _build_flat_relm_inputs_from_pymimir_encoded(
                 encoded=encoded,
                 relation_arities=relation_dict,
-                symbol_type=str(symbol_types[0]),
             )
         else:
-            batch = relm_encoder.encode_batch(states=states).to(device)
-            x_dict, edge_index_dict, batch_dict = _build_relm_inputs(
-                batch=batch,
-                keep_relations=set(relation_dict.keys()),
-                symbol_types=symbol_types,
+            if relm_encoder is None:
+                raise RuntimeError("Native relm encoder is not initialized.")
+            native_batch = relm_encoder.encode_batch(states=states, goals=relm_goals).to(device)
+            payload = _build_flat_relm_inputs_from_flat_data(
+                data=native_batch,
+                keep_relations=relm_native_keep_relations,
             )
-        return relm_eager(x_dict, edge_index_dict, batch_dict)
+            payload = _append_zero_count_relations_to_flat_payload(
+                payload=payload,
+                extra_relations=relm_native_zero_pad_relations,
+            )
+        prepared = relm_eager.prepare(payload)
+        return relm_eager.forward_prepared_entity_embeddings(prepared)
 
     def relm_full_compile() -> Any:
         if relm_compile is None:
             raise RuntimeError("Compile lane disabled.")
-        if args.strict_parity:
+        if args.encoder_mode == "shared_pymimir":
             encoded = get_input_from_encoders(
                 pymimir_inputs, input_spec, pymimir_model.get_device()
             )
@@ -982,45 +1319,50 @@ def main() -> int:
                 for k, v in encoded.flattened_relations.items()
                 if str(k) in relation_dict
             }
-            x_dict, edge_index_dict, batch_dict = _build_relm_inputs_from_pymimir_encoded(
+            payload = _build_flat_relm_inputs_from_pymimir_encoded(
                 encoded=encoded,
                 relation_arities=relation_dict,
-                symbol_type=str(symbol_types[0]),
             )
         else:
-            batch = relm_encoder.encode_batch(states=states).to(device)
-            x_dict, edge_index_dict, batch_dict = _build_relm_inputs(
-                batch=batch,
-                keep_relations=set(relation_dict.keys()),
-                symbol_types=symbol_types,
+            if relm_encoder is None:
+                raise RuntimeError("Native relm encoder is not initialized.")
+            native_batch = relm_encoder.encode_batch(states=states, goals=relm_goals).to(device)
+            payload = _build_flat_relm_inputs_from_flat_data(
+                data=native_batch,
+                keep_relations=relm_native_keep_relations,
             )
-        return relm_compile(x_dict, edge_index_dict, batch_dict)
+            payload = _append_zero_count_relations_to_flat_payload(
+                payload=payload,
+                extra_relations=relm_native_zero_pad_relations,
+            )
+        prepared = relm_compile.prepare(payload)
+        return relm_compile.forward_prepared_entity_embeddings(prepared)
 
     def pymimir_compute() -> Any:
         return pymimir_model._mpnn_module.forward(pymimir_encoded)
 
     def pymimir_full() -> Any:
         encoded = get_input_from_encoders(pymimir_inputs, input_spec, pymimir_model.get_device())
-        if args.strict_parity:
+        if pymimir_selected_relation_arities:
             encoded.flattened_relations = {
                 str(k): v
                 for k, v in encoded.flattened_relations.items()
-                if str(k) in relation_dict
+                if str(k) in pymimir_selected_relation_arities
             }
         return pymimir_model._mpnn_module.forward(encoded)
 
     rows: list[dict[str, Any]] = []
     lanes: list[tuple[str, str, Callable[[], Any], Callable[[], None]]] = [
-        ("relm_fast_fused", "compute_only", relm_compute, lambda: _zero_grad(relm_eager)),
+        ("relm_flat", "compute_only", relm_compute, lambda: _zero_grad(relm_eager)),
         ("pymimir_rgnn", "compute_only", pymimir_compute, lambda: _zero_grad(pymimir_model)),
-        ("relm_fast_fused", "full_with_encoding", relm_full, lambda: _zero_grad(relm_eager)),
+        ("relm_flat", "full_with_encoding", relm_full, lambda: _zero_grad(relm_eager)),
         ("pymimir_rgnn", "full_with_encoding", pymimir_full, lambda: _zero_grad(pymimir_model)),
     ]
     if relm_compile is not None:
         lanes.insert(
             1,
             (
-                "relm_fast_fused_compile",
+                "relm_flat_compile",
                 "compute_only",
                 relm_compute_compile,
                 lambda: _zero_grad(relm_compile),
@@ -1029,7 +1371,7 @@ def main() -> int:
         lanes.insert(
             4,
             (
-                "relm_fast_fused_compile",
+                "relm_flat_compile",
                 "full_with_encoding",
                 relm_full_compile,
                 lambda: _zero_grad(relm_compile),
@@ -1077,13 +1419,14 @@ def main() -> int:
     _print_results_table(rows)
     _print_comparison_table(comparisons)
 
-    total_nodes = int(sum(x.size(0) for x in relm_x_dict.values())) if relm_x_dict else 0
-    total_edges = int(sum(e.size(1) for e in relm_edge_index_dict.values())) if relm_edge_index_dict else 0
+    total_nodes = int(relm_flat_payload["x"].size(0))
+    total_relation_slots = int(relm_flat_payload["relation_args"].numel())
+    total_relation_instances = int(relm_flat_payload["relation_counts"].sum().item())
     relm_msg_params = int(
         sum(
             p.numel()
             for name, p in relm_eager.named_parameters()
-            if name.startswith("fast_fused_rel_layer_mp.update_modules.module_dict.")
+            if name.startswith("relational_layer.update_modules.")
         )
     )
     pymimir_msg_params = int(
@@ -1104,20 +1447,16 @@ def main() -> int:
             "embedding_size": int(args.embedding_size),
             "num_layers": int(args.num_layers),
             "aggr": args.aggr,
+            "encoder_mode": str(args.encoder_mode),
             "strict_parity": bool(args.strict_parity),
             "include_goal": bool(args.include_goal),
             "relm_mlp_layers": int(args.relm_mlp_layers),
+            "relm_fused_two_layer_mish": args.relm_fused_two_layer_mish,
+            "relm_fused_relation_gather": args.relm_fused_relation_gather,
             "warmup": int(args.warmup),
             "rounds": int(args.rounds),
             "pymimir_normalize_updates": bool(args.pymimir_normalize_updates),
             "relm_env": {
-                "RELM_MODELS_MP_GROUPED_MLP": os.getenv("RELM_MODELS_MP_GROUPED_MLP"),
-                "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL": os.getenv(
-                    "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL"
-                ),
-                "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL": os.getenv(
-                    "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL"
-                ),
             },
         },
         "workload": {
@@ -1128,7 +1467,8 @@ def main() -> int:
             "problem_name": getattr(problem, "name", None),
             "n_states": int(len(states)),
             "total_nodes": total_nodes,
-            "total_edges": total_edges,
+            "total_relation_instances": total_relation_instances,
+            "total_relation_slots": total_relation_slots,
         },
         "parity": {
             **parity_meta,

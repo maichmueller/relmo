@@ -13,10 +13,8 @@ from torch_geometric.typing import Adj, EdgeType
 from .._misc import stream_context
 from ..mixins import DeviceAwareMixin
 from ..patched_module_dict import PatchedModuleDict
-from ._grouped_exec import _apply_residual_truncate, _extract_grouped_residual_mlp_info
 from ._ops_env import (
     _resolve_fanin_mode,
-    _use_grouped_relation_mlp,
     _use_model_mp_batched_fanin_pack,
     _use_model_mp_batched_fanin_reduce,
     _use_model_mp_batched_fanout,
@@ -59,8 +57,6 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
         self.use_cuda_streams = torch.cuda.is_available() and use_cuda_streams
         self._cuda_streams = None
         self._cuda_pool = None
-        self._grouped_mlp_info_cache: dict[int, dict[str, Any] | None] = {}
-        self._persistent_grouped_param_stacks: dict[tuple[Any, ...], dict[str, Any]] = {}
 
     def _match_src(self, src: str) -> bool:
         return _match_ntype(src, self.src_types, self.strict_filter_mode)
@@ -88,52 +84,6 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
         if self.use_cuda_streams and (cuda_streams := self.cuda_streams) is not None:
             for stream in cuda_streams:
                 stream.synchronize()
-
-    def _grouped_mlp_info(self, module: torch.nn.Module) -> dict[str, Any] | None:
-        key = id(module)
-        cached = self._grouped_mlp_info_cache.get(key)
-        if cached is not None or key in self._grouped_mlp_info_cache:
-            return cached
-        info = _extract_grouped_residual_mlp_info(module)
-        self._grouped_mlp_info_cache[key] = info
-        return info
-
-    def _get_grouped_param_stack(
-        self,
-        *,
-        cache_key: tuple[Any, ...],
-        tensors: list[Tensor],
-        forward_cache: dict[tuple[Any, ...], Tensor],
-        allow_persistent: bool,
-    ) -> Tensor:
-        cached_forward = forward_cache.get(cache_key)
-        if cached_forward is not None:
-            return cached_forward
-
-        if allow_persistent and tensors:
-            versions = tuple(int(getattr(tensor, "_version", -1)) for tensor in tensors)
-            persistent = self._persistent_grouped_param_stacks.get(cache_key)
-            if persistent is not None:
-                stacked = persistent.get("tensor")
-                if (
-                    torch.is_tensor(stacked)
-                    and persistent.get("versions") == versions
-                    and tuple(stacked.shape) == tuple(persistent.get("shape", ()))
-                    and stacked.device == tensors[0].device
-                    and stacked.dtype == tensors[0].dtype
-                ):
-                    forward_cache[cache_key] = stacked
-                    return stacked
-
-        stacked = torch.stack(tensors, dim=0)
-        forward_cache[cache_key] = stacked
-        if allow_persistent and tensors:
-            self._persistent_grouped_param_stacks[cache_key] = {
-                "tensor": stacked,
-                "versions": tuple(int(getattr(tensor, "_version", -1)) for tensor in tensors),
-                "shape": tuple(stacked.shape),
-            }
-        return stacked
 
     def forward(
         self,
@@ -433,141 +383,24 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                 vals = x_dict[src].index_select(0, src_idx)
                 args_flat_all.index_copy_(0, flat_dst, vals)
 
-        use_grouped_mlp = _use_grouped_relation_mlp(ref)
-        if use_grouped_mlp:
-            grouped_exec: dict[tuple[Any, ...], list[tuple[Any, ...]]] = defaultdict(list)
-            fallback_exec: list[tuple[Any, ...]] = []
-            for entry in pred_exec:
-                pred, n, arity, slot_offset, update_module = entry
-                info = self._grouped_mlp_info(update_module)
-                if info is None:
-                    fallback_exec.append(entry)
-                    continue
-                grouped_exec[info["signature"]].append(
-                    (pred, n, arity, slot_offset, update_module, info)
-                )
-
-            grouped_param_stacks: dict[tuple[Any, ...], Tensor] = cache.setdefault(
-                "grouped_param_stacks", {}
-            )
-            allow_persistent_stacks = reuse_buffers
-            for group_items in grouped_exec.values():
-                if len(group_items) <= 1:
-                    pred, n, arity, slot_offset, update_module, _info = group_items[0]
-                    args_flat = args_flat_all[slot_offset : slot_offset + (n * arity)]
-                    args_feat = args_flat.view(n, arity * self.embedding_size)
+        for pred, n, arity, slot_offset, update_module in pred_exec:
+            args_flat = args_flat_all[slot_offset : slot_offset + (n * arity)]
+            args_feat = args_flat.view(n, arity * self.embedding_size)
+            if (stream := self.next_stream()) is not None:
+                with stream_context(stream):
                     out_pred = update_module(args_feat)
                     outputs[pred] = out_pred
                     if rel_flat_all is not None:
                         rel_flat_all[slot_offset : slot_offset + (n * arity)] = out_pred.view(
                             -1, self.embedding_size
                         )
-                    continue
-
-                batch_items = list(group_items)
-                max_rows = max(int(n) for _pred, n, _arity, _slot, _mod, _info in batch_items)
-                arity = int(batch_items[0][2])
-                in_dim = int(arity * self.embedding_size)
-                x_stack = args_flat_all.new_zeros((len(batch_items), max_rows, in_dim))
-                valid_rows: list[int] = []
-                for i, (_pred, n, _arity, slot_offset, _mod, _info) in enumerate(batch_items):
-                    n_i = int(n)
-                    valid_rows.append(n_i)
-                    if n_i <= 0:
-                        continue
-                    args_flat = args_flat_all[slot_offset : slot_offset + (n_i * arity)]
-                    x_stack[i, :n_i, :] = args_flat.view(n_i, in_dim)
-
-                out_stack = x_stack
-                template_info = batch_items[0][5]
-                ops = template_info["ops"]
-                group_pred_key = tuple(item[0] for item in batch_items)
-                linear_indices = sorted(
-                    {
-                        int(payload)
-                        for kind, payload in ops
-                        if kind == "linear"
-                    }
-                )
-                linear_index_map = {lin_idx: i for i, lin_idx in enumerate(linear_indices)}
-                weight_stacks: list[Tensor] = []
-                bias_stacks: list[Tensor] = []
-                for lin_idx in linear_indices:
-                    linears = [item[5]["linears"][lin_idx] for item in batch_items]
-                    weight_stacks.append(
-                        self._get_grouped_param_stack(
-                            cache_key=("w", group_pred_key, int(lin_idx)),
-                            tensors=[linear.weight for linear in linears],
-                            forward_cache=grouped_param_stacks,
-                            allow_persistent=allow_persistent_stacks,
-                        )
-                    )
-                    if linears[0].bias is None:
-                        bias_stacks.append(weight_stacks[-1].new_empty((0,)))
-                    else:
-                        bias_stacks.append(
-                            self._get_grouped_param_stack(
-                                cache_key=("b", group_pred_key, int(lin_idx)),
-                                tensors=[linear.bias for linear in linears if linear.bias is not None],
-                                forward_cache=grouped_param_stacks,
-                                allow_persistent=allow_persistent_stacks,
-                            )
-                        )
-                for op_kind, op_payload in ops:
-                    if op_kind == "linear":
-                        lin_idx = int(op_payload)
-                        mapped_idx = linear_index_map[lin_idx]
-                        weight_stack = weight_stacks[mapped_idx]
-                        out_stack = torch.matmul(out_stack, weight_stack.transpose(1, 2))
-                        bias_stack = bias_stacks[mapped_idx]
-                        if bias_stack.numel() > 0:
-                            out_stack = out_stack + bias_stack[:, None, :]
-                    else:
-                        out_stack = op_payload(out_stack)
-
-                out_stack = _apply_residual_truncate(
-                    x=x_stack,
-                    y=out_stack,
-                    truncated_dim=template_info["truncated_dim"],
-                    truncate_right=template_info["truncate_right"],
-                )
-                for i, (pred, n, _arity, slot_offset, _mod, _info) in enumerate(batch_items):
-                    n_i = int(n)
-                    out_pred = out_stack[i, :n_i, :]
-                    outputs[pred] = out_pred
-                    if rel_flat_all is not None:
-                        rel_flat_all[slot_offset : slot_offset + (n_i * arity)] = out_pred.view(
-                            -1, self.embedding_size
-                        )
-
-            for pred, n, arity, slot_offset, update_module in fallback_exec:
-                args_flat = args_flat_all[slot_offset : slot_offset + (n * arity)]
-                args_feat = args_flat.view(n, arity * self.embedding_size)
+            else:
                 out_pred = update_module(args_feat)
                 outputs[pred] = out_pred
                 if rel_flat_all is not None:
                     rel_flat_all[slot_offset : slot_offset + (n * arity)] = out_pred.view(
                         -1, self.embedding_size
                     )
-        else:
-            for pred, n, arity, slot_offset, update_module in pred_exec:
-                args_flat = args_flat_all[slot_offset : slot_offset + (n * arity)]
-                args_feat = args_flat.view(n, arity * self.embedding_size)
-                if (stream := self.next_stream()) is not None:
-                    with stream_context(stream):
-                        out_pred = update_module(args_feat)
-                        outputs[pred] = out_pred
-                        if rel_flat_all is not None:
-                            rel_flat_all[slot_offset : slot_offset + (n * arity)] = out_pred.view(
-                                -1, self.embedding_size
-                            )
-                else:
-                    out_pred = update_module(args_feat)
-                    outputs[pred] = out_pred
-                    if rel_flat_all is not None:
-                        rel_flat_all[slot_offset : slot_offset + (n * arity)] = out_pred.view(
-                            -1, self.embedding_size
-                        )
 
         self._sync_streams()
         layer_state["fanout_rel_flat_all"] = rel_flat_all

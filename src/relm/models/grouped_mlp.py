@@ -21,6 +21,7 @@ class GroupedMLPSpec:
             Ordered operations. Each item must be:
             - ("linear", int-index-into-linears)
             - ("pointwise", torch.nn.Module)
+            - ("norm", torch.nn.Module)
         truncated_dim:
             Optional residual truncation dim (same semantics as ResidualModule).
         truncate_right:

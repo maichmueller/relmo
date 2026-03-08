@@ -63,38 +63,35 @@ PYTHONPATH=src python scripts/benchmark_relational_models.py \
 - `--workload pddl --pddl-root /path/to/pddl_instances` benchmarks on real PDDL state-space batches via `pymimir` + `mifrost` (no rgnet import required).
 - `--workload rgnet --rgnet-root ~/GitHub/rgnet` benchmarks on rgnet problem batches (requires `mifrost`, rgnet test assets, and optional `numpy`).
 - `--model-kinds decentralized,centralized` runs both models for direct comparison.
-- `RELM_MODELS_MP_FANIN=1` enables model-side use of `relm.ops.mp` fanin kernels (default: on).
+- `RELM_MODELS_MP_FANIN=1` enables model-side `relm.ops.mp` fanin kernels for centralized fused paths (default: on).
 - `RELM_MODELS_MP_FANIN_FUSED=1` enables fanin kernels in `CentralFusedLayerMP` (default: on).
-- `RELM_MODELS_MP_FANIN_BATCHED=1` enables fanin kernels in `BatchedFanInMP` (default: on).
-- `RELM_MODELS_MP_FANIN_BATCHED_TRAINING=1` re-enables batched fanin kernels during `model.train()` (default: off; inference remains on).
-- `RELM_MODELS_MP_GROUPED_MLP=1` enables grouped execution for compatible per-relation residual MLPs in `BatchedFanOutMP` (default: on, with automatic fallback).
-- `RELM_MODELS_MP_FANOUT=0` enables fanout kernel path in batched/fused MPs (default: off).
+- Decentralized batched MP C++ flags remain as legacy scaffolding only; the maintained path is the regular PyG execution.
+- `RELM_MODELS_MP_FANOUT=0` enables fanout kernel path in centralized fused MP (default: off).
 
-### Grouped MLP Interface
+### Definitive variant matrix benchmark (single source of truth)
 
-`RELM_MODELS_MP_GROUPED_MLP=1` can accelerate custom per-relation modules when they expose:
-
-```python
-from relm.models import GroupedMLPSpec
-
-def relm_grouped_mlp_spec(self) -> GroupedMLPSpec | dict | None:
-    return GroupedMLPSpec(
-        linears=[self.lin1, self.lin2, self.lin3],  # torch.nn.Linear list
-        ops=[  # execution order
-            ("linear", 0),
-            ("pointwise", self.act1),  # one of: Identity/ReLU/Mish/GELU/SiLU/Tanh/ELU/LeakyReLU
-            ("linear", 1),
-            ("pointwise", self.act2),
-            ("linear", 2),
-        ],
-        truncated_dim=self.out_dim,  # optional residual truncation behavior
-        truncate_right=False,        # optional
-        signature=("my-mlp-v1",),    # optional grouping key (must be hashable)
-    )
+```bash
+PYTHONPATH=src python scripts/benchmark_relational_matrix.py \
+  --workload pddl \
+  --pddl-root /path/to/pddl_instances \
+  --domain-case blocks \
+  --problem-case medium \
+  --max-states 50 \
+  --device cuda \
+  --embedding-size 32 \
+  --num-layer 10 \
+  --rounds 20 \
+  --warmup 5 \
+  --repeats 3 \
+  --aggregations sum,logsumexp,mean \
+  --variants python_only,optimized_full \
+  --json-out docs/benchmark_matrix_latest.json \
+  --csv-out docs/benchmark_matrix_latest.csv
 ```
 
-Returning a raw `dict` with the same keys is still supported for backward compatibility.
-If this method is missing, returns `None`, or the module is incompatible, relm automatically falls back to per-relation execution.
+- `python_only`: disables model-side custom mp kernels.
+- `optimized_full`: enables the retained custom mp kernel lane for centralized/decentralized fanin/fanout.
+- Output artifacts are written to JSON + CSV for stable history and comparison automation.
 
 Benchmark snapshots are tracked in [docs/BENCHMARK_HISTORY.md](docs/BENCHMARK_HISTORY.md).
 

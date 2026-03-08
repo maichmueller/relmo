@@ -47,6 +47,16 @@ void check_int64_index(const Tensor& t, const char* name)
    TORCH_CHECK(dtype_of(t) == at::kLong, name, " must have dtype torch.int64.");
 }
 
+void check_int32_or_int64_index(const Tensor& t, const char* name)
+{
+   check_rank(t, 1, name);
+   TORCH_CHECK(
+      dtype_of(t) == at::kLong || dtype_of(t) == at::kInt,
+      name,
+      " must have dtype torch.int64 or torch.int32."
+   );
+}
+
 void check_in_bounds(int64_t idx, int64_t size, const char* name)
 {
    TORCH_CHECK(
@@ -58,6 +68,112 @@ Tensor ensure_contiguous(const Tensor& t)
 {
    return t.is_contiguous() ? t : t.contiguous();
 }
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t total_slots,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+);
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_two_layer_pointwise_from_indices_backward_cuda(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+);
+std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t total_slots,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   const Tensor& ln_weight_stack,
+   const Tensor& ln_bias_stack,
+   double ln_eps,
+   int64_t pointwise_code
+);
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   const Tensor& ln_weight_stack,
+   const Tensor& ln_bias_stack,
+   double ln_eps,
+   int64_t pointwise_code
+);
+std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t total_slots,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   double rms_eps,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+);
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   double rms_eps,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+);
+#endif
 
 Tensor make_scatter_index(const Tensor& idx, int64_t emb)
 {
@@ -250,233 +366,832 @@ std::tuple< Tensor, Tensor, Tensor > fanin_pack_multi(
    return std::make_tuple(rel_cat, flat_src, dst_idx);
 }
 
-Tensor grouped_stack_from_flat(
-   const Tensor& flat,
+std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
+   const Tensor& x,
+   const Tensor& relation_args,
    const std::vector< int64_t >& slot_offsets,
    const std::vector< int64_t >& row_sizes,
-   int64_t arity
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
 )
 {
-   check_rank(flat, 2, "flat");
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device(),
+      "fused_two_layer_pointwise_from_indices expects x and relation_args on the same device."
+   );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "grouped_stack_from_flat expects slot_offsets and row_sizes with equal length."
+      "fused_two_layer_pointwise_from_indices expects slot_offsets and row_sizes with equal lengths."
    );
-   TORCH_CHECK(arity > 0, "grouped_stack_from_flat expects arity > 0.");
+   TORCH_CHECK(arity > 0, "fused_two_layer_pointwise_from_indices expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+   TORCH_CHECK(
+      b1_stack.dim() <= 2,
+      "fused_two_layer_pointwise_from_indices expects b1_stack rank <= 2."
+   );
+   TORCH_CHECK(
+      b2_stack.dim() <= 2,
+      "fused_two_layer_pointwise_from_indices expects b2_stack rank <= 2."
+   );
 
    const int64_t groups = static_cast< int64_t >(slot_offsets.size());
-   const int64_t emb = flat.size(1);
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "fused_two_layer_pointwise_from_indices weight stacks must have first dim equal to group count."
+   );
+   if(b1_stack.numel() > 0) {
+      TORCH_CHECK(
+         b1_stack.dim() == 2 && b1_stack.size(0) == groups,
+         "fused_two_layer_pointwise_from_indices b1_stack must have shape [groups, hidden] when non-empty."
+      );
+   }
+   if(b2_stack.numel() > 0) {
+      TORCH_CHECK(
+         b2_stack.dim() == 2 && b2_stack.size(0) == groups,
+         "fused_two_layer_pointwise_from_indices b2_stack must have shape [groups, out_dim] when non-empty."
+      );
+   }
+
+   const int64_t emb = x.size(1);
    const int64_t in_dim = emb * arity;
-   int64_t max_rows = 0;
-   for(const int64_t n : row_sizes) {
-      TORCH_CHECK(n >= 0, "grouped_stack_from_flat row_sizes must be >= 0.");
-      if(n > max_rows) {
-         max_rows = n;
-      }
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim,
+      "fused_two_layer_pointwise_from_indices expects w1_stack.shape[-1] == arity * emb, got ",
+      w1_stack.size(2),
+      " vs ",
+      in_dim,
+      "."
+   );
+   const int64_t hidden = w1_stack.size(1);
+   TORCH_CHECK(
+      w2_stack.size(2) == hidden,
+      "fused_two_layer_pointwise_from_indices expects w2_stack.shape[-1] == hidden."
+   );
+   TORCH_CHECK(
+      w2_stack.size(1) == in_dim,
+      "fused_two_layer_pointwise_from_indices expects w2_stack.shape[1] == arity * emb."
+   );
+   if(b1_stack.numel() > 0) {
+      TORCH_CHECK(
+         b1_stack.size(1) == hidden,
+         "fused_two_layer_pointwise_from_indices expects b1_stack.shape[1] == hidden."
+      );
+   }
+   if(b2_stack.numel() > 0) {
+      TORCH_CHECK(
+         b2_stack.size(1) == in_dim,
+         "fused_two_layer_pointwise_from_indices expects b2_stack.shape[1] == arity * emb."
+      );
    }
 
-   Tensor out = at::zeros({groups, max_rows, in_dim}, flat.options());
-   if(groups == 0 || max_rows == 0) {
-      return out;
-   }
+   Tensor relation_args_i64 =
+      dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
 
+   std::vector< int64_t > row_offsets;
+   std::vector< int64_t > out_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   out_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   out_offsets.push_back(0);
    for(int64_t i = 0; i < groups; ++i) {
       const int64_t n = row_sizes[static_cast< size_t >(i)];
-      if(n <= 0) {
-         continue;
-      }
+      TORCH_CHECK(
+         n >= 0,
+         "fused_two_layer_pointwise_from_indices row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
       const int64_t start = slot_offsets[static_cast< size_t >(i)];
       const int64_t len = n * arity;
-      TORCH_CHECK(start >= 0, "grouped_stack_from_flat slot_offsets must be >= 0.");
       TORCH_CHECK(
-         start + len <= flat.size(0),
-         "grouped_stack_from_flat slice out of bounds at group ",
+         start >= 0,
+         "fused_two_layer_pointwise_from_indices expects non-negative slot offsets."
+      );
+      TORCH_CHECK(
+         start + len <= relation_args_i64.size(0),
+         "fused_two_layer_pointwise_from_indices slice out of bounds at group ",
          i,
          ": start=",
          start,
          " len=",
          len,
-         " flat_rows=",
-         flat.size(0),
+         " relation_args_rows=",
+         relation_args_i64.size(0),
          "."
       );
-      Tensor src = flat.narrow(0, start, len).view({n, in_dim});
-      out[i].narrow(0, 0, n).copy_(src);
-   }
-   return out;
-}
-
-std::tuple< Tensor, Tensor > grouped_residual_mlp_from_flat(
-   const Tensor& flat,
-   const std::vector< int64_t >& slot_offsets,
-   const std::vector< int64_t >& row_sizes,
-   int64_t arity,
-   const std::vector< Tensor >& weight_stacks,
-   const std::vector< Tensor >& bias_stacks,
-   const std::vector< int64_t >& op_kinds,
-   const std::vector< int64_t >& op_indices,
-   const std::vector< int64_t >& pointwise_codes,
-   int64_t truncated_dim,
-   bool truncate_right
-)
-{
-   check_rank(flat, 2, "flat");
-   TORCH_CHECK(
-      slot_offsets.size() == row_sizes.size(),
-      "grouped_residual_mlp_from_flat expects slot_offsets and row_sizes with equal lengths."
-   );
-   TORCH_CHECK(
-      op_kinds.size() == op_indices.size(),
-      "grouped_residual_mlp_from_flat expects op_kinds and op_indices with equal lengths."
-   );
-   TORCH_CHECK(arity > 0, "grouped_residual_mlp_from_flat expects arity > 0.");
-
-   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
-   const int64_t emb = flat.size(1);
-   const int64_t in_dim = emb * arity;
-   int64_t max_rows = 0;
-   for(const int64_t n : row_sizes) {
-      TORCH_CHECK(n >= 0, "grouped_residual_mlp_from_flat row_sizes must be >= 0.");
-      if(n > max_rows) {
-         max_rows = n;
-      }
+      row_offsets.push_back(row_offsets.back() + n);
+      out_offsets.push_back(out_offsets.back() + len);
    }
 
-   for(size_t i = 0; i < weight_stacks.size(); ++i) {
-      const Tensor& w = weight_stacks[i];
-      check_rank(w, 3, "weight_stacks[i]");
-      TORCH_CHECK(
-         w.size(0) == groups,
-         "grouped_residual_mlp_from_flat weight_stacks[",
-         i,
-         "] first dim must equal group count."
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(x.is_cuda() && relation_args_i64.is_cuda() && w1_stack.is_cuda() && w2_stack.is_cuda()
+      && (b1_stack.numel() == 0 || b1_stack.is_cuda()) && (b2_stack.numel() == 0 || b2_stack.is_cuda())
+      && is_fastpath_dtype(dtype_of(x))) {
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
+      return fused_two_layer_pointwise_from_indices_cuda(
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         out_offsets_t,
+         row_offsets.back(),
+         out_offsets.back(),
+         arity,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         pointwise_code
       );
    }
-   for(size_t i = 0; i < bias_stacks.size(); ++i) {
-      const Tensor& b = bias_stacks[i];
-      TORCH_CHECK(
-         b.dim() <= 2,
-         "grouped_residual_mlp_from_flat bias_stacks[",
-         i,
-         "] must be rank <= 2."
-      );
-      if(b.numel() == 0) {
-         continue;
-      }
-      TORCH_CHECK(
-         b.dim() == 2 && b.size(0) == groups,
-         "grouped_residual_mlp_from_flat bias_stacks[",
-         i,
-         "] must have shape [groups, out_features] when non-empty."
-      );
-   }
+#endif
 
-   Tensor x_stack = at::zeros({groups, max_rows, in_dim}, flat.options());
-   if(groups > 0 && max_rows > 0) {
-      for(int64_t i = 0; i < groups; ++i) {
-         const int64_t n = row_sizes[static_cast< size_t >(i)];
-         if(n <= 0) {
-            continue;
-         }
-         const int64_t start = slot_offsets[static_cast< size_t >(i)];
-         const int64_t len = n * arity;
-         TORCH_CHECK(
-            start >= 0,
-            "grouped_residual_mlp_from_flat expects non-negative slot offsets."
-         );
-         TORCH_CHECK(
-            start + len <= flat.size(0),
-            "grouped_residual_mlp_from_flat slice out of bounds at group ",
-            i,
-            ": start=",
-            start,
-            " len=",
-            len,
-            " flat_rows=",
-            flat.size(0),
-            "."
-         );
-         Tensor src = flat.narrow(0, start, len).view({n, in_dim});
-         x_stack[i].narrow(0, 0, n).copy_(src);
-      }
-   }
-
-   Tensor out_stack = x_stack;
-   for(size_t op_i = 0; op_i < op_kinds.size(); ++op_i) {
-      const int64_t kind = op_kinds[op_i];
-      const int64_t idx = op_indices[op_i];
-      if(kind == 0) {
-         TORCH_CHECK(
-            idx >= 0 && static_cast< size_t >(idx) < weight_stacks.size(),
-            "grouped_residual_mlp_from_flat linear op index out of range: ",
-            idx,
-            "."
-         );
-         const Tensor& w = weight_stacks[static_cast< size_t >(idx)];
-         out_stack = at::matmul(out_stack, w.transpose(1, 2));
-         if(static_cast< size_t >(idx) < bias_stacks.size()) {
-            const Tensor& b = bias_stacks[static_cast< size_t >(idx)];
-            if(b.numel() > 0) {
-               out_stack = out_stack + b.unsqueeze(1);
-            }
-         }
-         continue;
-      }
-      if(kind == 1) {
-         TORCH_CHECK(
-            idx >= 0 && static_cast< size_t >(idx) < pointwise_codes.size(),
-            "grouped_residual_mlp_from_flat pointwise op index out of range: ",
-            idx,
-            "."
-         );
-         const int64_t code = pointwise_codes[static_cast< size_t >(idx)];
-         out_stack = apply_pointwise_code(out_stack, code);
-         continue;
-      }
-      TORCH_CHECK(
-         false,
-         "grouped_residual_mlp_from_flat unsupported op kind: ",
-         kind,
-         "."
-      );
-   }
-
-   Tensor residual;
-   if(truncated_dim >= 0 && x_stack.size(-1) != truncated_dim) {
-      if(truncate_right) {
-         residual = x_stack.narrow(-1, 0, truncated_dim);
-      } else {
-         residual = x_stack.narrow(-1, x_stack.size(-1) - truncated_dim, truncated_dim);
-      }
-   } else {
-      residual = x_stack;
-   }
-   out_stack = residual + out_stack;
-
-   std::vector< Tensor > rel_parts;
-   std::vector< Tensor > flat_parts;
-   rel_parts.reserve(groups);
-   flat_parts.reserve(groups);
-   auto idx_options = flat.options().dtype(at::kLong);
+   Tensor rel_cat = x.new_empty({out_offsets.back(), emb});
+   Tensor node_idx_cat = at::empty({out_offsets.back()}, relation_args_i64.options());
    for(int64_t i = 0; i < groups; ++i) {
-      const int64_t n = row_sizes[static_cast< size_t >(i)];
-      if(n <= 0) {
+      const int64_t row_start = row_offsets[static_cast< size_t >(i)];
+      const int64_t row_end = row_offsets[static_cast< size_t >(i + 1)];
+      const int64_t out_start = out_offsets[static_cast< size_t >(i)];
+      const int64_t out_end = out_offsets[static_cast< size_t >(i + 1)];
+      const int64_t n = row_end - row_start;
+      const int64_t len = out_end - out_start;
+      if(n <= 0 || len <= 0) {
          continue;
       }
       const int64_t slot = slot_offsets[static_cast< size_t >(i)];
-      Tensor rel_i = out_stack[i].narrow(0, 0, n).contiguous().view({n * arity, emb});
-      Tensor flat_i = at::arange(n * arity, idx_options) + slot;
-      rel_parts.push_back(rel_i);
-      flat_parts.push_back(flat_i);
+      Tensor node_idx_i = relation_args_i64.narrow(0, slot, len);
+      Tensor arg_emb_i = x.index_select(0, node_idx_i);
+      Tensor x_i = arg_emb_i.view({n, in_dim});
+      Tensor hidden_i;
+      if(b1_stack.numel() > 0) {
+         hidden_i = at::addmm(b1_stack.select(0, i), x_i, w1_stack.select(0, i).transpose(0, 1));
+      } else {
+         hidden_i = at::mm(x_i, w1_stack.select(0, i).transpose(0, 1));
+      }
+      hidden_i = apply_pointwise_code(hidden_i, pointwise_code);
+      Tensor out_i;
+      if(b2_stack.numel() > 0) {
+         out_i = at::addmm(b2_stack.select(0, i), hidden_i, w2_stack.select(0, i).transpose(0, 1));
+      } else {
+         out_i = at::mm(hidden_i, w2_stack.select(0, i).transpose(0, 1));
+      }
+      Tensor rel_i = (x_i + out_i).contiguous().view({len, emb});
+      rel_cat.narrow(0, out_start, len).copy_(rel_i);
+      node_idx_cat.narrow(0, out_start, len).copy_(node_idx_i);
    }
-   if(rel_parts.empty()) {
-      return std::make_tuple(
-         flat.new_empty({0, emb}), at::empty({0}, flat.options().dtype(at::kLong))
+   return std::make_tuple(rel_cat, node_idx_cat);
+}
+
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_two_layer_pointwise_from_indices_backward(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+)
+{
+   check_rank(grad_rel, 2, "grad_rel");
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device() && grad_rel.device() == x.device(),
+      "fused_two_layer_pointwise_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+   );
+   TORCH_CHECK(
+      slot_offsets.size() == row_sizes.size(),
+      "fused_two_layer_pointwise_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+   );
+   TORCH_CHECK(arity > 0, "fused_two_layer_pointwise_from_indices_backward expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+
+   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
+   const int64_t emb = x.size(1);
+   const int64_t in_dim = emb * arity;
+   TORCH_CHECK(
+      grad_rel.size(1) == emb,
+      "fused_two_layer_pointwise_from_indices_backward expects grad_rel.shape[1] == emb."
+   );
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "fused_two_layer_pointwise_from_indices_backward weight stacks must match group count."
+   );
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
+      "fused_two_layer_pointwise_from_indices_backward weight stack dims do not match arity * emb."
+   );
+
+   std::vector< int64_t > row_offsets;
+   std::vector< int64_t > out_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   out_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   out_offsets.push_back(0);
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t n = row_sizes[static_cast< size_t >(i)];
+      TORCH_CHECK(
+         n >= 0,
+         "fused_two_layer_pointwise_from_indices_backward row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
+      const int64_t start = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      TORCH_CHECK(
+         start >= 0,
+         "fused_two_layer_pointwise_from_indices_backward expects non-negative slot offsets."
+      );
+      TORCH_CHECK(
+         start + len <= relation_args.size(0),
+         "fused_two_layer_pointwise_from_indices_backward slice out of bounds at group ",
+         i,
+         "."
+      );
+      row_offsets.push_back(row_offsets.back() + n);
+      out_offsets.push_back(out_offsets.back() + len);
+   }
+   TORCH_CHECK(
+      grad_rel.size(0) == out_offsets.back(),
+      "fused_two_layer_pointwise_from_indices_backward expects grad_rel rows to match packed slot count."
+   );
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(grad_rel.is_cuda() && x.is_cuda() && relation_args.is_cuda() && w1_stack.is_cuda()
+      && w2_stack.is_cuda() && (b1_stack.numel() == 0 || b1_stack.is_cuda())
+      && (b2_stack.numel() == 0 || b2_stack.is_cuda()) && is_fastpath_dtype(dtype_of(grad_rel))) {
+      Tensor relation_args_i64 =
+         dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
+      return fused_two_layer_pointwise_from_indices_backward_cuda(
+         grad_rel,
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         out_offsets_t,
+         row_offsets.back(),
+         arity,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         pointwise_code
       );
    }
-   Tensor rel_cat = rel_parts.size() == 1 ? rel_parts[0] : at::cat(rel_parts, 0);
-   Tensor flat_idx = flat_parts.size() == 1 ? flat_parts[0] : at::cat(flat_parts, 0);
-   return std::make_tuple(rel_cat, flat_idx);
+#endif
+
+   TORCH_CHECK(
+      false,
+      "fused_two_layer_pointwise_from_indices_backward currently supports only CUDA float32/float64 tensors."
+   );
+}
+
+std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   const Tensor& ln_weight_stack,
+   const Tensor& ln_bias_stack,
+   double ln_eps,
+   int64_t pointwise_code
+)
+{
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device(),
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects x and relation_args on the same device."
+   );
+   TORCH_CHECK(
+      slot_offsets.size() == row_sizes.size(),
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+   );
+   TORCH_CHECK(arity > 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+
+   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
+   const int64_t emb = x.size(1);
+   const int64_t in_dim = emb * arity;
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stacks must match group count."
+   );
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stack dims do not match arity * emb."
+   );
+   if(ln_weight_stack.numel() > 0) {
+      check_rank(ln_weight_stack, 2, "ln_weight_stack");
+      TORCH_CHECK(
+         ln_weight_stack.size(0) == groups && ln_weight_stack.size(1) == in_dim,
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_weight_stack must have shape [groups, arity * emb]."
+      );
+   }
+   if(ln_bias_stack.numel() > 0) {
+      check_rank(ln_bias_stack, 2, "ln_bias_stack");
+      TORCH_CHECK(
+         ln_bias_stack.size(0) == groups && ln_bias_stack.size(1) == in_dim,
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_bias_stack must have shape [groups, arity * emb]."
+      );
+   }
+
+   Tensor relation_args_i64 =
+      dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
+   std::vector< int64_t > row_offsets;
+   std::vector< int64_t > out_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   out_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   out_offsets.push_back(0);
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t n = row_sizes[static_cast< size_t >(i)];
+      TORCH_CHECK(
+         n >= 0,
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
+      const int64_t start = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      TORCH_CHECK(start >= 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects non-negative slot offsets.");
+      TORCH_CHECK(
+         start + len <= relation_args_i64.size(0),
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices slice out of bounds at group ",
+         i,
+         "."
+      );
+      row_offsets.push_back(row_offsets.back() + n);
+      out_offsets.push_back(out_offsets.back() + len);
+   }
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(x.is_cuda() && relation_args_i64.is_cuda() && w1_stack.is_cuda() && w2_stack.is_cuda()
+      && (b1_stack.numel() == 0 || b1_stack.is_cuda()) && (b2_stack.numel() == 0 || b2_stack.is_cuda())
+      && (ln_weight_stack.numel() == 0 || ln_weight_stack.is_cuda())
+      && (ln_bias_stack.numel() == 0 || ln_bias_stack.is_cuda()) && is_fastpath_dtype(dtype_of(x))) {
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
+      return fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda(
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         out_offsets_t,
+         row_offsets.back(),
+         out_offsets.back(),
+         arity,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         ln_weight_stack,
+         ln_bias_stack,
+         ln_eps,
+         pointwise_code
+      );
+   }
+#endif
+
+   TORCH_CHECK(
+      false,
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices currently supports only CUDA float32/float64 tensors."
+   );
+}
+
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   const Tensor& ln_weight_stack,
+   const Tensor& ln_bias_stack,
+   double ln_eps,
+   int64_t pointwise_code
+)
+{
+   check_rank(grad_rel, 2, "grad_rel");
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device() && grad_rel.device() == x.device(),
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+   );
+   TORCH_CHECK(
+      slot_offsets.size() == row_sizes.size(),
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+   );
+   TORCH_CHECK(arity > 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+
+   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
+   const int64_t emb = x.size(1);
+   const int64_t in_dim = emb * arity;
+   TORCH_CHECK(
+      grad_rel.size(1) == emb,
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects grad_rel.shape[1] == emb."
+   );
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward weight stacks must match group count."
+   );
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward weight stack dims do not match arity * emb."
+   );
+   if(ln_weight_stack.numel() > 0) {
+      check_rank(ln_weight_stack, 2, "ln_weight_stack");
+      TORCH_CHECK(
+         ln_weight_stack.size(0) == groups && ln_weight_stack.size(1) == in_dim,
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward ln_weight_stack must have shape [groups, arity * emb]."
+      );
+   }
+   if(ln_bias_stack.numel() > 0) {
+      check_rank(ln_bias_stack, 2, "ln_bias_stack");
+      TORCH_CHECK(
+         ln_bias_stack.size(0) == groups && ln_bias_stack.size(1) == in_dim,
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward ln_bias_stack must have shape [groups, arity * emb]."
+      );
+   }
+
+   std::vector< int64_t > row_offsets;
+   std::vector< int64_t > out_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   out_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   out_offsets.push_back(0);
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t n = row_sizes[static_cast< size_t >(i)];
+      TORCH_CHECK(
+         n >= 0,
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
+      const int64_t start = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      TORCH_CHECK(start >= 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects non-negative slot offsets.");
+      TORCH_CHECK(
+         start + len <= relation_args.size(0),
+         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward slice out of bounds at group ",
+         i,
+         "."
+      );
+      row_offsets.push_back(row_offsets.back() + n);
+      out_offsets.push_back(out_offsets.back() + len);
+   }
+   TORCH_CHECK(
+      grad_rel.size(0) == out_offsets.back(),
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects grad_rel rows to match packed slot count."
+   );
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(grad_rel.is_cuda() && x.is_cuda() && relation_args.is_cuda() && w1_stack.is_cuda()
+      && w2_stack.is_cuda() && (b1_stack.numel() == 0 || b1_stack.is_cuda())
+      && (b2_stack.numel() == 0 || b2_stack.is_cuda())
+      && (ln_weight_stack.numel() == 0 || ln_weight_stack.is_cuda())
+      && (ln_bias_stack.numel() == 0 || ln_bias_stack.is_cuda()) && is_fastpath_dtype(dtype_of(grad_rel))) {
+      Tensor relation_args_i64 =
+         dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
+      return fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
+         grad_rel,
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         out_offsets_t,
+         row_offsets.back(),
+         arity,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         ln_weight_stack,
+         ln_bias_stack,
+         ln_eps,
+         pointwise_code
+      );
+   }
+#endif
+
+   TORCH_CHECK(
+      false,
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward currently supports only CUDA float32/float64 tensors."
+   );
+}
+
+std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   double rms_eps,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+)
+{
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device(),
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects x and relation_args on the same device."
+   );
+   TORCH_CHECK(
+      slot_offsets.size() == row_sizes.size(),
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+   );
+   TORCH_CHECK(arity > 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+
+   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
+   const int64_t emb = x.size(1);
+   const int64_t in_dim = emb * arity;
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stacks must match group count."
+   );
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stack dims do not match arity * emb."
+   );
+   if(rms_weight_stack.numel() > 0) {
+      check_rank(rms_weight_stack, 2, "rms_weight_stack");
+      TORCH_CHECK(
+         rms_weight_stack.size(0) == groups && rms_weight_stack.size(1) == in_dim,
+         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices rms_weight_stack must have shape [groups, arity * emb]."
+      );
+   }
+
+   Tensor relation_args_i64 =
+      dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
+   std::vector< int64_t > row_offsets;
+   std::vector< int64_t > out_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   out_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   out_offsets.push_back(0);
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t n = row_sizes[static_cast< size_t >(i)];
+      TORCH_CHECK(
+         n >= 0,
+         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
+      const int64_t start = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      TORCH_CHECK(start >= 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects non-negative slot offsets.");
+      TORCH_CHECK(
+         start + len <= relation_args_i64.size(0),
+         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices slice out of bounds at group ",
+         i,
+         "."
+      );
+      row_offsets.push_back(row_offsets.back() + n);
+      out_offsets.push_back(out_offsets.back() + len);
+   }
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(x.is_cuda() && relation_args_i64.is_cuda() && w1_stack.is_cuda() && w2_stack.is_cuda()
+      && (b1_stack.numel() == 0 || b1_stack.is_cuda()) && (b2_stack.numel() == 0 || b2_stack.is_cuda())
+      && (rms_weight_stack.numel() == 0 || rms_weight_stack.is_cuda()) && is_fastpath_dtype(dtype_of(x))) {
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
+      return fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda(
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         out_offsets_t,
+         row_offsets.back(),
+         out_offsets.back(),
+         arity,
+         rms_weight_stack,
+         rms_eps,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         pointwise_code
+      );
+   }
+#endif
+
+   TORCH_CHECK(
+      false,
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices currently supports only CUDA float32/float64 tensors."
+   );
+}
+
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   double rms_eps,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+)
+{
+   check_rank(grad_rel, 2, "grad_rel");
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device() && grad_rel.device() == x.device(),
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+   );
+   TORCH_CHECK(
+      slot_offsets.size() == row_sizes.size(),
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+   );
+   TORCH_CHECK(arity > 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+
+   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
+   const int64_t emb = x.size(1);
+   const int64_t in_dim = emb * arity;
+   TORCH_CHECK(
+      grad_rel.size(1) == emb,
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects grad_rel.shape[1] == emb."
+   );
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward weight stacks must match group count."
+   );
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward weight stack dims do not match arity * emb."
+   );
+   if(rms_weight_stack.numel() > 0) {
+      check_rank(rms_weight_stack, 2, "rms_weight_stack");
+      TORCH_CHECK(
+         rms_weight_stack.size(0) == groups && rms_weight_stack.size(1) == in_dim,
+         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward rms_weight_stack must have shape [groups, arity * emb]."
+      );
+   }
+
+   std::vector< int64_t > row_offsets;
+   std::vector< int64_t > out_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   out_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   out_offsets.push_back(0);
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t n = row_sizes[static_cast< size_t >(i)];
+      TORCH_CHECK(
+         n >= 0,
+         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
+      const int64_t start = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      TORCH_CHECK(start >= 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects non-negative slot offsets.");
+      TORCH_CHECK(
+         start + len <= relation_args.size(0),
+         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward slice out of bounds at group ",
+         i,
+         "."
+      );
+      row_offsets.push_back(row_offsets.back() + n);
+      out_offsets.push_back(out_offsets.back() + len);
+   }
+   TORCH_CHECK(
+      grad_rel.size(0) == out_offsets.back(),
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects grad_rel rows to match packed slot count."
+   );
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(grad_rel.is_cuda() && x.is_cuda() && relation_args.is_cuda() && w1_stack.is_cuda()
+      && w2_stack.is_cuda() && (b1_stack.numel() == 0 || b1_stack.is_cuda())
+      && (b2_stack.numel() == 0 || b2_stack.is_cuda())
+      && (rms_weight_stack.numel() == 0 || rms_weight_stack.is_cuda()) && is_fastpath_dtype(dtype_of(grad_rel))) {
+      Tensor relation_args_i64 =
+         dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
+      return fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
+         grad_rel,
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         out_offsets_t,
+         row_offsets.back(),
+         arity,
+         rms_weight_stack,
+         rms_eps,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         pointwise_code
+      );
+   }
+#endif
+
+   TORCH_CHECK(
+      false,
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward currently supports only CUDA float32/float64 tensors."
+   );
+}
+
+std::tuple< Tensor, Tensor > fused_two_layer_mish_from_indices(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack
+)
+{
+   return fused_two_layer_pointwise_from_indices(
+      x, relation_args, slot_offsets, row_sizes, arity, w1_stack, b1_stack, w2_stack, b2_stack, kPwMish
+   );
+}
+
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_two_layer_mish_from_indices_backward(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack
+)
+{
+   return fused_two_layer_pointwise_from_indices_backward(
+      grad_rel,
+      x,
+      relation_args,
+      slot_offsets,
+      row_sizes,
+      arity,
+      w1_stack,
+      b1_stack,
+      w2_stack,
+      b2_stack,
+      kPwMish
+   );
 }
 
 std::tuple< Tensor, Tensor, Tensor > fanout_pack_from_edges(
@@ -780,6 +1495,35 @@ Tensor fanin_reduce_logsumexp_backward_cuda(
    const Tensor& dst_idx,
    const Tensor& out,
    int64_t rel_rows
+);
+std::tuple< Tensor, Tensor > fused_two_layer_mish_from_indices_cuda(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t total_slots,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack
+);
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_two_layer_mish_from_indices_backward_cuda(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack
 );
 #endif
 
@@ -1357,10 +2101,28 @@ TORCH_LIBRARY(relm_mp, m)
       "fanin_pack_from_edges(Tensor[] rel_parts, Tensor[] edge_src_parts, Tensor[] edge_dst_parts, int[] rel_part_ids, int[] arity_parts, int[] pos_parts, int mode) -> (Tensor, Tensor, Tensor)"
    );
    m.def(
-      "grouped_stack_from_flat(Tensor flat, int[] slot_offsets, int[] row_sizes, int arity) -> Tensor"
+      "fused_two_layer_pointwise_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor)"
    );
    m.def(
-      "grouped_residual_mlp_from_flat(Tensor flat, int[] slot_offsets, int[] row_sizes, int arity, Tensor[] weight_stacks, Tensor[] bias_stacks, int[] op_kinds, int[] op_indices, int[] pointwise_codes, int truncated_dim, bool truncate_right) -> (Tensor, Tensor)"
+      "fused_two_layer_pointwise_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+   );
+   m.def(
+      "fused_two_layer_mish_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack) -> (Tensor, Tensor)"
+   );
+   m.def(
+      "fused_two_layer_mish_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+   );
+   m.def(
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps, int pointwise_code) -> (Tensor, Tensor)"
+   );
+   m.def(
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+   );
+   m.def(
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor)"
+   );
+   m.def(
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def("build_info() -> str");
 }
@@ -1376,7 +2138,33 @@ TORCH_LIBRARY_IMPL(relm_mp, CompositeImplicitAutograd, m)
    m.impl("fanin_reduce_logsumexp_backward", relm::mp::fanin_reduce_logsumexp_backward);
    m.impl("fanin_pack_multi", relm::mp::fanin_pack_multi);
    m.impl("fanin_pack_from_edges", relm::mp::fanin_pack_from_edges);
-   m.impl("grouped_stack_from_flat", relm::mp::grouped_stack_from_flat);
-   m.impl("grouped_residual_mlp_from_flat", relm::mp::grouped_residual_mlp_from_flat);
+   m.impl(
+      "fused_two_layer_pointwise_from_indices", relm::mp::fused_two_layer_pointwise_from_indices
+   );
+   m.impl(
+      "fused_two_layer_pointwise_from_indices_backward",
+      relm::mp::fused_two_layer_pointwise_from_indices_backward
+   );
+   m.impl("fused_two_layer_mish_from_indices", relm::mp::fused_two_layer_mish_from_indices);
+   m.impl(
+      "fused_two_layer_mish_from_indices_backward",
+      relm::mp::fused_two_layer_mish_from_indices_backward
+   );
+   m.impl(
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices",
+      relm::mp::fused_postnorm_two_layer_pointwise_layernorm_from_indices
+   );
+   m.impl(
+      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward",
+      relm::mp::fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward
+   );
+   m.impl(
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices",
+      relm::mp::fused_prenorm_two_layer_pointwise_rmsnorm_from_indices
+   );
+   m.impl(
+      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward",
+      relm::mp::fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward
+   );
    m.impl("build_info", relm::mp::build_info);
 }

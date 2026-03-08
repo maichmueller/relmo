@@ -232,13 +232,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-steps", type=int, default=2)
     parser.add_argument(
         "--variants",
-        default=(
-            "optimized_general,"
-            "batched_cpp_scaffold_only,"
-            "batched_cpp_scaffold_fanin_only,"
-            "batched_cpp_fanout_only,"
-            "batched_cpp_experimental"
-        ),
+        default="python_only,optimized_full",
     )
     parser.add_argument("--aggregations", default="mean,sum")
     parser.add_argument("--json-out", default="docs/profile_batched_variants.json")

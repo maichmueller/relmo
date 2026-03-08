@@ -3,8 +3,7 @@
 
 This script provides a single, rerunnable source of truth for comparing:
 - pure Python/PyG execution (`python_only`)
-- non-kernel optimizations (`optimized_general`)
-- full optimization lane including custom mp kernels (`optimized_full`)
+- retained custom mp kernel lane (`optimized_full`)
 
 It emits machine-readable JSON/CSV artifacts for easy history tracking.
 """
@@ -50,25 +49,6 @@ VARIANTS: dict[str, Variant] = {
             "RELM_MODELS_MP_FANIN": "0",
             "RELM_MODELS_MP_FANIN_FUSED": "0",
             "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "0",
-            "RELM_MODELS_MP_LOGSUMEXP": "0",
-            "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "0",
-            "RELM_MP_ENABLE": "0",
-            "RELM_MP_FALLBACK": "python",
-        },
-    ),
-    "optimized_general": Variant(
-        name="optimized_general",
-        description=(
-            "Keep generic model optimizations (e.g., grouped compatible relation MLP path), "
-            "but disable custom mp kernel lane."
-        ),
-        env={
-            "RELM_MODELS_MP_OPS": "0",
-            "RELM_MODELS_MP_FANIN": "0",
-            "RELM_MODELS_MP_FANIN_FUSED": "0",
-            "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "1",
             "RELM_MODELS_MP_LOGSUMEXP": "0",
             "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "0",
             "RELM_MP_ENABLE": "0",
@@ -78,109 +58,16 @@ VARIANTS: dict[str, Variant] = {
     "optimized_full": Variant(
         name="optimized_full",
         description=(
-            "Enable full optimization lane: grouped path plus centralized custom fanin kernels "
-            "(sum, and logsumexp when enabled)."
+            "Enable the retained custom mp kernel lane for centralized/decentralized fanin/fanout."
         ),
         env={
             "RELM_MODELS_MP_OPS": "1",
             "RELM_MODELS_MP_FANIN": "1",
             "RELM_MODELS_MP_FANIN_FUSED": "1",
             "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "1",
             "RELM_MODELS_MP_LOGSUMEXP": "1",
             "RELM_MP_ENABLE": "1",
             "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "0",
-            "RELM_MP_FALLBACK": "error",
-        },
-    ),
-    "batched_cpp_experimental": Variant(
-        name="batched_cpp_experimental",
-        description=(
-            "Experimental decentralized batched fanout/fanin custom-op lane for direct "
-            "A/B against Python batched path."
-        ),
-        env={
-            "RELM_MODELS_MP_OPS": "1",
-            "RELM_MODELS_MP_FANIN": "1",
-            "RELM_MODELS_MP_FANIN_FUSED": "1",
-            "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "1",
-            "RELM_MODELS_MP_LOGSUMEXP": "1",
-            "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL": "1",
-            "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "0",
-            "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL": "1",
-            "RELM_MP_ENABLE": "1",
-            "RELM_MP_FALLBACK": "error",
-        },
-    ),
-    "batched_cpp_fanin_only": Variant(
-        name="batched_cpp_fanin_only",
-        description="Experimental decentralized batched fanin custom-op only.",
-        env={
-            "RELM_MODELS_MP_OPS": "1",
-            "RELM_MODELS_MP_FANIN": "1",
-            "RELM_MODELS_MP_FANIN_FUSED": "1",
-            "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "1",
-            "RELM_MODELS_MP_LOGSUMEXP": "1",
-            "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL": "1",
-            "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "0",
-            "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL": "0",
-            "RELM_MP_ENABLE": "1",
-            "RELM_MP_FALLBACK": "error",
-        },
-    ),
-    "batched_cpp_fanout_only": Variant(
-        name="batched_cpp_fanout_only",
-        description="Experimental decentralized batched fanout custom-op only.",
-        env={
-            "RELM_MODELS_MP_OPS": "1",
-            "RELM_MODELS_MP_FANIN": "1",
-            "RELM_MODELS_MP_FANIN_FUSED": "1",
-            "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "1",
-            "RELM_MODELS_MP_LOGSUMEXP": "1",
-            "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL": "0",
-            "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "0",
-            "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL": "1",
-            "RELM_MP_ENABLE": "1",
-            "RELM_MP_FALLBACK": "error",
-        },
-    ),
-    "batched_cpp_scaffold_only": Variant(
-        name="batched_cpp_scaffold_only",
-        description=(
-            "Experimental decentralized batched scaffold relay path only: C++ pack/scatter "
-            "without custom fanin reduction kernel."
-        ),
-        env={
-            "RELM_MODELS_MP_OPS": "1",
-            "RELM_MODELS_MP_FANIN": "0",
-            "RELM_MODELS_MP_FANIN_FUSED": "0",
-            "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "1",
-            "RELM_MODELS_MP_LOGSUMEXP": "0",
-            "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL": "0",
-            "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "1",
-            "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL": "1",
-            "RELM_MP_ENABLE": "1",
-            "RELM_MP_FALLBACK": "error",
-        },
-    ),
-    "batched_cpp_scaffold_fanin_only": Variant(
-        name="batched_cpp_scaffold_fanin_only",
-        description="Experimental decentralized batched C++ fanin packing only (no reduction kernel).",
-        env={
-            "RELM_MODELS_MP_OPS": "1",
-            "RELM_MODELS_MP_FANIN": "0",
-            "RELM_MODELS_MP_FANIN_FUSED": "0",
-            "RELM_MODELS_MP_FANOUT": "0",
-            "RELM_MODELS_MP_GROUPED_MLP": "1",
-            "RELM_MODELS_MP_LOGSUMEXP": "0",
-            "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL": "0",
-            "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": "1",
-            "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL": "0",
-            "RELM_MP_ENABLE": "1",
             "RELM_MP_FALLBACK": "error",
         },
     ),
@@ -188,12 +75,7 @@ VARIANTS: dict[str, Variant] = {
 
 
 def _variant_env_for_aggr(variant: Variant, aggr: str) -> dict[str, str]:
-    env = dict(variant.env)
-    # Batched fanin reduction custom kernels only exist for sum/logsumexp.
-    # Keep benchmark lanes apples-to-apples by disabling that flag on other aggregations.
-    if aggr not in {"sum", "logsumexp"}:
-        env["RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL"] = "0"
-    return env
+    return dict(variant.env)
 
 
 @contextlib.contextmanager
@@ -495,7 +377,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--variants",
-        default="python_only,optimized_general,optimized_full",
+        default="python_only,optimized_full",
         help="Comma-separated variant names.",
     )
     parser.add_argument(

@@ -67,6 +67,30 @@ def _fallback_mode() -> str:
     return raw if raw in {"python", "error"} else "python"
 
 
+def pointwise_code_from_signature(signature: tuple[object, ...] | None) -> int | None:
+    if not signature:
+        return None
+    kind = str(signature[0])
+    if kind == "identity":
+        return _PW_IDENTITY
+    if kind == "relu":
+        return _PW_RELU
+    if kind == "mish":
+        return _PW_MISH
+    if kind == "gelu":
+        approximate = str(signature[1]) if len(signature) > 1 else "none"
+        if approximate == "none":
+            return _PW_GELU_NONE
+        if approximate == "tanh":
+            return _PW_GELU_TANH
+        return None
+    if kind == "silu":
+        return _PW_SILU
+    if kind == "tanh":
+        return _PW_TANH
+    return None
+
+
 def _runtime_cuda_tag() -> str:
     assert torch is not None
     cuda = getattr(torch.version, "cuda", None)
@@ -364,47 +388,6 @@ def _fanin_pack_multi_python(
     return rel_cat, flat_src, dst_idx
 
 
-def _grouped_stack_from_flat_python(
-    flat: torch.Tensor,
-    slot_offsets: list[int],
-    row_sizes: list[int],
-    arity: int,
-) -> torch.Tensor:
-    if flat.dim() != 2:
-        raise ValueError("grouped_stack_from_flat expects flat to be rank-2.")
-    if len(slot_offsets) != len(row_sizes):
-        raise ValueError(
-            "grouped_stack_from_flat expects slot_offsets and row_sizes with equal lengths."
-        )
-    arity_i = int(arity)
-    if arity_i <= 0:
-        raise ValueError("grouped_stack_from_flat expects arity > 0.")
-    groups = len(slot_offsets)
-    emb = int(flat.size(1))
-    in_dim = int(arity_i * emb)
-    max_rows = max((int(n) for n in row_sizes), default=0)
-    out = flat.new_zeros((groups, max_rows, in_dim))
-    if groups == 0 or max_rows == 0:
-        return out
-    flat_rows = int(flat.size(0))
-    for i, (slot, rows) in enumerate(zip(slot_offsets, row_sizes)):
-        n = int(rows)
-        if n <= 0:
-            continue
-        start = int(slot)
-        span = int(n * arity_i)
-        if start < 0:
-            raise ValueError("grouped_stack_from_flat expects non-negative slot offsets.")
-        if start + span > flat_rows:
-            raise ValueError(
-                "grouped_stack_from_flat slice out of bounds: "
-                f"start={start} span={span} flat_rows={flat_rows}."
-            )
-        src = flat.narrow(0, start, span).view(n, in_dim)
-        out[i, :n, :].copy_(src)
-    return out
-
-
 def _apply_pointwise_code(x: torch.Tensor, code: int) -> torch.Tensor:
     code_i = int(code)
     if code_i == _PW_IDENTITY:
@@ -424,109 +407,303 @@ def _apply_pointwise_code(x: torch.Tensor, code: int) -> torch.Tensor:
     raise ValueError(f"Unsupported pointwise code: {code_i!r}.")
 
 
-def _grouped_residual_mlp_from_flat_python(
-    flat: torch.Tensor,
+def _fused_two_layer_pointwise_from_indices_python(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
     slot_offsets: list[int],
     row_sizes: list[int],
     arity: int,
-    weight_stacks: list[torch.Tensor],
-    bias_stacks: list[torch.Tensor],
-    op_kinds: list[int],
-    op_indices: list[int],
-    pointwise_codes: list[int],
-    truncated_dim: int,
-    truncate_right: bool,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    pointwise_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if flat.dim() != 2:
-        raise ValueError("grouped_residual_mlp_from_flat expects flat to be rank-2.")
+    if x.dim() != 2:
+        raise ValueError("fused_two_layer_pointwise_from_indices expects x to be rank-2.")
+    if relation_args.dim() != 1:
+        raise ValueError(
+            "fused_two_layer_pointwise_from_indices expects relation_args to be rank-1."
+        )
     if len(slot_offsets) != len(row_sizes):
         raise ValueError(
-            "grouped_residual_mlp_from_flat expects slot_offsets and row_sizes with equal lengths."
-        )
-    if len(op_kinds) != len(op_indices):
-        raise ValueError(
-            "grouped_residual_mlp_from_flat expects op_kinds and op_indices with equal lengths."
+            "fused_two_layer_pointwise_from_indices expects slot_offsets and row_sizes with equal lengths."
         )
     arity_i = int(arity)
     if arity_i <= 0:
-        raise ValueError("grouped_residual_mlp_from_flat expects arity > 0.")
-    groups = len(slot_offsets)
-    emb = int(flat.size(1))
+        raise ValueError("fused_two_layer_pointwise_from_indices expects arity > 0.")
+
+    relation_args_i64 = relation_args.to(dtype=torch.int64)
+    emb = int(x.size(1))
     in_dim = int(emb * arity_i)
-    max_rows = max((int(n) for n in row_sizes), default=0)
-    x_stack = flat.new_zeros((groups, max_rows, in_dim))
-    flat_rows = int(flat.size(0))
+    groups = len(slot_offsets)
+    if w1_stack.dim() != 3 or w2_stack.dim() != 3:
+        raise ValueError("fused_two_layer_pointwise_from_indices expects rank-3 weight stacks.")
+    if int(w1_stack.size(0)) != groups or int(w2_stack.size(0)) != groups:
+        raise ValueError("fused_two_layer_pointwise_from_indices weight stacks must match group count.")
+    if int(w1_stack.size(2)) != in_dim or int(w2_stack.size(1)) != in_dim:
+        raise ValueError(
+            "fused_two_layer_pointwise_from_indices weight stack dims do not match arity * emb."
+        )
+
+    rel_parts: list[torch.Tensor] = []
+    node_parts: list[torch.Tensor] = []
     for i, (slot, rows) in enumerate(zip(slot_offsets, row_sizes)):
         n = int(rows)
         if n <= 0:
             continue
         start = int(slot)
         span = int(n * arity_i)
-        if start < 0:
-            raise ValueError(
-                "grouped_residual_mlp_from_flat expects non-negative slot offsets."
-            )
-        if start + span > flat_rows:
-            raise ValueError(
-                "grouped_residual_mlp_from_flat slice out of bounds: "
-                f"start={start} span={span} flat_rows={flat_rows}."
-            )
-        x_stack[i, :n, :] = flat.narrow(0, start, span).view(n, in_dim)
+        rel_idx = relation_args_i64.narrow(0, start, span)
+        arg_emb = x.index_select(0, rel_idx)
+        x_i = arg_emb.view(n, in_dim)
+        hidden = torch.nn.functional.linear(
+            x_i,
+            w1_stack[i],
+            b1_stack[i] if b1_stack.numel() > 0 else None,
+        )
+        hidden = _apply_pointwise_code(hidden, int(pointwise_code))
+        out_i = torch.nn.functional.linear(
+            hidden,
+            w2_stack[i],
+            b2_stack[i] if b2_stack.numel() > 0 else None,
+        )
+        rel_parts.append((x_i + out_i).view(span, emb))
+        node_parts.append(rel_idx)
 
-    out_stack = x_stack
-    for kind, op_idx in zip(op_kinds, op_indices):
-        kind_i = int(kind)
-        idx_i = int(op_idx)
-        if kind_i == 0:
-            if idx_i < 0 or idx_i >= len(weight_stacks):
-                raise ValueError(
-                    f"Linear op index out of range in grouped_residual_mlp_from_flat: {idx_i}."
-                )
-            w = weight_stacks[idx_i]
-            out_stack = torch.matmul(out_stack, w.transpose(1, 2))
-            if idx_i < len(bias_stacks):
-                b = bias_stacks[idx_i]
-                if b.numel() > 0:
-                    out_stack = out_stack + b[:, None, :]
-        elif kind_i == 1:
-            if idx_i < 0 or idx_i >= len(pointwise_codes):
-                raise ValueError(
-                    f"Pointwise op index out of range in grouped_residual_mlp_from_flat: {idx_i}."
-                )
-            out_stack = _apply_pointwise_code(out_stack, int(pointwise_codes[idx_i]))
-        else:
-            raise ValueError(
-                f"Unsupported op kind in grouped_residual_mlp_from_flat: {kind_i}."
-            )
+    if not rel_parts:
+        return x.new_empty((0, emb)), torch.empty(0, device=x.device, dtype=torch.int64)
+    rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
+    node_idx = node_parts[0] if len(node_parts) == 1 else torch.cat(node_parts, dim=0)
+    return rel_cat, node_idx
 
-    trunc_dim = int(truncated_dim)
-    if trunc_dim >= 0 and int(x_stack.size(-1)) != trunc_dim:
-        if bool(truncate_right):
-            out_stack = x_stack[..., :trunc_dim] + out_stack
-        else:
-            out_stack = x_stack[..., -trunc_dim:] + out_stack
-    else:
-        out_stack = x_stack + out_stack
+
+def _fused_two_layer_mish_from_indices_python(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _fused_two_layer_pointwise_from_indices_python(
+        x,
+        relation_args,
+        slot_offsets,
+        row_sizes,
+        arity,
+        w1_stack,
+        b1_stack,
+        w2_stack,
+        b2_stack,
+        _PW_MISH,
+    )
+
+
+def _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    ln_weight_stack: torch.Tensor,
+    ln_bias_stack: torch.Tensor,
+    ln_eps: float,
+    pointwise_code: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.dim() != 2:
+        raise ValueError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects x to be rank-2."
+        )
+    if relation_args.dim() != 1:
+        raise ValueError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects relation_args to be rank-1."
+        )
+    if len(slot_offsets) != len(row_sizes):
+        raise ValueError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+        )
+    arity_i = int(arity)
+    if arity_i <= 0:
+        raise ValueError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects arity > 0."
+        )
+
+    relation_args_i64 = relation_args.to(dtype=torch.int64)
+    emb = int(x.size(1))
+    in_dim = int(emb * arity_i)
+    groups = len(slot_offsets)
+    if w1_stack.dim() != 3 or w2_stack.dim() != 3:
+        raise ValueError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects rank-3 weight stacks."
+        )
+    if int(w1_stack.size(0)) != groups or int(w2_stack.size(0)) != groups:
+        raise ValueError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stacks must match group count."
+        )
+    if int(w1_stack.size(2)) != in_dim or int(w2_stack.size(1)) != in_dim:
+        raise ValueError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stack dims do not match arity * emb."
+        )
+    if ln_weight_stack.numel() > 0:
+        if ln_weight_stack.dim() != 2 or int(ln_weight_stack.size(0)) != groups:
+            raise ValueError(
+                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_weight_stack must have shape [groups, in_dim] when non-empty."
+            )
+        if int(ln_weight_stack.size(1)) != in_dim:
+            raise ValueError(
+                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_weight_stack dims do not match arity * emb."
+            )
+    if ln_bias_stack.numel() > 0:
+        if ln_bias_stack.dim() != 2 or int(ln_bias_stack.size(0)) != groups:
+            raise ValueError(
+                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_bias_stack must have shape [groups, in_dim] when non-empty."
+            )
+        if int(ln_bias_stack.size(1)) != in_dim:
+            raise ValueError(
+                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_bias_stack dims do not match arity * emb."
+            )
 
     rel_parts: list[torch.Tensor] = []
-    flat_parts: list[torch.Tensor] = []
+    node_parts: list[torch.Tensor] = []
     for i, (slot, rows) in enumerate(zip(slot_offsets, row_sizes)):
         n = int(rows)
         if n <= 0:
             continue
-        rel_i = out_stack[i, :n, :].contiguous().view(n * arity_i, emb)
-        flat_i = torch.arange(
-            n * arity_i, device=flat.device, dtype=torch.int64
-        ) + int(slot)
-        rel_parts.append(rel_i)
-        flat_parts.append(flat_i)
-    if not rel_parts:
-        return flat.new_empty((0, emb)), torch.empty(
-            0, device=flat.device, dtype=torch.int64
+        start = int(slot)
+        span = int(n * arity_i)
+        rel_idx = relation_args_i64.narrow(0, start, span)
+        arg_emb = x.index_select(0, rel_idx)
+        x_i = arg_emb.view(n, in_dim)
+        hidden = torch.nn.functional.linear(
+            x_i,
+            w1_stack[i],
+            b1_stack[i] if b1_stack.numel() > 0 else None,
         )
+        hidden = _apply_pointwise_code(hidden, int(pointwise_code))
+        out_i = torch.nn.functional.linear(
+            hidden,
+            w2_stack[i],
+            b2_stack[i] if b2_stack.numel() > 0 else None,
+        )
+        out_i = torch.nn.functional.layer_norm(
+            out_i,
+            (in_dim,),
+            weight=(ln_weight_stack[i] if ln_weight_stack.numel() > 0 else None),
+            bias=(ln_bias_stack[i] if ln_bias_stack.numel() > 0 else None),
+            eps=float(ln_eps),
+        )
+        rel_parts.append((x_i + out_i).view(span, emb))
+        node_parts.append(rel_idx)
+
+    if not rel_parts:
+        return x.new_empty((0, emb)), torch.empty(0, device=x.device, dtype=torch.int64)
     rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
-    flat_dst = flat_parts[0] if len(flat_parts) == 1 else torch.cat(flat_parts, dim=0)
-    return rel_cat, flat_dst
+    node_idx = node_parts[0] if len(node_parts) == 1 else torch.cat(node_parts, dim=0)
+    return rel_cat, node_idx
+
+
+def _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    rms_weight_stack: torch.Tensor,
+    rms_eps: float,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    pointwise_code: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.dim() != 2:
+        raise ValueError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects x to be rank-2."
+        )
+    if relation_args.dim() != 1:
+        raise ValueError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects relation_args to be rank-1."
+        )
+    if len(slot_offsets) != len(row_sizes):
+        raise ValueError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+        )
+    arity_i = int(arity)
+    if arity_i <= 0:
+        raise ValueError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects arity > 0."
+        )
+
+    relation_args_i64 = relation_args.to(dtype=torch.int64)
+    emb = int(x.size(1))
+    in_dim = int(emb * arity_i)
+    groups = len(slot_offsets)
+    if rms_weight_stack.numel() > 0:
+        if rms_weight_stack.dim() != 2 or int(rms_weight_stack.size(0)) != groups:
+            raise ValueError(
+                "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices rms_weight_stack must have shape [groups, in_dim] when non-empty."
+            )
+        if int(rms_weight_stack.size(1)) != in_dim:
+            raise ValueError(
+                "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices rms_weight_stack dims do not match arity * emb."
+            )
+    if w1_stack.dim() != 3 or w2_stack.dim() != 3:
+        raise ValueError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects rank-3 weight stacks."
+        )
+    if int(w1_stack.size(0)) != groups or int(w2_stack.size(0)) != groups:
+        raise ValueError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stacks must match group count."
+        )
+    if int(w1_stack.size(2)) != in_dim or int(w2_stack.size(1)) != in_dim:
+        raise ValueError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stack dims do not match arity * emb."
+        )
+
+    rel_parts: list[torch.Tensor] = []
+    node_parts: list[torch.Tensor] = []
+    for i, (slot, rows) in enumerate(zip(slot_offsets, row_sizes)):
+        n = int(rows)
+        if n <= 0:
+            continue
+        start = int(slot)
+        span = int(n * arity_i)
+        rel_idx = relation_args_i64.narrow(0, start, span)
+        arg_emb = x.index_select(0, rel_idx)
+        x_i = arg_emb.view(n, in_dim)
+        norm_i = torch.nn.functional.rms_norm(
+            x_i,
+            (in_dim,),
+            weight=(rms_weight_stack[i] if rms_weight_stack.numel() > 0 else None),
+            eps=float(rms_eps),
+        )
+        hidden = torch.nn.functional.linear(
+            norm_i,
+            w1_stack[i],
+            b1_stack[i] if b1_stack.numel() > 0 else None,
+        )
+        hidden = _apply_pointwise_code(hidden, int(pointwise_code))
+        out_i = torch.nn.functional.linear(
+            hidden,
+            w2_stack[i],
+            b2_stack[i] if b2_stack.numel() > 0 else None,
+        )
+        rel_parts.append((x_i + out_i).view(span, emb))
+        node_parts.append(rel_idx)
+
+    if not rel_parts:
+        return x.new_empty((0, emb)), torch.empty(0, device=x.device, dtype=torch.int64)
+    rel_cat = rel_parts[0] if len(rel_parts) == 1 else torch.cat(rel_parts, dim=0)
+    node_idx = node_parts[0] if len(node_parts) == 1 else torch.cat(node_parts, dim=0)
+    return rel_cat, node_idx
 
 
 def _fanout_pack_from_edges_python(
@@ -691,6 +868,13 @@ def _fanin_pack_from_edges_python(
 
 if torch is not None:
 
+    _CUSTOM_TWO_LAYER_POINTWISE_CODES = {
+        _PW_MISH,
+        _PW_GELU_NONE,
+        _PW_GELU_TANH,
+        _PW_SILU,
+    }
+
     class _FanoutScatterFunction(torch.autograd.Function):
         @staticmethod
         def forward(
@@ -771,6 +955,571 @@ if torch is not None:
                 int(ctx.rel_rows),
             )
             return grad_rel, None, None, None
+
+    class _FusedTwoLayerPointwiseFromIndicesFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: torch.autograd.function.FunctionCtx,
+            x: torch.Tensor,
+            relation_args: torch.Tensor,
+            slot_offsets: list[int],
+            row_sizes: list[int],
+            arity: int,
+            w1_stack: torch.Tensor,
+            b1_stack: torch.Tensor,
+            w2_stack: torch.Tensor,
+            b2_stack: torch.Tensor,
+            pointwise_code: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            ctx.slot_offsets = [int(v) for v in slot_offsets]
+            ctx.row_sizes = [int(v) for v in row_sizes]
+            ctx.arity = int(arity)
+            ctx.pointwise_code = int(pointwise_code)
+            ctx.save_for_backward(x, relation_args, w1_stack, b1_stack, w2_stack, b2_stack)
+            used_custom = (
+                x.is_cuda
+                and ctx.pointwise_code in _CUSTOM_TWO_LAYER_POINTWISE_CODES
+                and _should_use_custom("fused_two_layer_pointwise_from_indices")
+                and _namespace_has_op("fused_two_layer_pointwise_from_indices")
+            )
+            ctx.used_custom = bool(used_custom)
+            if used_custom:
+                return _ops_namespace().fused_two_layer_pointwise_from_indices(
+                    x,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    w1_stack,
+                    b1_stack,
+                    w2_stack,
+                    b2_stack,
+                    int(ctx.pointwise_code),
+                )
+            return _fused_two_layer_pointwise_from_indices_python(
+                x,
+                relation_args,
+                list(ctx.slot_offsets),
+                list(ctx.row_sizes),
+                int(ctx.arity),
+                w1_stack,
+                b1_stack,
+                w2_stack,
+                b2_stack,
+                int(ctx.pointwise_code),
+            )
+
+        @staticmethod
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            grad_rel: torch.Tensor,
+            grad_node_idx: torch.Tensor | None,
+        ) -> tuple[
+            torch.Tensor | None,
+            None,
+            None,
+            None,
+            None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            None,
+        ]:
+            del grad_node_idx
+            if grad_rel is None:
+                return (None, None, None, None, None, None, None, None, None, None)
+
+            x, relation_args, w1_stack, b1_stack, w2_stack, b2_stack = ctx.saved_tensors
+            needs = ctx.needs_input_grad
+            grad_map: list[torch.Tensor | None] = [None, None, None, None, None, None, None, None, None, None]
+            if (
+                bool(getattr(ctx, "used_custom", False))
+                and grad_rel.is_cuda
+                and _should_use_custom("fused_two_layer_pointwise_from_indices_backward")
+                and _namespace_has_op("fused_two_layer_pointwise_from_indices_backward")
+            ):
+                grad_x, grad_w1, grad_b1, grad_w2, grad_b2 = (
+                    _ops_namespace().fused_two_layer_pointwise_from_indices_backward(
+                        grad_rel,
+                        x,
+                        relation_args,
+                        list(ctx.slot_offsets),
+                        list(ctx.row_sizes),
+                        int(ctx.arity),
+                        w1_stack,
+                        b1_stack,
+                        w2_stack,
+                        b2_stack,
+                        int(ctx.pointwise_code),
+                    )
+                )
+                if needs[0]:
+                    grad_map[0] = grad_x
+                if needs[5]:
+                    grad_map[5] = grad_w1
+                if needs[6] and b1_stack.numel() > 0:
+                    grad_map[6] = grad_b1
+                if needs[7]:
+                    grad_map[7] = grad_w2
+                if needs[8] and b2_stack.numel() > 0:
+                    grad_map[8] = grad_b2
+                return tuple(grad_map)  # type: ignore[return-value]
+            with torch.enable_grad():
+                x_req = x.detach().requires_grad_(bool(needs[0]))
+                w1_req = w1_stack.detach().requires_grad_(bool(needs[5]))
+                b1_req = (
+                    b1_stack.detach().requires_grad_(bool(needs[6] and b1_stack.numel() > 0))
+                    if b1_stack.numel() > 0
+                    else b1_stack
+                )
+                w2_req = w2_stack.detach().requires_grad_(bool(needs[7]))
+                b2_req = (
+                    b2_stack.detach().requires_grad_(bool(needs[8] and b2_stack.numel() > 0))
+                    if b2_stack.numel() > 0
+                    else b2_stack
+                )
+                rel_cat, _ = _fused_two_layer_pointwise_from_indices_python(
+                    x_req,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    w1_req,
+                    b1_req,
+                    w2_req,
+                    b2_req,
+                    int(ctx.pointwise_code),
+                )
+                grad_inputs: list[torch.Tensor] = []
+                grad_targets: list[int] = []
+                for pos, tensor in (
+                    (0, x_req),
+                    (5, w1_req),
+                    (6, b1_req if b1_stack.numel() > 0 else None),
+                    (7, w2_req),
+                    (8, b2_req if b2_stack.numel() > 0 else None),
+                ):
+                    if tensor is not None and tensor.requires_grad:
+                        grad_inputs.append(tensor)
+                        grad_targets.append(pos)
+                grads = (
+                    torch.autograd.grad(rel_cat, grad_inputs, grad_rel, allow_unused=True)
+                    if grad_inputs
+                    else ()
+                )
+            for pos, grad in zip(grad_targets, grads):
+                grad_map[pos] = grad
+            return tuple(grad_map)  # type: ignore[return-value]
+
+
+    class _FusedTwoLayerMishFromIndicesFunction(_FusedTwoLayerPointwiseFromIndicesFunction):
+        pass
+
+    class _FusedPostNormTwoLayerPointwiseLayerNormFromIndicesFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: torch.autograd.function.FunctionCtx,
+            x: torch.Tensor,
+            relation_args: torch.Tensor,
+            slot_offsets: list[int],
+            row_sizes: list[int],
+            arity: int,
+            w1_stack: torch.Tensor,
+            b1_stack: torch.Tensor,
+            w2_stack: torch.Tensor,
+            b2_stack: torch.Tensor,
+            ln_weight_stack: torch.Tensor,
+            ln_bias_stack: torch.Tensor,
+            ln_eps: float,
+            pointwise_code: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            ctx.slot_offsets = [int(v) for v in slot_offsets]
+            ctx.row_sizes = [int(v) for v in row_sizes]
+            ctx.arity = int(arity)
+            ctx.ln_eps = float(ln_eps)
+            ctx.pointwise_code = int(pointwise_code)
+            ctx.save_for_backward(
+                x,
+                relation_args,
+                w1_stack,
+                b1_stack,
+                w2_stack,
+                b2_stack,
+                ln_weight_stack,
+                ln_bias_stack,
+            )
+            used_custom = (
+                x.is_cuda
+                and ctx.pointwise_code in _CUSTOM_TWO_LAYER_POINTWISE_CODES
+                and _should_use_custom("fused_postnorm_two_layer_pointwise_layernorm_from_indices")
+                and _namespace_has_op("fused_postnorm_two_layer_pointwise_layernorm_from_indices")
+            )
+            ctx.used_custom = bool(used_custom)
+            if used_custom:
+                return _ops_namespace().fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+                    x,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    w1_stack,
+                    b1_stack,
+                    w2_stack,
+                    b2_stack,
+                    ln_weight_stack,
+                    ln_bias_stack,
+                    float(ctx.ln_eps),
+                    int(ctx.pointwise_code),
+                )
+            return _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
+                x,
+                relation_args,
+                list(ctx.slot_offsets),
+                list(ctx.row_sizes),
+                int(ctx.arity),
+                w1_stack,
+                b1_stack,
+                w2_stack,
+                b2_stack,
+                ln_weight_stack,
+                ln_bias_stack,
+                float(ctx.ln_eps),
+                int(ctx.pointwise_code),
+            )
+
+        @staticmethod
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            grad_rel: torch.Tensor,
+            grad_node_idx: torch.Tensor | None,
+        ) -> tuple[
+            torch.Tensor | None,
+            None,
+            None,
+            None,
+            None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            None,
+            None,
+        ]:
+            del grad_node_idx
+            if grad_rel is None:
+                return (
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+
+            x, relation_args, w1_stack, b1_stack, w2_stack, b2_stack, ln_weight_stack, ln_bias_stack = ctx.saved_tensors
+            needs = ctx.needs_input_grad
+            grad_map: list[torch.Tensor | None] = [None] * 13
+            if (
+                bool(getattr(ctx, "used_custom", False))
+                and grad_rel.is_cuda
+                and _should_use_custom(
+                    "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward"
+                )
+                and _namespace_has_op(
+                    "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward"
+                )
+            ):
+                grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_ln_weight, grad_ln_bias = (
+                    _ops_namespace().fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
+                        grad_rel,
+                        x,
+                        relation_args,
+                        list(ctx.slot_offsets),
+                        list(ctx.row_sizes),
+                        int(ctx.arity),
+                        w1_stack,
+                        b1_stack,
+                        w2_stack,
+                        b2_stack,
+                        ln_weight_stack,
+                        ln_bias_stack,
+                        float(ctx.ln_eps),
+                        int(ctx.pointwise_code),
+                    )
+                )
+                if needs[0]:
+                    grad_map[0] = grad_x
+                if needs[5]:
+                    grad_map[5] = grad_w1
+                if needs[6] and b1_stack.numel() > 0:
+                    grad_map[6] = grad_b1
+                if needs[7]:
+                    grad_map[7] = grad_w2
+                if needs[8] and b2_stack.numel() > 0:
+                    grad_map[8] = grad_b2
+                if needs[9] and ln_weight_stack.numel() > 0:
+                    grad_map[9] = grad_ln_weight
+                if needs[10] and ln_bias_stack.numel() > 0:
+                    grad_map[10] = grad_ln_bias
+                return tuple(grad_map)  # type: ignore[return-value]
+
+            with torch.enable_grad():
+                x_req = x.detach().requires_grad_(bool(needs[0]))
+                w1_req = w1_stack.detach().requires_grad_(bool(needs[5]))
+                b1_req = (
+                    b1_stack.detach().requires_grad_(bool(needs[6] and b1_stack.numel() > 0))
+                    if b1_stack.numel() > 0
+                    else b1_stack
+                )
+                w2_req = w2_stack.detach().requires_grad_(bool(needs[7]))
+                b2_req = (
+                    b2_stack.detach().requires_grad_(bool(needs[8] and b2_stack.numel() > 0))
+                    if b2_stack.numel() > 0
+                    else b2_stack
+                )
+                ln_w_req = (
+                    ln_weight_stack.detach().requires_grad_(bool(needs[9] and ln_weight_stack.numel() > 0))
+                    if ln_weight_stack.numel() > 0
+                    else ln_weight_stack
+                )
+                ln_b_req = (
+                    ln_bias_stack.detach().requires_grad_(bool(needs[10] and ln_bias_stack.numel() > 0))
+                    if ln_bias_stack.numel() > 0
+                    else ln_bias_stack
+                )
+                rel_cat, _ = _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
+                    x_req,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    w1_req,
+                    b1_req,
+                    w2_req,
+                    b2_req,
+                    ln_w_req,
+                    ln_b_req,
+                    float(ctx.ln_eps),
+                    int(ctx.pointwise_code),
+                )
+                grad_inputs: list[torch.Tensor] = []
+                grad_targets: list[int] = []
+                for pos, tensor in (
+                    (0, x_req),
+                    (5, w1_req),
+                    (6, b1_req if b1_stack.numel() > 0 else None),
+                    (7, w2_req),
+                    (8, b2_req if b2_stack.numel() > 0 else None),
+                    (9, ln_w_req if ln_weight_stack.numel() > 0 else None),
+                    (10, ln_b_req if ln_bias_stack.numel() > 0 else None),
+                ):
+                    if tensor is not None and tensor.requires_grad:
+                        grad_inputs.append(tensor)
+                        grad_targets.append(pos)
+                grads = (
+                    torch.autograd.grad(rel_cat, grad_inputs, grad_rel, allow_unused=True)
+                    if grad_inputs
+                    else ()
+                )
+            for pos, grad in zip(grad_targets, grads):
+                grad_map[pos] = grad
+            return tuple(grad_map)  # type: ignore[return-value]
+
+    class _FusedPreNormTwoLayerPointwiseRMSNormFromIndicesFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: torch.autograd.function.FunctionCtx,
+            x: torch.Tensor,
+            relation_args: torch.Tensor,
+            slot_offsets: list[int],
+            row_sizes: list[int],
+            arity: int,
+            rms_weight_stack: torch.Tensor,
+            rms_eps: float,
+            w1_stack: torch.Tensor,
+            b1_stack: torch.Tensor,
+            w2_stack: torch.Tensor,
+            b2_stack: torch.Tensor,
+            pointwise_code: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            ctx.slot_offsets = [int(v) for v in slot_offsets]
+            ctx.row_sizes = [int(v) for v in row_sizes]
+            ctx.arity = int(arity)
+            ctx.rms_eps = float(rms_eps)
+            ctx.pointwise_code = int(pointwise_code)
+            ctx.save_for_backward(
+                x,
+                relation_args,
+                rms_weight_stack,
+                w1_stack,
+                b1_stack,
+                w2_stack,
+                b2_stack,
+            )
+            used_custom = (
+                x.is_cuda
+                and ctx.pointwise_code in _CUSTOM_TWO_LAYER_POINTWISE_CODES
+                and _should_use_custom("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices")
+                and _namespace_has_op("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices")
+            )
+            ctx.used_custom = bool(used_custom)
+            if used_custom:
+                return _ops_namespace().fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
+                    x,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    rms_weight_stack,
+                    float(ctx.rms_eps),
+                    w1_stack,
+                    b1_stack,
+                    w2_stack,
+                    b2_stack,
+                    int(ctx.pointwise_code),
+                )
+            return _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
+                x,
+                relation_args,
+                list(ctx.slot_offsets),
+                list(ctx.row_sizes),
+                int(ctx.arity),
+                rms_weight_stack,
+                float(ctx.rms_eps),
+                w1_stack,
+                b1_stack,
+                w2_stack,
+                b2_stack,
+                int(ctx.pointwise_code),
+            )
+
+        @staticmethod
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            grad_rel: torch.Tensor,
+            grad_node_idx: torch.Tensor | None,
+        ) -> tuple[
+            torch.Tensor | None,
+            None,
+            None,
+            None,
+            None,
+            torch.Tensor | None,
+            None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            None,
+        ]:
+            del grad_node_idx
+            if grad_rel is None:
+                return (None, None, None, None, None, None, None, None, None, None, None, None)
+
+            x, relation_args, rms_weight_stack, w1_stack, b1_stack, w2_stack, b2_stack = ctx.saved_tensors
+            needs = ctx.needs_input_grad
+            grad_map: list[torch.Tensor | None] = [None] * 12
+            if (
+                bool(getattr(ctx, "used_custom", False))
+                and grad_rel.is_cuda
+                and _should_use_custom("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward")
+                and _namespace_has_op("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward")
+            ):
+                grad_x, grad_rms_weight, grad_w1, grad_b1, grad_w2, grad_b2 = (
+                    _ops_namespace().fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
+                        grad_rel,
+                        x,
+                        relation_args,
+                        list(ctx.slot_offsets),
+                        list(ctx.row_sizes),
+                        int(ctx.arity),
+                        rms_weight_stack,
+                        float(ctx.rms_eps),
+                        w1_stack,
+                        b1_stack,
+                        w2_stack,
+                        b2_stack,
+                        int(ctx.pointwise_code),
+                    )
+                )
+                if needs[0]:
+                    grad_map[0] = grad_x
+                if needs[5] and rms_weight_stack.numel() > 0:
+                    grad_map[5] = grad_rms_weight
+                if needs[7]:
+                    grad_map[7] = grad_w1
+                if needs[8] and b1_stack.numel() > 0:
+                    grad_map[8] = grad_b1
+                if needs[9]:
+                    grad_map[9] = grad_w2
+                if needs[10] and b2_stack.numel() > 0:
+                    grad_map[10] = grad_b2
+                return tuple(grad_map)  # type: ignore[return-value]
+
+            with torch.enable_grad():
+                x_req = x.detach().requires_grad_(bool(needs[0]))
+                rms_w_req = (
+                    rms_weight_stack.detach().requires_grad_(bool(needs[5] and rms_weight_stack.numel() > 0))
+                    if rms_weight_stack.numel() > 0
+                    else rms_weight_stack
+                )
+                w1_req = w1_stack.detach().requires_grad_(bool(needs[7]))
+                b1_req = (
+                    b1_stack.detach().requires_grad_(bool(needs[8] and b1_stack.numel() > 0))
+                    if b1_stack.numel() > 0
+                    else b1_stack
+                )
+                w2_req = w2_stack.detach().requires_grad_(bool(needs[9]))
+                b2_req = (
+                    b2_stack.detach().requires_grad_(bool(needs[10] and b2_stack.numel() > 0))
+                    if b2_stack.numel() > 0
+                    else b2_stack
+                )
+                rel_cat, _ = _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
+                    x_req,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    rms_w_req,
+                    float(ctx.rms_eps),
+                    w1_req,
+                    b1_req,
+                    w2_req,
+                    b2_req,
+                    int(ctx.pointwise_code),
+                )
+                grad_inputs: list[torch.Tensor] = []
+                grad_targets: list[int] = []
+                for pos, tensor in (
+                    (0, x_req),
+                    (5, rms_w_req if rms_weight_stack.numel() > 0 else None),
+                    (7, w1_req),
+                    (8, b1_req if b1_stack.numel() > 0 else None),
+                    (9, w2_req),
+                    (10, b2_req if b2_stack.numel() > 0 else None),
+                ):
+                    if tensor is not None and tensor.requires_grad:
+                        grad_inputs.append(tensor)
+                        grad_targets.append(pos)
+                grads = (
+                    torch.autograd.grad(rel_cat, grad_inputs, grad_rel, allow_unused=True)
+                    if grad_inputs
+                    else ()
+                )
+            for pos, grad in zip(grad_targets, grads):
+                grad_map[pos] = grad
+            return tuple(grad_map)  # type: ignore[return-value]
 
 
 def fanout_scatter(
@@ -941,76 +1690,132 @@ def fanin_pack_from_edges(
     )
 
 
-def grouped_stack_from_flat(
-    flat: torch.Tensor,
+def fused_two_layer_pointwise_from_indices(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
     slot_offsets: list[int],
     row_sizes: list[int],
     arity: int,
-) -> torch.Tensor:
-    if torch is None:
-        raise ModuleNotFoundError(
-            "grouped_stack_from_flat requires torch."
-        ) from _TORCH_IMPORT_ERROR
-    if _should_use_custom("grouped_stack_from_flat"):
-        if _namespace_has_op("grouped_stack_from_flat"):
-            return _ops_namespace().grouped_stack_from_flat(
-                flat, slot_offsets, row_sizes, int(arity)
-            )
-        if _fallback_mode() == "error":
-            raise RuntimeError(
-                "Custom mp op grouped_stack_from_flat is unavailable in the loaded relm_mp library."
-            )
-    return _grouped_stack_from_flat_python(flat, slot_offsets, row_sizes, int(arity))
-
-
-def grouped_residual_mlp_from_flat(
-    flat: torch.Tensor,
-    slot_offsets: list[int],
-    row_sizes: list[int],
-    arity: int,
-    weight_stacks: list[torch.Tensor],
-    bias_stacks: list[torch.Tensor],
-    op_kinds: list[int],
-    op_indices: list[int],
-    pointwise_codes: list[int],
-    truncated_dim: int,
-    truncate_right: bool,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    pointwise_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if torch is None:
         raise ModuleNotFoundError(
-            "grouped_residual_mlp_from_flat requires torch."
+            "fused_two_layer_pointwise_from_indices requires torch."
         ) from _TORCH_IMPORT_ERROR
-    if _should_use_custom("grouped_residual_mlp_from_flat"):
-        if _namespace_has_op("grouped_residual_mlp_from_flat"):
-            return _ops_namespace().grouped_residual_mlp_from_flat(
-                flat,
-                slot_offsets,
-                row_sizes,
-                int(arity),
-                weight_stacks,
-                bias_stacks,
-                op_kinds,
-                op_indices,
-                pointwise_codes,
-                int(truncated_dim),
-                bool(truncate_right),
-            )
-        if _fallback_mode() == "error":
-            raise RuntimeError(
-                "Custom mp op grouped_residual_mlp_from_flat is unavailable in the loaded relm_mp library."
-            )
-    return _grouped_residual_mlp_from_flat_python(
-        flat,
-        slot_offsets,
-        row_sizes,
+    return _FusedTwoLayerPointwiseFromIndicesFunction.apply(
+        x,
+        relation_args,
+        list(slot_offsets),
+        list(row_sizes),
         int(arity),
-        weight_stacks,
-        bias_stacks,
-        op_kinds,
-        op_indices,
-        pointwise_codes,
-        int(truncated_dim),
-        bool(truncate_right),
+        w1_stack,
+        b1_stack,
+        w2_stack,
+        b2_stack,
+        int(pointwise_code),
+    )
+
+
+def fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    ln_weight_stack: torch.Tensor,
+    ln_bias_stack: torch.Tensor,
+    ln_eps: float,
+    pointwise_code: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fused_postnorm_two_layer_pointwise_layernorm_from_indices requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    return _FusedPostNormTwoLayerPointwiseLayerNormFromIndicesFunction.apply(
+        x,
+        relation_args,
+        list(slot_offsets),
+        list(row_sizes),
+        int(arity),
+        w1_stack,
+        b1_stack,
+        w2_stack,
+        b2_stack,
+        ln_weight_stack,
+        ln_bias_stack,
+        float(ln_eps),
+        int(pointwise_code),
+    )
+
+
+def fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    rms_weight_stack: torch.Tensor,
+    rms_eps: float,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    pointwise_code: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    return _FusedPreNormTwoLayerPointwiseRMSNormFromIndicesFunction.apply(
+        x,
+        relation_args,
+        list(slot_offsets),
+        list(row_sizes),
+        int(arity),
+        rms_weight_stack,
+        float(rms_eps),
+        w1_stack,
+        b1_stack,
+        w2_stack,
+        b2_stack,
+        int(pointwise_code),
+    )
+
+
+def fused_two_layer_mish_from_indices(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fused_two_layer_mish_from_indices requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    return fused_two_layer_pointwise_from_indices(
+        x,
+        relation_args,
+        list(slot_offsets),
+        list(row_sizes),
+        int(arity),
+        w1_stack,
+        b1_stack,
+        w2_stack,
+        b2_stack,
+        _PW_MISH,
     )
 
 
@@ -1021,8 +1826,11 @@ __all__ = [
     "fanin_pack_multi",
     "fanout_pack_from_edges",
     "fanin_pack_from_edges",
-    "grouped_stack_from_flat",
-    "grouped_residual_mlp_from_flat",
+    "fused_two_layer_pointwise_from_indices",
+    "fused_postnorm_two_layer_pointwise_layernorm_from_indices",
+    "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices",
+    "fused_two_layer_mish_from_indices",
+    "pointwise_code_from_signature",
     "available",
     "assert_runtime_compat",
 ]

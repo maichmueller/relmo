@@ -24,8 +24,6 @@ _BASELINE_FLAGS: dict[str, bool] = {
     "RELM_MODELS_MP_FANIN": True,
     "RELM_MODELS_MP_FANOUT": False,
     "RELM_MODELS_MP_LOGSUMEXP": False,
-    # Generic relation MLP grouping path.
-    "RELM_MODELS_MP_GROUPED_MLP": True,
     # Central fused custom fanin reduction.
     "RELM_MODELS_MP_FANIN_FUSED": True,
     # Decentralized batched experimental lanes.
@@ -37,24 +35,9 @@ _BASELINE_FLAGS: dict[str, bool] = {
 _PRESET_FLAGS: dict[str, dict[str, bool]] = {
     # Historical behavior before introducing presets.
     "baseline": dict(_BASELINE_FLAGS),
-    # Training-oriented defaults: keep grouped relation MLP enabled and
-    # avoid pack-only fanin lane, which raised backward cost on real PDDL runs.
+    # Retained model-side default while flat-native kernels are the primary optimized path.
     "tuned_train": {
         **_BASELINE_FLAGS,
-    },
-    # Inference-oriented defaults: reduce Python-side relation routing overhead.
-    "tuned_infer": {
-        **_BASELINE_FLAGS,
-        "RELM_MODELS_MP_GROUPED_MLP": False,
-        "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": True,
-    },
-    # Explicit full decentralized C++ experiment lane.
-    "full_cpp_exp": {
-        **_BASELINE_FLAGS,
-        "RELM_MODELS_MP_GROUPED_MLP": False,
-        "RELM_MODELS_MP_FANOUT_BATCHED_EXPERIMENTAL": True,
-        "RELM_MODELS_MP_FANIN_BATCHED_EXPERIMENTAL": True,
-        "RELM_MODELS_MP_FANIN_BATCHED_PACK_EXPERIMENTAL": True,
     },
 }
 
@@ -62,9 +45,6 @@ _PRESET_ALIASES = {
     "default": "tuned_train",
     "train": "tuned_train",
     "training": "tuned_train",
-    "infer": "tuned_infer",
-    "inference": "tuned_infer",
-    "full_cpp": "full_cpp_exp",
 }
 
 
@@ -86,11 +66,6 @@ def _mp_flag(name: str, legacy_default: bool) -> bool:
     preset = _PRESET_FLAGS.get(_mp_preset_name(), _PRESET_FLAGS["tuned_train"])
     default = preset.get(name, legacy_default)
     return _env_bool(name, default)
-
-
-def _use_grouped_relation_mlp(ref: torch.Tensor) -> bool:
-    return ref.device.type == "cuda" and _mp_flag("RELM_MODELS_MP_GROUPED_MLP", True)
-
 
 def _use_model_mp_ops(ref: torch.Tensor) -> bool:
     if relm_mp_ops is None:
