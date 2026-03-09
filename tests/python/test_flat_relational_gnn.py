@@ -19,6 +19,9 @@ from relm.models import (
 from relm.models import flat_relational_layer as flat_relational_layer_module
 from relm.models.flat_relational_layer import build_flat_topology
 from relm.models.grouped_mlp import GroupedMLPSpec
+from relm.models.program_family_reference import (
+    execute_program_two_layer_silu_then_two_layer_silu_reference,
+)
 
 
 class _SpecPostNormTwoLayerSiLU(torch.nn.Module):
@@ -549,6 +552,91 @@ def test_flat_relational_layer_matches_staged_two_layer_silu_program() -> None:
         "two_layer_silu",
         "two_layer_silu",
     )
+    assert match.program_family is not None
+    assert match.program_family.family == "program_two_layer_silu_then_two_layer_silu"
+
+
+def test_flat_relational_layer_non_exact_program_has_no_manual_program_family() -> None:
+    model, relation_slice = _make_family_model(
+        torch.nn.Sequential(
+            TwoLayerPointwiseRelationMLP(8, 16, activation="silu"),
+            TwoLayerPointwiseRelationMLP(8, 12, activation="gelu"),
+        ),
+        embedding_size=4,
+        arity=2,
+    )
+    match = model.relational_layer._match_fused_relation(relation_slice)
+    assert match is not None
+    assert match.spec.family == "program"
+    assert match.program_family is None
+
+
+def test_manual_program_reference_matches_loop_reference_forward_and_gradients() -> None:
+    def loop_reference(
+        packed_rows: torch.Tensor,
+        row_sizes: torch.Tensor,
+        w10_stack: torch.Tensor,
+        b10_stack: torch.Tensor,
+        w20_stack: torch.Tensor,
+        b20_stack: torch.Tensor,
+        w11_stack: torch.Tensor,
+        b11_stack: torch.Tensor,
+        w21_stack: torch.Tensor,
+        b21_stack: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.empty_like(packed_rows)
+        cursor = 0
+        for gid, row_size_t in enumerate(row_sizes):
+            row_count = int(row_size_t.item())
+            rows = packed_rows[cursor : cursor + row_count]
+            stage1 = torch.nn.functional.linear(
+                torch.nn.functional.silu(torch.nn.functional.linear(rows, w10_stack[gid], b10_stack[gid])),
+                w20_stack[gid],
+                b20_stack[gid],
+            )
+            stage2 = torch.nn.functional.linear(
+                torch.nn.functional.silu(torch.nn.functional.linear(stage1, w11_stack[gid], b11_stack[gid])),
+                w21_stack[gid],
+                b21_stack[gid],
+            )
+            out[cursor : cursor + row_count] = rows + stage2
+            cursor += row_count
+        return out
+
+    torch.manual_seed(0)
+    packed_rows = torch.randn(7, 8, requires_grad=True)
+    packed_rows_ref = packed_rows.detach().clone().requires_grad_(True)
+    row_sizes = torch.tensor([2, 3, 2], dtype=torch.long)
+    params = [
+        torch.randn(3, 16, 8, requires_grad=True),
+        torch.randn(3, 16, requires_grad=True),
+        torch.randn(3, 8, 16, requires_grad=True),
+        torch.randn(3, 8, requires_grad=True),
+        torch.randn(3, 12, 8, requires_grad=True),
+        torch.randn(3, 12, requires_grad=True),
+        torch.randn(3, 8, 12, requires_grad=True),
+        torch.randn(3, 8, requires_grad=True),
+    ]
+    params_ref = [param.detach().clone().requires_grad_(True) for param in params]
+
+    out = execute_program_two_layer_silu_then_two_layer_silu_reference(
+        packed_rows,
+        row_sizes,
+        *params,
+    )
+    ref = loop_reference(
+        packed_rows_ref,
+        row_sizes,
+        *params_ref,
+    )
+
+    assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5)
+
+    out.square().sum().backward()
+    ref.square().sum().backward()
+    assert torch.allclose(packed_rows.grad, packed_rows_ref.grad, atol=1e-4, rtol=1e-4)
+    for param, param_ref in zip(params, params_ref):
+        assert torch.allclose(param.grad, param_ref.grad, atol=1e-4, rtol=1e-4)
 
 
 def test_flat_relational_layer_staged_program_is_opt_in_not_auto() -> None:

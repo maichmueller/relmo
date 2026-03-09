@@ -478,6 +478,139 @@ def _fused_two_layer_pointwise_from_indices_python(
     return rel_cat, node_idx
 
 
+def _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w10_stack: torch.Tensor,
+    b10_stack: torch.Tensor,
+    w20_stack: torch.Tensor,
+    b20_stack: torch.Tensor,
+    w11_stack: torch.Tensor,
+    b11_stack: torch.Tensor,
+    w21_stack: torch.Tensor,
+    b21_stack: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.dim() != 2:
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects x to be rank-2."
+        )
+    if relation_args.dim() != 1:
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects relation_args to be rank-1."
+        )
+    if len(slot_offsets) != len(row_sizes):
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects slot_offsets and row_sizes with equal lengths."
+        )
+    arity_i = int(arity)
+    if arity_i <= 0:
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects arity > 0."
+        )
+    relation_args_i64 = relation_args.to(dtype=torch.int64)
+    emb = int(x.size(1))
+    in_dim = int(emb * arity_i)
+    groups = len(slot_offsets)
+    stacks = (
+        ("w10_stack", w10_stack, 3),
+        ("b10_stack", b10_stack, 2),
+        ("w20_stack", w20_stack, 3),
+        ("b20_stack", b20_stack, 2),
+        ("w11_stack", w11_stack, 3),
+        ("b11_stack", b11_stack, 2),
+        ("w21_stack", w21_stack, 3),
+        ("b21_stack", b21_stack, 2),
+    )
+    for name, tensor, rank in stacks:
+        if tensor.dim() != rank:
+            raise ValueError(
+                f"fused_program_two_layer_silu_then_two_layer_silu_from_indices expects {name} rank-{rank}."
+            )
+        if int(tensor.size(0)) != groups:
+            raise ValueError(
+                "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects all parameter stacks to match group count."
+            )
+    if int(w10_stack.size(2)) != in_dim or int(w20_stack.size(1)) != in_dim:
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-1 dims do not match arity * emb."
+        )
+    if int(w11_stack.size(2)) != in_dim or int(w21_stack.size(1)) != in_dim:
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-2 dims do not match arity * emb."
+        )
+    if int(w20_stack.size(2)) != int(w10_stack.size(1)) or int(b10_stack.size(1)) != int(w10_stack.size(1)):
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-1 hidden dims do not match."
+        )
+    if int(w21_stack.size(2)) != int(w11_stack.size(1)) or int(b11_stack.size(1)) != int(w11_stack.size(1)):
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-2 hidden dims do not match."
+        )
+    if int(b20_stack.size(1)) != in_dim or int(b21_stack.size(1)) != in_dim:
+        raise ValueError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices output bias dims do not match arity * emb."
+        )
+
+    packed_rows_parts: list[torch.Tensor] = []
+    node_parts: list[torch.Tensor] = []
+    for slot, rows in zip(slot_offsets, row_sizes):
+        n = int(rows)
+        if n <= 0:
+            continue
+        start = int(slot)
+        span = int(n * arity_i)
+        rel_idx = relation_args_i64.narrow(0, start, span)
+        arg_emb = x.index_select(0, rel_idx)
+        packed_rows_parts.append(arg_emb.view(n, in_dim))
+        node_parts.append(rel_idx)
+
+    if not packed_rows_parts:
+        return x.new_empty((0, emb)), torch.empty(0, device=x.device, dtype=torch.int64)
+
+    packed_rows = (
+        packed_rows_parts[0] if len(packed_rows_parts) == 1 else torch.cat(packed_rows_parts, dim=0)
+    )
+    row_sizes_tensor = torch.as_tensor(row_sizes, device=x.device, dtype=torch.long)
+
+    row_sizes_long = row_sizes_tensor.to(dtype=torch.long)
+    max_rows = int(row_sizes_long.max().item()) if int(row_sizes_long.numel()) > 0 else 0
+    row_offsets = torch.empty_like(row_sizes_long)
+    if int(row_sizes_long.numel()) > 0:
+        row_offsets[0] = 0
+    if int(row_sizes_long.numel()) > 1:
+        row_offsets[1:] = torch.cumsum(row_sizes_long[:-1], dim=0)
+    base = torch.arange(max_rows, device=x.device, dtype=torch.long).unsqueeze(0)
+    safe_sizes = row_sizes_long.clamp_min(1).unsqueeze(1)
+    safe_idx = row_offsets.unsqueeze(1) + torch.minimum(base, safe_sizes - 1)
+    mask = base < row_sizes_long.unsqueeze(1)
+    x_rows = packed_rows.index_select(0, safe_idx.reshape(-1)).view(groups, max_rows, in_dim)
+    mask_f = mask.unsqueeze(-1).to(dtype=x.dtype)
+    x_rows = x_rows * mask_f
+
+    pre1 = (torch.bmm(x_rows, w10_stack.transpose(1, 2)) + b10_stack.unsqueeze(1)) * mask_f
+    stage1 = (
+        torch.bmm(torch.nn.functional.silu(pre1), w20_stack.transpose(1, 2)) + b20_stack.unsqueeze(1)
+    ) * mask_f
+    pre2 = (torch.bmm(stage1, w11_stack.transpose(1, 2)) + b11_stack.unsqueeze(1)) * mask_f
+    stage2 = (
+        torch.bmm(torch.nn.functional.silu(pre2), w21_stack.transpose(1, 2)) + b21_stack.unsqueeze(1)
+    ) * mask_f
+    out_rows = x_rows + stage2
+
+    packed_out = packed_rows.new_zeros((int(packed_rows.size(0)), in_dim))
+    packed_out.index_add_(
+        0,
+        safe_idx.reshape(-1),
+        (out_rows * mask_f).reshape(-1, in_dim),
+    )
+    rel_cat = packed_out.view(-1, emb)
+    node_idx = node_parts[0] if len(node_parts) == 1 else torch.cat(node_parts, dim=0)
+    return rel_cat, node_idx
+
+
 def _fused_two_layer_mish_from_indices_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
@@ -1111,6 +1244,201 @@ if torch is not None:
             for pos, grad in zip(grad_targets, grads):
                 grad_map[pos] = grad
             return tuple(grad_map)  # type: ignore[return-value]
+
+    class _FusedProgramTwoLayerSiLUThenTwoLayerSiLUFromIndicesFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: torch.autograd.function.FunctionCtx,
+            x: torch.Tensor,
+            relation_args: torch.Tensor,
+            slot_offsets: list[int],
+            row_sizes: list[int],
+            arity: int,
+            w10_stack: torch.Tensor,
+            b10_stack: torch.Tensor,
+            w20_stack: torch.Tensor,
+            b20_stack: torch.Tensor,
+            w11_stack: torch.Tensor,
+            b11_stack: torch.Tensor,
+            w21_stack: torch.Tensor,
+            b21_stack: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            ctx.slot_offsets = [int(v) for v in slot_offsets]
+            ctx.row_sizes = [int(v) for v in row_sizes]
+            ctx.arity = int(arity)
+            ctx.save_for_backward(
+                x,
+                relation_args,
+                w10_stack,
+                b10_stack,
+                w20_stack,
+                b20_stack,
+                w11_stack,
+                b11_stack,
+                w21_stack,
+                b21_stack,
+            )
+            used_custom = (
+                x.is_cuda
+                and _should_use_custom("fused_program_two_layer_silu_then_two_layer_silu_from_indices")
+                and _namespace_has_op("fused_program_two_layer_silu_then_two_layer_silu_from_indices")
+            )
+            ctx.used_custom = bool(used_custom)
+            if used_custom:
+                return _ops_namespace().fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+                    x,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    w10_stack,
+                    b10_stack,
+                    w20_stack,
+                    b20_stack,
+                    w11_stack,
+                    b11_stack,
+                    w21_stack,
+                    b21_stack,
+                )
+            return _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
+                x,
+                relation_args,
+                list(ctx.slot_offsets),
+                list(ctx.row_sizes),
+                int(ctx.arity),
+                w10_stack,
+                b10_stack,
+                w20_stack,
+                b20_stack,
+                w11_stack,
+                b11_stack,
+                w21_stack,
+                b21_stack,
+            )
+
+        @staticmethod
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            grad_rel: torch.Tensor,
+            grad_node_idx: torch.Tensor | None,
+        ) -> tuple[torch.Tensor | None, ...]:
+            del grad_node_idx
+            if grad_rel is None:
+                return (None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+            (
+                x,
+                relation_args,
+                w10_stack,
+                b10_stack,
+                w20_stack,
+                b20_stack,
+                w11_stack,
+                b11_stack,
+                w21_stack,
+                b21_stack,
+            ) = ctx.saved_tensors
+            needs = ctx.needs_input_grad
+            grad_map: list[torch.Tensor | None] = [None] * 14
+            if (
+                bool(getattr(ctx, "used_custom", False))
+                and grad_rel.is_cuda
+                and _should_use_custom(
+                    "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward"
+                )
+                and _namespace_has_op(
+                    "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward"
+                )
+            ):
+                (
+                    grad_x,
+                    grad_w10,
+                    grad_b10,
+                    grad_w20,
+                    grad_b20,
+                    grad_w11,
+                    grad_b11,
+                    grad_w21,
+                    grad_b21,
+                ) = _ops_namespace().fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
+                    grad_rel,
+                    x,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    w10_stack,
+                    b10_stack,
+                    w20_stack,
+                    b20_stack,
+                    w11_stack,
+                    b11_stack,
+                    w21_stack,
+                    b21_stack,
+                )
+                if needs[0]:
+                    grad_map[0] = grad_x
+                if needs[5]:
+                    grad_map[5] = grad_w10
+                if needs[6]:
+                    grad_map[6] = grad_b10
+                if needs[7]:
+                    grad_map[7] = grad_w20
+                if needs[8]:
+                    grad_map[8] = grad_b20
+                if needs[9]:
+                    grad_map[9] = grad_w11
+                if needs[10]:
+                    grad_map[10] = grad_b11
+                if needs[11]:
+                    grad_map[11] = grad_w21
+                if needs[12]:
+                    grad_map[12] = grad_b21
+                return tuple(grad_map)
+            with torch.enable_grad():
+                x_req = x.detach().requires_grad_(bool(needs[0]))
+                w10_req = w10_stack.detach().requires_grad_(bool(needs[5]))
+                b10_req = b10_stack.detach().requires_grad_(bool(needs[6]))
+                w20_req = w20_stack.detach().requires_grad_(bool(needs[7]))
+                b20_req = b20_stack.detach().requires_grad_(bool(needs[8]))
+                w11_req = w11_stack.detach().requires_grad_(bool(needs[9]))
+                b11_req = b11_stack.detach().requires_grad_(bool(needs[10]))
+                w21_req = w21_stack.detach().requires_grad_(bool(needs[11]))
+                b21_req = b21_stack.detach().requires_grad_(bool(needs[12]))
+                rel_cat, _ = _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
+                    x_req,
+                    relation_args,
+                    list(ctx.slot_offsets),
+                    list(ctx.row_sizes),
+                    int(ctx.arity),
+                    w10_req,
+                    b10_req,
+                    w20_req,
+                    b20_req,
+                    w11_req,
+                    b11_req,
+                    w21_req,
+                    b21_req,
+                )
+                grad_inputs: list[torch.Tensor] = []
+                grad_targets: list[int] = []
+                for idx, tensor in (
+                    (0, x_req),
+                    (5, w10_req),
+                    (6, b10_req),
+                    (7, w20_req),
+                    (8, b20_req),
+                    (9, w11_req),
+                    (10, b11_req),
+                    (11, w21_req),
+                    (12, b21_req),
+                ):
+                    if needs[idx]:
+                        grad_inputs.append(tensor)
+                        grad_targets.append(idx)
+                grads = torch.autograd.grad(rel_cat, grad_inputs, grad_rel, allow_unused=True)
+            for idx, grad in zip(grad_targets, grads):
+                grad_map[idx] = grad
+            return tuple(grad_map)
 
 
     class _FusedTwoLayerMishFromIndicesFunction(_FusedTwoLayerPointwiseFromIndicesFunction):
@@ -1790,6 +2118,42 @@ def fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
     )
 
 
+def fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w10_stack: torch.Tensor,
+    b10_stack: torch.Tensor,
+    w20_stack: torch.Tensor,
+    b20_stack: torch.Tensor,
+    w11_stack: torch.Tensor,
+    b11_stack: torch.Tensor,
+    w21_stack: torch.Tensor,
+    b21_stack: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch is None:
+        raise ModuleNotFoundError(
+            "fused_program_two_layer_silu_then_two_layer_silu_from_indices requires torch."
+        ) from _TORCH_IMPORT_ERROR
+    return _FusedProgramTwoLayerSiLUThenTwoLayerSiLUFromIndicesFunction.apply(
+        x,
+        relation_args,
+        list(slot_offsets),
+        list(row_sizes),
+        int(arity),
+        w10_stack,
+        b10_stack,
+        w20_stack,
+        b20_stack,
+        w11_stack,
+        b11_stack,
+        w21_stack,
+        b21_stack,
+    )
+
+
 def fused_two_layer_mish_from_indices(
     x: torch.Tensor,
     relation_args: torch.Tensor,
@@ -1829,6 +2193,7 @@ __all__ = [
     "fused_two_layer_pointwise_from_indices",
     "fused_postnorm_two_layer_pointwise_layernorm_from_indices",
     "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices",
+    "fused_program_two_layer_silu_then_two_layer_silu_from_indices",
     "fused_two_layer_mish_from_indices",
     "pointwise_code_from_signature",
     "available",

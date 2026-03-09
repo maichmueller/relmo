@@ -56,12 +56,23 @@ class FusedRelationSpec:
 
 
 @dataclass(frozen=True)
+class ProgramFamilySpec:
+    family: str
+    signature: Hashable
+    arity: int
+    input_dim: int
+    output_dim: int
+    block_specs: tuple[FusedRelationSpec, ...]
+
+
+@dataclass(frozen=True)
 class FusedRelationMatch:
     spec: FusedRelationSpec
     linears: tuple[torch.nn.Linear, ...]
     pointwise_modules: tuple[torch.nn.Module, ...] = ()
     norm_modules: tuple[torch.nn.Module, ...] = ()
     program_matches: tuple["FusedRelationMatch", ...] = ()
+    program_family: ProgramFamilySpec | None = None
 
 
 _GROUPED_SPEC_METHODS = ("relm_grouped_mlp_spec", "grouped_mlp_spec")
@@ -982,6 +993,11 @@ class FlatRelationalLayer(torch.nn.Module):
 
         if len(stages) <= 1:
             return None
+        program_family = self._match_program_family(
+            relation_slice,
+            stages=tuple(stages),
+            expected_dim=expected_dim,
+        )
         return FusedRelationMatch(
             spec=FusedRelationSpec(
                 family="program",
@@ -994,6 +1010,35 @@ class FlatRelationalLayer(torch.nn.Module):
             ),
             linears=tuple(),
             program_matches=tuple(stages),
+            program_family=program_family,
+        )
+
+    def _match_program_family(
+        self,
+        relation_slice: RelationSlice,
+        *,
+        stages: tuple[FusedRelationMatch, ...],
+        expected_dim: int,
+    ) -> ProgramFamilySpec | None:
+        if len(stages) != 2:
+            return None
+        stage0, stage1 = stages
+        if stage0.spec.family != "two_layer_silu" or stage1.spec.family != "two_layer_silu":
+            return None
+        if stage0.spec.output_dim != expected_dim or stage1.spec.output_dim != expected_dim:
+            return None
+        return ProgramFamilySpec(
+            family="program_two_layer_silu_then_two_layer_silu",
+            signature=(
+                stage0.spec.family,
+                stage0.spec.signature,
+                stage1.spec.family,
+                stage1.spec.signature,
+            ),
+            arity=int(relation_slice.arity),
+            input_dim=int(expected_dim),
+            output_dim=int(expected_dim),
+            block_specs=(stage0.spec, stage1.spec),
         )
 
     def _match_fused_relation(
@@ -1759,6 +1804,84 @@ class FlatRelationalLayer(torch.nn.Module):
             ],
             dim=0,
         )
+
+        if stage_count == 2 and bool(self.fused_two_layer_pointwise_execution):
+            stage0_matches = [item[1].program_matches[0] for item in batch_items]
+            stage1_matches = [item[1].program_matches[1] for item in batch_items]
+            if all(
+                item[1].program_family is not None
+                and item[1].program_family.family == "program_two_layer_silu_then_two_layer_silu"
+                for item in batch_items
+            ):
+                program_key = (
+                    "manual_program",
+                    grouped_batch.family,
+                    grouped_batch.arity,
+                    grouped_batch.signature,
+                )
+                w10_stack = self._get_grouped_param_stack(
+                    cache_key=("w10", program_key),
+                    tensors=[match.linears[0].weight for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b10_stack = self._get_grouped_param_stack(
+                    cache_key=("b10", program_key),
+                    tensors=[cast(Tensor, match.linears[0].bias) for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                w20_stack = self._get_grouped_param_stack(
+                    cache_key=("w20", program_key),
+                    tensors=[match.linears[1].weight for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b20_stack = self._get_grouped_param_stack(
+                    cache_key=("b20", program_key),
+                    tensors=[cast(Tensor, match.linears[1].bias) for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                w11_stack = self._get_grouped_param_stack(
+                    cache_key=("w11", program_key),
+                    tensors=[match.linears[0].weight for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b11_stack = self._get_grouped_param_stack(
+                    cache_key=("b11", program_key),
+                    tensors=[cast(Tensor, match.linears[0].bias) for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                w21_stack = self._get_grouped_param_stack(
+                    cache_key=("w21", program_key),
+                    tensors=[match.linears[1].weight for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b21_stack = self._get_grouped_param_stack(
+                    cache_key=("b21", program_key),
+                    tensors=[cast(Tensor, match.linears[1].bias) for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                return relm_mp_ops.fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+                    x,
+                    relation_args,
+                    slot_offsets_global,
+                    row_sizes,
+                    int(grouped_batch.arity),
+                    w10_stack,
+                    b10_stack,
+                    w20_stack,
+                    b20_stack,
+                    w11_stack,
+                    b11_stack,
+                    w21_stack,
+                    b21_stack,
+                )
 
         current_x = x
         current_relation_args = relation_args
