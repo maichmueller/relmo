@@ -1,11 +1,18 @@
+"""Public typed relation blocks for the flat relational runtime.
+
+These blocks define width-preserving relation transforms over packed relation
+rows of shape ``[rows, width]``. They do not apply the outer tuple residual.
+The flat layer or exact kernel path is responsible for adding the gathered
+input slots exactly once after block/program execution.
+"""
+
 from __future__ import annotations
 
-from typing import Literal
+from typing import Iterable, Literal
 
 import torch
 
-from .grouped_mlp import GroupedMLPSpec
-
+from .relation_block_spec import RelationBlockSpec
 
 PointwiseKind = Literal["identity", "relu", "mish", "gelu", "silu", "tanh"]
 NormKind = Literal["layernorm", "rmsnorm"]
@@ -53,6 +60,8 @@ def _make_norm(
 
 
 class TwoLayerPointwiseRelationMLP(torch.nn.Module):
+    """Width-preserving ``Linear -> Pointwise -> Linear`` relation block."""
+
     def __init__(
         self,
         width: int,
@@ -63,6 +72,7 @@ class TwoLayerPointwiseRelationMLP(torch.nn.Module):
         bias: bool = True,
     ) -> None:
         super().__init__()
+        self.width = int(width)
         self.lin1 = torch.nn.Linear(width, hidden, bias=bias)
         self.act = _make_pointwise(activation, gelu_approximate=gelu_approximate)
         self.lin2 = torch.nn.Linear(hidden, width, bias=bias)
@@ -70,8 +80,8 @@ class TwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin2(self.act(self.lin1(x)))
 
-    def relm_grouped_mlp_spec(self) -> GroupedMLPSpec:
-        return GroupedMLPSpec(
+    def relm_kernel_spec(self) -> RelationBlockSpec:
+        return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
                 ("linear", 0),
@@ -82,6 +92,8 @@ class TwoLayerPointwiseRelationMLP(torch.nn.Module):
 
 
 class PreNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
+    """Width-preserving ``Norm -> Linear -> Pointwise -> Linear`` block."""
+
     def __init__(
         self,
         width: int,
@@ -95,6 +107,7 @@ class PreNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
         bias: bool = True,
     ) -> None:
         super().__init__()
+        self.width = int(width)
         self.norm = _make_norm(width, norm=norm, eps=norm_eps, affine=norm_affine)
         self.lin1 = torch.nn.Linear(width, hidden, bias=bias)
         self.act = _make_pointwise(activation, gelu_approximate=gelu_approximate)
@@ -103,8 +116,8 @@ class PreNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin2(self.act(self.lin1(self.norm(x))))
 
-    def relm_grouped_mlp_spec(self) -> GroupedMLPSpec:
-        return GroupedMLPSpec(
+    def relm_kernel_spec(self) -> RelationBlockSpec:
+        return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
                 ("norm", self.norm),
@@ -116,6 +129,8 @@ class PreNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
 
 
 class PostNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
+    """Width-preserving ``Linear -> Pointwise -> Linear -> Norm`` block."""
+
     def __init__(
         self,
         width: int,
@@ -129,6 +144,7 @@ class PostNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
         bias: bool = True,
     ) -> None:
         super().__init__()
+        self.width = int(width)
         self.lin1 = torch.nn.Linear(width, hidden, bias=bias)
         self.act = _make_pointwise(activation, gelu_approximate=gelu_approximate)
         self.lin2 = torch.nn.Linear(hidden, width, bias=bias)
@@ -137,8 +153,8 @@ class PostNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.lin2(self.act(self.lin1(x))))
 
-    def relm_grouped_mlp_spec(self) -> GroupedMLPSpec:
-        return GroupedMLPSpec(
+    def relm_kernel_spec(self) -> RelationBlockSpec:
+        return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
                 ("linear", 0),
@@ -150,6 +166,8 @@ class PostNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
 
 
 class ThreeLayerPointwiseRelationMLP(torch.nn.Module):
+    """Width-preserving ``Linear -> Pointwise -> Linear -> Pointwise -> Linear`` block."""
+
     def __init__(
         self,
         width: int,
@@ -161,6 +179,7 @@ class ThreeLayerPointwiseRelationMLP(torch.nn.Module):
         bias: bool = True,
     ) -> None:
         super().__init__()
+        self.width = int(width)
         self.lin1 = torch.nn.Linear(width, hidden1, bias=bias)
         self.act1 = _make_pointwise(activation, gelu_approximate=gelu_approximate)
         self.lin2 = torch.nn.Linear(hidden1, hidden2, bias=bias)
@@ -170,8 +189,8 @@ class ThreeLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin3(self.act2(self.lin2(self.act1(self.lin1(x)))))
 
-    def relm_grouped_mlp_spec(self) -> GroupedMLPSpec:
-        return GroupedMLPSpec(
+    def relm_kernel_spec(self) -> RelationBlockSpec:
+        return RelationBlockSpec(
             linears=[self.lin1, self.lin2, self.lin3],
             ops=[
                 ("linear", 0),
@@ -183,9 +202,51 @@ class ThreeLayerPointwiseRelationMLP(torch.nn.Module):
         )
 
 
+class RelationProgram(torch.nn.Module):
+    """Explicit composed relation program.
+
+    A relation program is an ordered sequence of width-preserving relation
+    blocks. It does not apply the outer tuple residual. Exact CUDA program
+    kernels are matched only from this wrapper, not from arbitrary
+    ``torch.nn.Sequential`` modules.
+    """
+
+    def __init__(self, *blocks: torch.nn.Module) -> None:
+        super().__init__()
+        if not blocks:
+            raise ValueError("RelationProgram requires at least one block.")
+        self.blocks = torch.nn.ModuleList(blocks)
+        widths = [getattr(block, "width", None) for block in self.blocks]
+        if any(width is None for width in widths):
+            raise ValueError(
+                "All RelationProgram blocks must expose a 'width' attribute for validation."
+            )
+        unique_widths = {int(width) for width in widths}
+        if len(unique_widths) != 1:
+            raise ValueError(
+                f"RelationProgram blocks must share one width, got {sorted(unique_widths)}."
+            )
+        self.width = int(next(iter(unique_widths)))
+
+    def __iter__(self):
+        return iter(self.blocks)
+
+    def __len__(self) -> int:
+        return len(self.blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for block in self.blocks:
+            out = block(out)
+        return out
+
+
 __all__ = [
-    "TwoLayerPointwiseRelationMLP",
-    "PreNormTwoLayerPointwiseRelationMLP",
+    "NormKind",
+    "PointwiseKind",
     "PostNormTwoLayerPointwiseRelationMLP",
+    "PreNormTwoLayerPointwiseRelationMLP",
+    "RelationProgram",
     "ThreeLayerPointwiseRelationMLP",
+    "TwoLayerPointwiseRelationMLP",
 ]

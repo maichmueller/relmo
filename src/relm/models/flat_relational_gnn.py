@@ -1,7 +1,17 @@
+"""Flat relational GNN public model API.
+
+This module owns the high-level flat relation model surface:
+1. input normalization into an internal prepared-batch carrier
+2. embedding-state rollout over :class:`FlatRelationalLayer`
+3. structured :class:`FlatRelationalOutput` construction
+
+The actual relation message passing lives in ``flat_relational_layer``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 import torch
 import torch_geometric as pyg
@@ -10,30 +20,40 @@ from torch_geometric.nn.resolver import aggregation_resolver
 
 from ._compile import optional_compile
 from .aggr import LogSumExpAggregation
+from .flat_contract import (
+    FlatBatchInput,
+    FlatExecutionPolicy,
+    _FlatPreparedBatch,
+    FlatRelationalOutput,
+    normalize_optional_index_tensor,
+    normalize_optional_long_tensor,
+    preferred_index_dtype,
+)
 from .flat_relational_layer import (
+    FlatRelationKernel,
     FlatRelationalLayer,
-    FlatTopology,
     normalize_relation_arities,
     normalize_relation_counts,
 )
 from .mlp import ArityMLPFactory, SimpleMLP
 from .pyg_module import PyGFlatModule
 
-try:  # pragma: no cover - optional runtime dependency
-    import mifrost  # type: ignore
-except Exception:  # pragma: no cover - keep module importable without mifrost
-    mifrost = None  # type: ignore
+import mifrost  # type: ignore
 
-RelationDict = dict[str, int]
-INT32_MAX = int(torch.iinfo(torch.int32).max)
+Relations = dict[str, int]
 
 
 @dataclass(frozen=True)
-class FlatPreparedInputs:
+class _NormalizedRelationCore:
     x: Tensor
     relation_counts: Tensor
     relation_args: Tensor
     relation_arities: Tensor
+    index_dtype: torch.dtype
+
+
+@dataclass(frozen=True)
+class _NormalizedFlatViews:
     batch: Tensor
     node_sizes: Tensor | None
     object_indices: Tensor | None = None
@@ -49,103 +69,69 @@ class FlatPreparedInputs:
     target_sizes: Tensor | None = None
     target_indices: Tensor | None = None
     target_candidate_ids: Tensor | None = None
-    topology: FlatTopology | None = None
-    _relm_flat_prepared: bool = True
-
-
-def _normalize_optional_long_tensor(
-    value: Tensor | Sequence[int] | None,
-    *,
-    device: torch.device,
-    flatten: bool = True,
-) -> Tensor | None:
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        out = value.to(device=device, dtype=torch.long)
-    else:
-        out = torch.as_tensor(tuple(int(x) for x in value), device=device, dtype=torch.long)
-    return out.view(-1) if flatten else out
-
-
-def _preferred_index_dtype(*, device: torch.device, max_index_bound: int) -> torch.dtype:
-    if device.type == "cpu" and int(max_index_bound) <= INT32_MAX:
-        return torch.int32
-    return torch.long
-
-
-def _normalize_optional_index_tensor(
-    value: Tensor | Sequence[int] | None,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    flatten: bool = True,
-) -> Tensor | None:
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        out = value.to(device=device, dtype=dtype)
-    else:
-        out = torch.as_tensor(tuple(int(x) for x in value), device=device, dtype=dtype)
-    return out.view(-1) if flatten else out
 
 
 class FlatRelationalGNN(PyGFlatModule):
+    """Flat relation message-passing network.
+
+    Public inputs are:
+    1. native ``mifrost.BatchEncoding`` flat batches
+    2. explicit PyG ``Data``/``Batch`` objects carrying the flat relation
+       tensors
+
+    The model returns a structured output object. Relation modules are
+    width-preserving transforms over packed relation rows of shape
+    ``[rows, arity * embedding]``. The layer applies the tuple residual exactly
+    once when writing messages back to the entity table.
+    """
+
     def __init__(
         self,
         embedding_size: int,
-        num_layer: int,
-        aggr: Optional[str | pyg.nn.aggr.Aggregation],
-        relation_dict: RelationDict,
-        relation_module_factory: Callable[[int], torch.nn.Module]
-        | ArityMLPFactory
-        | None = None,
-        activation: str | Callable | None = None,
+        num_layers: int,
+        relations: Mapping[str, int],
+        aggregation: str | pyg.nn.aggr.Aggregation | None = "sum",
+        relation_modules: Mapping[str, torch.nn.Module] | Sequence[torch.nn.Module] | None = None,
+        relation_module_factory: Callable[[int], torch.nn.Module] | ArityMLPFactory | None = None,
+        relation_kernels: Sequence[FlatRelationKernel] | None = None,
+        execution_policy: FlatExecutionPolicy = FlatExecutionPolicy(),
         compile_forward: bool = False,
-        fused_two_layer_mish_execution: bool | None = None,
-        fused_two_layer_pointwise_execution: bool | None = None,
-        fused_relation_gather: bool | None = None,
+        activation: str | Callable | None = None,
     ) -> None:
         super().__init__()
         self._compile_forward = bool(compile_forward)
         self.embedding_size = int(embedding_size)
-        self.num_layer = int(num_layer)
-        self.relation_dict = {str(key): int(value) for key, value in relation_dict.items()}
-        self.relation_names = tuple(self.relation_dict.keys())
+        self.num_layers = int(num_layers)
+        self.relations = {str(key): int(value) for key, value in relations.items()}
+        self.relation_names = tuple(self.relations.keys())
         self.relation_arities = torch.as_tensor(
-            tuple(int(v) for v in self.relation_dict.values()), dtype=torch.long
+            tuple(int(v) for v in self.relations.values()), dtype=torch.long
         )
         self.activation = activation or "mish"
+        self.execution_policy = execution_policy
 
-        if relation_module_factory is None:
-            relation_module_factory = ArityMLPFactory(
-                feature_size=self.embedding_size,
-                added_arity=0,
-                residual=False,
-                padding=None,
-                layers=1,
-                activation=self.activation,
-            )
-        relation_modules = [relation_module_factory(arity) for arity in self.relation_arities.tolist()]
+        modules = self._build_relation_modules(
+            relation_modules=relation_modules,
+            relation_module_factory=relation_module_factory,
+        )
+        self._validate_relation_module_widths(modules)
 
-        resolved_aggr: str | pyg.nn.aggr.Aggregation
-        if isinstance(aggr, str) or aggr is None:
-            if aggr is None or aggr.lower() == "logsumexp":
-                resolved_aggr = LogSumExpAggregation()
+        if isinstance(aggregation, str) or aggregation is None:
+            if aggregation is None or aggregation.lower() == "logsumexp":
+                resolved_aggregation: str | pyg.nn.aggr.Aggregation = LogSumExpAggregation()
             else:
-                resolved_aggr = aggregation_resolver(aggr)
+                resolved_aggregation = aggregation_resolver(aggregation)
         else:
-            resolved_aggr = aggr
+            resolved_aggregation = aggregation
 
         self.relational_layer = FlatRelationalLayer(
-            update_modules=relation_modules,
+            update_modules=modules,
             relation_names=self.relation_names,
             relation_arities=self.relation_arities,
             embedding_size=self.embedding_size,
-            aggr=aggr if isinstance(aggr, str) else resolved_aggr,
-            fused_two_layer_mish_execution=fused_two_layer_mish_execution,
-            fused_two_layer_pointwise_execution=fused_two_layer_pointwise_execution,
-            fused_relation_gather=fused_relation_gather,
+            aggregation=aggregation if isinstance(aggregation, str) else resolved_aggregation,
+            execution_policy=execution_policy,
+            kernels=relation_kernels,
         )
         self.embedding_updater = SimpleMLP(
             in_size=2 * self.embedding_size,
@@ -154,7 +140,62 @@ class FlatRelationalGNN(PyGFlatModule):
             activation=self.activation,
         )
 
-    def _normalize_inputs(
+    def _build_relation_modules(
+        self,
+        *,
+        relation_modules: Mapping[str, torch.nn.Module] | Sequence[torch.nn.Module] | None,
+        relation_module_factory: Callable[[int], torch.nn.Module] | ArityMLPFactory | None,
+    ) -> list[torch.nn.Module]:
+        if relation_modules is not None and relation_module_factory is not None:
+            raise ValueError(
+                "Provide either relation_modules or relation_module_factory, not both."
+            )
+        if relation_modules is None and relation_module_factory is None:
+            relation_module_factory = ArityMLPFactory(
+                feature_size=self.embedding_size,
+                added_arity=0,
+                residual=False,
+                padding=None,
+                layers=1,
+                activation=self.activation,
+            )
+
+        if relation_modules is not None:
+            if isinstance(relation_modules, Mapping):
+                keys = tuple(str(key) for key in relation_modules.keys())
+                if set(keys) != set(self.relation_names):
+                    missing = tuple(name for name in self.relation_names if name not in relation_modules)
+                    extra = tuple(name for name in keys if name not in self.relation_names)
+                    raise ValueError(
+                        "relation_modules mapping keys must match relations exactly, "
+                        f"missing={missing}, extra={extra}."
+                    )
+                return [relation_modules[name] for name in self.relation_names]
+            modules = list(relation_modules)
+            if len(modules) != len(self.relation_names):
+                raise ValueError(
+                    "relation_modules sequence length must match relations, got "
+                    f"{len(modules)} vs {len(self.relation_names)}."
+                )
+            return modules
+
+        assert relation_module_factory is not None
+        return [relation_module_factory(arity) for arity in self.relation_arities.tolist()]
+
+    def _validate_relation_module_widths(self, modules: Sequence[torch.nn.Module]) -> None:
+        for relation_name, arity, module in zip(
+            self.relation_names,
+            self.relation_arities.tolist(),
+            modules,
+        ):
+            width = int(arity * self.embedding_size)
+            module_width = getattr(module, "width", None)
+            if module_width is not None and int(module_width) != width:
+                raise ValueError(
+                    f"relation module {relation_name!r} declares width {module_width}, expected {width}."
+                )
+
+    def _normalize_relation_core(
         self,
         x: Tensor,
         relation_counts: Tensor,
@@ -162,29 +203,12 @@ class FlatRelationalGNN(PyGFlatModule):
         relation_arities: Tensor | Sequence[int] | None = None,
         *,
         relation_names: Sequence[str] | None = None,
-        batch: Tensor | None = None,
-        node_sizes: Tensor | None = None,
-        object_indices: Tensor | Sequence[int] | None = None,
-        object_sizes: Tensor | Sequence[int] | None = None,
-        history_entity_indices: Tensor | Sequence[int] | None = None,
-        history_entity_sizes: Tensor | Sequence[int] | None = None,
-        history_entity_dt: Tensor | Sequence[int] | None = None,
-        target_entity_indices: Tensor | Sequence[int] | None = None,
-        target_entity_group_ids: Tensor | Sequence[int] | None = None,
-        target_entity_sizes: Tensor | Sequence[int] | None = None,
-        target_positions: Tensor | Sequence[int] | None = None,
-        target_group_ids: Tensor | Sequence[int] | None = None,
-        target_sizes: Tensor | Sequence[int] | None = None,
-        target_indices: Tensor | Sequence[int] | None = None,
-        target_candidate_ids: Tensor | Sequence[int] | None = None,
-    ) -> dict[str, Any]:
+    ) -> _NormalizedRelationCore:
+        """Canonicalize the flat relation tensors required by the core layer."""
         if x.dim() != 2:
             raise ValueError(f"x must be rank-2, got shape {tuple(x.shape)}.")
         relation_counts_2d = normalize_relation_counts(relation_counts, device=x.device)
-        index_dtype = _preferred_index_dtype(
-            device=x.device,
-            max_index_bound=int(x.size(0)),
-        )
+        index_dtype = preferred_index_dtype(device=x.device, max_index_bound=int(x.size(0)))
         relation_args_1d = relation_args.to(device=x.device, dtype=index_dtype).view(-1)
         arities_1d = (
             self.relation_arities.to(device=x.device)
@@ -197,20 +221,29 @@ class FlatRelationalGNN(PyGFlatModule):
                 f"{tuple(relation_counts_2d.shape)} vs {tuple(arities_1d.shape)}."
             )
         if arities_1d.numel() != self.relation_arities.numel():
-            raise ValueError(
-                "flat model relation arity dimension does not match constructor relation_dict."
-            )
+            raise ValueError("flat model relation dimension does not match constructor relations.")
         if not torch.equal(arities_1d.cpu(), self.relation_arities):
-            raise ValueError(
-                "input relation_arities does not match the model relation_dict ordering."
-            )
+            raise ValueError("input relation_arities does not match the model relation order.")
         if relation_names is not None and tuple(str(name) for name in relation_names) != self.relation_names:
-            raise ValueError("input relation_names does not match model relation_dict ordering.")
+            raise ValueError("input relation_names does not match the model relation order.")
+        return _NormalizedRelationCore(
+            x=x,
+            relation_counts=relation_counts_2d,
+            relation_args=relation_args_1d,
+            relation_arities=arities_1d,
+            index_dtype=index_dtype,
+        )
 
+    def _resolve_entity_batch(
+        self,
+        x: Tensor,
+        *,
+        batch: Tensor | None = None,
+        node_sizes: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Resolve the graph id per entity row from ``batch`` or ``node_sizes``."""
         node_sizes_t = (
-            None
-            if node_sizes is None
-            else node_sizes.to(device=x.device, dtype=torch.long).view(-1)
+            None if node_sizes is None else node_sizes.to(device=x.device, dtype=torch.long).view(-1)
         )
         if batch is None:
             if node_sizes_t is not None:
@@ -227,105 +260,172 @@ class FlatRelationalGNN(PyGFlatModule):
                 batch = torch.zeros((int(x.size(0)),), device=x.device, dtype=torch.long)
         else:
             batch = batch.to(device=x.device, dtype=torch.long).view(-1)
+        return batch, node_sizes_t
 
-        return {
-            "relation_counts": relation_counts_2d,
-            "relation_args": relation_args_1d,
-            "relation_arities": arities_1d,
-            "batch": batch,
-            "node_sizes": node_sizes_t,
-            "object_indices": _normalize_optional_index_tensor(
-                object_indices,
-                device=x.device,
-                dtype=index_dtype,
-            ),
-            "object_sizes": _normalize_optional_long_tensor(object_sizes, device=x.device),
-            "history_entity_indices": _normalize_optional_index_tensor(
-                history_entity_indices,
-                device=x.device,
-                dtype=index_dtype,
-            ),
-            "history_entity_sizes": _normalize_optional_long_tensor(
-                history_entity_sizes, device=x.device
-            ),
-            "history_entity_dt": _normalize_optional_long_tensor(
-                history_entity_dt, device=x.device
-            ),
-            "target_entity_indices": _normalize_optional_index_tensor(
-                target_entity_indices,
-                device=x.device,
-                dtype=index_dtype,
-            ),
-            "target_entity_group_ids": _normalize_optional_long_tensor(
-                target_entity_group_ids, device=x.device
-            ),
-            "target_entity_sizes": _normalize_optional_long_tensor(
-                target_entity_sizes, device=x.device
-            ),
-            "target_positions": _normalize_optional_index_tensor(
-                target_positions,
-                device=x.device,
-                dtype=index_dtype,
-            ),
-            "target_group_ids": _normalize_optional_long_tensor(
-                target_group_ids, device=x.device
-            ),
-            "target_sizes": _normalize_optional_long_tensor(target_sizes, device=x.device),
-            "target_indices": _normalize_optional_long_tensor(target_indices, device=x.device),
-            "target_candidate_ids": _normalize_optional_long_tensor(
-                target_candidate_ids, device=x.device
-            ),
-        }
-
-    def initialize_embeddings(self, x: Tensor) -> Tensor:
-        return torch.zeros((int(x.size(0)), self.embedding_size), device=x.device, dtype=x.dtype)
-
-    def prepare(
+    def _normalize_output_views(
         self,
-        data: Any,
-        *args,
-        cache: dict | None = None,
-        **kwargs,
-    ) -> FlatPreparedInputs:
-        if getattr(data, "_relm_flat_prepared", False):
-            return data
-        if torch.is_tensor(data):
-            relation_counts = args[0] if len(args) > 0 else kwargs.pop("relation_counts")
-            relation_args = args[1] if len(args) > 1 else kwargs.pop("relation_args")
-            relation_arities = args[2] if len(args) > 2 else kwargs.pop("relation_arities", None)
-            rest = kwargs
-            x = data
-        elif isinstance(data, dict):
-            x = data["x"]
-            relation_counts = data["relation_counts"]
-            relation_args = data["relation_args"]
-            relation_arities = data.get("relation_arities", kwargs.pop("relation_arities", None))
-            rest = {
-                key: value
-                for key, value in data.items()
-                if key not in {"x", "relation_counts", "relation_args", "relation_arities"}
-            }
-            rest.update(kwargs)
-        else:
-            if (
-                mifrost is not None
-                and isinstance(data, mifrost.BatchEncoding)
-                and hasattr(data, "relation_counts")
-                and hasattr(data, "relation_args")
-            ):
-                x, relation_counts, relation_args, relation_arities, rest = self.unpack_native_flat(data)
-            else:
-                if hasattr(data, "as_pyg") and hasattr(data, "relation_counts") and hasattr(data, "relation_args") and not hasattr(data, "x"):
-                    data = data.as_pyg(as_batch=True)
-                x, relation_counts, relation_args, relation_arities, rest = self.unpack_attr(data)
-            rest = dict(rest)
-            rest.update(kwargs)
+        *,
+        device: torch.device,
+        index_dtype: torch.dtype,
+        batch: Tensor,
+        node_sizes: Tensor | None,
+        object_indices: Tensor | Sequence[int] | None = None,
+        object_sizes: Tensor | Sequence[int] | None = None,
+        history_entity_indices: Tensor | Sequence[int] | None = None,
+        history_entity_sizes: Tensor | Sequence[int] | None = None,
+        history_entity_dt: Tensor | Sequence[int] | None = None,
+        target_entity_indices: Tensor | Sequence[int] | None = None,
+        target_entity_group_ids: Tensor | Sequence[int] | None = None,
+        target_entity_sizes: Tensor | Sequence[int] | None = None,
+        target_positions: Tensor | Sequence[int] | None = None,
+        target_group_ids: Tensor | Sequence[int] | None = None,
+        target_sizes: Tensor | Sequence[int] | None = None,
+        target_indices: Tensor | Sequence[int] | None = None,
+        target_candidate_ids: Tensor | Sequence[int] | None = None,
+    ) -> _NormalizedFlatViews:
+        """Canonicalize optional encoder-provided entity subset views."""
+        return _NormalizedFlatViews(
+            batch=batch,
+            node_sizes=node_sizes,
+            object_indices=normalize_optional_index_tensor(
+                object_indices,
+                device=device,
+                dtype=index_dtype,
+            ),
+            object_sizes=normalize_optional_long_tensor(object_sizes, device=device),
+            history_entity_indices=normalize_optional_index_tensor(
+                history_entity_indices,
+                device=device,
+                dtype=index_dtype,
+            ),
+            history_entity_sizes=normalize_optional_long_tensor(
+                history_entity_sizes, device=device
+            ),
+            history_entity_dt=normalize_optional_long_tensor(history_entity_dt, device=device),
+            target_entity_indices=normalize_optional_index_tensor(
+                target_entity_indices,
+                device=device,
+                dtype=index_dtype,
+            ),
+            target_entity_group_ids=normalize_optional_long_tensor(
+                target_entity_group_ids, device=device
+            ),
+            target_entity_sizes=normalize_optional_long_tensor(
+                target_entity_sizes, device=device
+            ),
+            target_positions=normalize_optional_index_tensor(
+                target_positions,
+                device=device,
+                dtype=index_dtype,
+            ),
+            target_group_ids=normalize_optional_long_tensor(target_group_ids, device=device),
+            target_sizes=normalize_optional_long_tensor(target_sizes, device=device),
+            target_indices=normalize_optional_long_tensor(target_indices, device=device),
+            target_candidate_ids=normalize_optional_long_tensor(
+                target_candidate_ids, device=device
+            ),
+        )
 
-        normalized = self._normalize_inputs(
+    def _prepare_from_unpacked(
+        self,
+        *,
+        x: Tensor,
+        relation_counts: Tensor,
+        relation_args: Tensor,
+        relation_arities: Tensor | Sequence[int] | None,
+        relation_names: Sequence[str] | None,
+        batch: Tensor | None,
+        node_sizes: Tensor | None,
+        object_indices: Tensor | Sequence[int] | None,
+        object_sizes: Tensor | Sequence[int] | None,
+        history_entity_indices: Tensor | Sequence[int] | None,
+        history_entity_sizes: Tensor | Sequence[int] | None,
+        history_entity_dt: Tensor | Sequence[int] | None,
+        target_entity_indices: Tensor | Sequence[int] | None,
+        target_entity_group_ids: Tensor | Sequence[int] | None,
+        target_entity_sizes: Tensor | Sequence[int] | None,
+        target_positions: Tensor | Sequence[int] | None,
+        target_group_ids: Tensor | Sequence[int] | None,
+        target_sizes: Tensor | Sequence[int] | None,
+        target_indices: Tensor | Sequence[int] | None,
+        target_candidate_ids: Tensor | Sequence[int] | None,
+        cache: dict | None,
+    ) -> _FlatPreparedBatch:
+        """Build the internal prepared carrier from already-unpacked flat fields."""
+        core = self._normalize_relation_core(
             x,
             relation_counts,
             relation_args,
             relation_arities,
+            relation_names=relation_names,
+        )
+        batch_t, node_sizes_t = self._resolve_entity_batch(
+            core.x,
+            batch=batch,
+            node_sizes=node_sizes,
+        )
+        views = self._normalize_output_views(
+            device=core.x.device,
+            index_dtype=core.index_dtype,
+            batch=batch_t,
+            node_sizes=node_sizes_t,
+            object_indices=object_indices,
+            object_sizes=object_sizes,
+            history_entity_indices=history_entity_indices,
+            history_entity_sizes=history_entity_sizes,
+            history_entity_dt=history_entity_dt,
+            target_entity_indices=target_entity_indices,
+            target_entity_group_ids=target_entity_group_ids,
+            target_entity_sizes=target_entity_sizes,
+            target_positions=target_positions,
+            target_group_ids=target_group_ids,
+            target_sizes=target_sizes,
+            target_indices=target_indices,
+            target_candidate_ids=target_candidate_ids,
+        )
+        topology_store = cache.setdefault("topology_store", {}) if cache is not None else None
+        topology = self.relational_layer.get_topology(
+            core.relation_counts,
+            relation_arities=core.relation_arities,
+            cache=topology_store,
+        )
+        return _FlatPreparedBatch(
+            x=core.x,
+            relation_counts=core.relation_counts,
+            relation_args=core.relation_args,
+            relation_arities=core.relation_arities,
+            batch=views.batch,
+            node_sizes=views.node_sizes,
+            object_indices=views.object_indices,
+            object_sizes=views.object_sizes,
+            history_entity_indices=views.history_entity_indices,
+            history_entity_sizes=views.history_entity_sizes,
+            history_entity_dt=views.history_entity_dt,
+            target_entity_indices=views.target_entity_indices,
+            target_entity_group_ids=views.target_entity_group_ids,
+            target_entity_sizes=views.target_entity_sizes,
+            target_positions=views.target_positions,
+            target_group_ids=views.target_group_ids,
+            target_sizes=views.target_sizes,
+            target_indices=views.target_indices,
+            target_candidate_ids=views.target_candidate_ids,
+            topology=topology,
+        )
+
+    def _prepare_native_flat_batch(
+        self,
+        data: mifrost.BatchEncoding,
+        *,
+        cache: dict | None = None,
+    ) -> _FlatPreparedBatch:
+        """Prepare a native mifrost flat batch for repeated model execution."""
+        x, relation_counts, relation_args, relation_arities, rest = self.unpack_native_flat(data)
+        rest = dict(rest)
+        return self._prepare_from_unpacked(
+            x=x,
+            relation_counts=relation_counts,
+            relation_args=relation_args,
+            relation_arities=relation_arities,
             relation_names=rest.pop("relation_names", None),
             batch=rest.pop("batch", None),
             node_sizes=rest.pop("node_sizes", None),
@@ -342,37 +442,69 @@ class FlatRelationalGNN(PyGFlatModule):
             target_sizes=rest.pop("target_sizes", None),
             target_indices=rest.pop("target_indices", None),
             target_candidate_ids=rest.pop("target_candidate_ids", None),
-        )
-        topology_store = cache.setdefault("topology_store", {}) if cache is not None else None
-        topology = self.relational_layer.get_topology(
-            normalized["relation_counts"],
-            relation_arities=normalized["relation_arities"],
-            cache=topology_store,
-        )
-        return FlatPreparedInputs(
-            x=x,
-            relation_counts=normalized["relation_counts"],
-            relation_args=normalized["relation_args"],
-            relation_arities=normalized["relation_arities"],
-            batch=normalized["batch"],
-            node_sizes=normalized["node_sizes"],
-            object_indices=normalized["object_indices"],
-            object_sizes=normalized["object_sizes"],
-            history_entity_indices=normalized["history_entity_indices"],
-            history_entity_sizes=normalized["history_entity_sizes"],
-            history_entity_dt=normalized["history_entity_dt"],
-            target_entity_indices=normalized["target_entity_indices"],
-            target_entity_group_ids=normalized["target_entity_group_ids"],
-            target_entity_sizes=normalized["target_entity_sizes"],
-            target_positions=normalized["target_positions"],
-            target_group_ids=normalized["target_group_ids"],
-            target_sizes=normalized["target_sizes"],
-            target_indices=normalized["target_indices"],
-            target_candidate_ids=normalized["target_candidate_ids"],
-            topology=topology,
+            cache=cache,
         )
 
-    def _build_outputs(
+    def _prepare_pyg_flat_batch(
+        self,
+        data: pyg.data.Data | pyg.data.Batch,
+        *,
+        cache: dict | None = None,
+    ) -> _FlatPreparedBatch:
+        """Prepare an explicit PyG flat carrier for repeated model execution."""
+        if not (hasattr(data, "relation_counts") and hasattr(data, "relation_args")):
+            raise TypeError("PyG flat inputs must carry relation_counts and relation_args.")
+        x, relation_counts, relation_args, relation_arities, rest = self.unpack(data)
+        rest = dict(rest)
+        return self._prepare_from_unpacked(
+            x=x,
+            relation_counts=relation_counts,
+            relation_args=relation_args,
+            relation_arities=relation_arities,
+            relation_names=rest.pop("relation_names", None),
+            batch=rest.pop("batch", None),
+            node_sizes=rest.pop("node_sizes", None),
+            object_indices=rest.pop("object_indices", None),
+            object_sizes=rest.pop("object_sizes", None),
+            history_entity_indices=rest.pop("history_entity_indices", None),
+            history_entity_sizes=rest.pop("history_entity_sizes", None),
+            history_entity_dt=rest.pop("history_entity_dt", None),
+            target_entity_indices=rest.pop("target_entity_indices", None),
+            target_entity_group_ids=rest.pop("target_entity_group_ids", None),
+            target_entity_sizes=rest.pop("target_entity_sizes", None),
+            target_positions=rest.pop("target_positions", None),
+            target_group_ids=rest.pop("target_group_ids", None),
+            target_sizes=rest.pop("target_sizes", None),
+            target_indices=rest.pop("target_indices", None),
+            target_candidate_ids=rest.pop("target_candidate_ids", None),
+            cache=cache,
+        )
+
+    def initialize_embeddings(self, x: Tensor) -> Tensor:
+        """Create the initial entity embedding table of shape ``[num_nodes, embedding_size]``."""
+        return torch.zeros((int(x.size(0)), self.embedding_size), device=x.device, dtype=x.dtype)
+
+    def _prepare_batch(
+        self,
+        data: FlatBatchInput | _FlatPreparedBatch,
+        cache: dict | None = None,
+    ) -> _FlatPreparedBatch:
+        if getattr(data, "_relm_flat_prepared_batch", False):
+            return data
+        if (
+            isinstance(data, mifrost.BatchEncoding)
+            and hasattr(data, "relation_counts")
+            and hasattr(data, "relation_args")
+        ):
+            return self._prepare_native_flat_batch(data, cache=cache)
+        if isinstance(data, (pyg.data.Data, pyg.data.Batch)):
+            return self._prepare_pyg_flat_batch(data, cache=cache)
+        raise TypeError(
+            "FlatRelationalGNN expects a mifrost flat BatchEncoding or a PyG "
+            "Data/Batch carrying relation_counts and relation_args."
+        )
+
+    def _build_output(
         self,
         entity_embeddings: Tensor,
         batch: Tensor,
@@ -380,125 +512,106 @@ class FlatRelationalGNN(PyGFlatModule):
         object_indices: Tensor | None = None,
         target_entity_indices: Tensor | None = None,
         target_positions: Tensor | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        out = {"entity": entity_embeddings}
-        out_batch = {"entity": batch}
+    ) -> FlatRelationalOutput:
+        # The relational core always produces the full entity table. All other
+        # views are encoder-defined subsets of that same table.
+        object_embeddings = None
+        object_batch = None
         if object_indices is not None:
-            out["object"] = entity_embeddings.index_select(0, object_indices)
-            out_batch["object"] = batch.index_select(0, object_indices)
-        if target_entity_indices is not None:
-            out["target_entity"] = entity_embeddings.index_select(0, target_entity_indices)
-            out_batch["target_entity"] = batch.index_select(0, target_entity_indices)
-        if target_positions is not None:
-            out["target"] = entity_embeddings.index_select(0, target_positions)
-            out_batch["target"] = batch.index_select(0, target_positions)
-        return out, out_batch
+            object_embeddings = entity_embeddings.index_select(0, object_indices)
+            object_batch = batch.index_select(0, object_indices)
 
-    @optional_compile(
-        enable_attr="_compile_forward",
-        backend="inductor",
-        dynamic=True,
-    )
-    def forward_prepared_entity_embeddings(
+        target_entity_embeddings = None
+        target_entity_batch = None
+        if target_entity_indices is not None:
+            target_entity_embeddings = entity_embeddings.index_select(0, target_entity_indices)
+            target_entity_batch = batch.index_select(0, target_entity_indices)
+
+        target_embeddings = None
+        target_batch = None
+        if target_positions is not None:
+            target_embeddings = entity_embeddings.index_select(0, target_positions)
+            target_batch = batch.index_select(0, target_positions)
+
+        return FlatRelationalOutput(
+            entity=entity_embeddings,
+            entity_batch=batch,
+            object=object_embeddings,
+            object_batch=object_batch,
+            target_entity=target_entity_embeddings,
+            target_entity_batch=target_entity_batch,
+            target=target_embeddings,
+            target_batch=target_batch,
+        )
+
+    @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
+    def _compute_entity_embeddings_prepared(
         self,
-        prepared: FlatPreparedInputs,
+        prepared_batch: _FlatPreparedBatch,
         *,
         cache: dict | None = None,
     ) -> Tensor:
+        """Run the recurrent flat relation core and return entity embeddings.
+
+        Input:
+            ``prepared_batch`` with packed relation tensors.
+        Output:
+            ``[num_nodes, embedding_size]`` entity embeddings after all relation
+            layers and updater residuals.
+        """
         layer_cache = cache.setdefault("relational_layer", {}) if cache is not None else {}
-        entity_embeddings = self.initialize_embeddings(prepared.x)
-        for _ in range(self.num_layer):
+        entity_embeddings = self.initialize_embeddings(prepared_batch.x)
+        for _ in range(self.num_layers):
             relation_msgs = self.relational_layer(
                 entity_embeddings,
-                prepared.relation_counts,
-                prepared.relation_args,
-                relation_arities=prepared.relation_arities,
-                topology=prepared.topology,
+                prepared_batch.relation_counts,
+                prepared_batch.relation_args,
+                relation_arities=prepared_batch.relation_arities,
+                topology=prepared_batch.topology,
                 cache=layer_cache,
             )
-            updated = self.embedding_updater(
-                torch.cat([entity_embeddings, relation_msgs], dim=1)
-            )
+            updated = self.embedding_updater(torch.cat([entity_embeddings, relation_msgs], dim=1))
             entity_embeddings = entity_embeddings + updated
         return entity_embeddings
 
-    @optional_compile(
-        enable_attr="_compile_forward",
-        backend="inductor",
-        dynamic=True,
-    )
-    def forward_prepared(
+    @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
+    def _forward_prepared_batch(
         self,
-        prepared: FlatPreparedInputs,
+        prepared_batch: _FlatPreparedBatch,
         *,
         cache: dict | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        entity_embeddings = self.forward_prepared_entity_embeddings(
-            prepared,
-            cache=cache,
-        )
-
-        return self._build_outputs(
+    ) -> FlatRelationalOutput:
+        entity_embeddings = self._compute_entity_embeddings_prepared(prepared_batch, cache=cache)
+        return self._build_output(
             entity_embeddings,
-            prepared.batch,
-            object_indices=prepared.object_indices,
-            target_entity_indices=prepared.target_entity_indices,
-            target_positions=prepared.target_positions,
+            prepared_batch.batch,
+            object_indices=prepared_batch.object_indices,
+            target_entity_indices=prepared_batch.target_entity_indices,
+            target_positions=prepared_batch.target_positions,
         )
 
-    @optional_compile(
-        enable_attr="_compile_forward",
-        backend="inductor",
-        dynamic=True,
-    )
+    @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
+    def compute_entity_embeddings(
+        self,
+        data: FlatBatchInput,
+        cache: dict | None = None,
+    ) -> Tensor:
+        prepared_batch = self._prepare_batch(data, cache=cache)
+        return self._compute_entity_embeddings_prepared(prepared_batch, cache=cache)
+
+    @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
     def forward(
         self,
-        x: Tensor,
-        relation_counts: Tensor,
-        relation_args: Tensor,
-        relation_arities: Tensor | Sequence[int] | None = None,
-        *,
-        relation_names: Sequence[str] | None = None,
-        batch: Tensor | None = None,
-        node_sizes: Tensor | None = None,
-        object_indices: Tensor | Sequence[int] | None = None,
-        object_sizes: Tensor | Sequence[int] | None = None,
-        history_entity_indices: Tensor | Sequence[int] | None = None,
-        history_entity_sizes: Tensor | Sequence[int] | None = None,
-        history_entity_dt: Tensor | Sequence[int] | None = None,
-        target_entity_indices: Tensor | Sequence[int] | None = None,
-        target_entity_group_ids: Tensor | Sequence[int] | None = None,
-        target_entity_sizes: Tensor | Sequence[int] | None = None,
-        target_positions: Tensor | Sequence[int] | None = None,
-        target_group_ids: Tensor | Sequence[int] | None = None,
-        target_sizes: Tensor | Sequence[int] | None = None,
-        target_indices: Tensor | Sequence[int] | None = None,
-        target_candidate_ids: Tensor | Sequence[int] | None = None,
-        relation_sources: Sequence[str] | Tensor | None = None,
+        data: FlatBatchInput,
         cache: dict | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        del relation_sources
-        prepared = self.prepare(
-            x,
-            relation_counts,
-            relation_args,
-            relation_arities,
-            relation_names=relation_names,
-            batch=batch,
-            node_sizes=node_sizes,
-            object_indices=object_indices,
-            object_sizes=object_sizes,
-            history_entity_indices=history_entity_indices,
-            history_entity_sizes=history_entity_sizes,
-            history_entity_dt=history_entity_dt,
-            target_entity_indices=target_entity_indices,
-            target_entity_group_ids=target_entity_group_ids,
-            target_entity_sizes=target_entity_sizes,
-            target_positions=target_positions,
-            target_group_ids=target_group_ids,
-            target_sizes=target_sizes,
-            target_indices=target_indices,
-            target_candidate_ids=target_candidate_ids,
-            cache=cache,
-        )
-        return self.forward_prepared(prepared)
+    ) -> FlatRelationalOutput:
+        prepared_batch = self._prepare_batch(data, cache=cache)
+        return self._forward_prepared_batch(prepared_batch, cache=cache)
+
+
+__all__ = [
+    "FlatRelationalGNN",
+    "FlatRelationalOutput",
+    "FlatExecutionPolicy",
+    "FlatBatchInput",
+]

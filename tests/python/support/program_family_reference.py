@@ -171,10 +171,3 @@ def execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference
     stage2 = (torch.bmm(torch.nn.functional.silu(pre2), w21_stack.transpose(1, 2)) + b21_stack.unsqueeze(1)) * mask_f
     out_rows = x_rows + stage2
     return _scatter_padded_group_rows(out_rows, row_sizes_long, safe_idx, out_rows=int(packed_rows.size(0)))
-
-
-__all__ = [
-    "execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference",
-    "execute_program_two_layer_silu_then_two_layer_silu_reference",
-    "execute_program_two_layer_silu_then_postnorm_two_layer_silu_reference",
-]

@@ -1,11 +1,14 @@
-"""Relational GNN models and message passing modules."""
+"""Relational GNN models and flat relation building blocks."""
 
-from .grouped_mlp import GroupedMLPCompatible, GroupedMLPSpec
-from .flat_relational_gnn import FlatPreparedInputs, FlatRelationalGNN
+from .flat_contract import FlatBatchInput, FlatExecutionPolicy, FlatRelationalOutput
+from .flat_relational_gnn import FlatRelationalGNN
+from .flat_relational_layer import FlatRelationKernel
 from .mlp import ArityMLPFactory
-from .relation_mlp_stacks import (
+from .relation_block_spec import RelationBlockCompatible, RelationBlockSpec
+from .relation_blocks import (
     PostNormTwoLayerPointwiseRelationMLP,
     PreNormTwoLayerPointwiseRelationMLP,
+    RelationProgram,
     ThreeLayerPointwiseRelationMLP,
     TwoLayerPointwiseRelationMLP,
 )
@@ -18,10 +21,14 @@ from .relational_gnn import (
 
 __all__ = [
     "ArityMLPFactory",
-    "GroupedMLPSpec",
-    "GroupedMLPCompatible",
-    "FlatPreparedInputs",
+    "FlatExecutionPolicy",
+    "FlatBatchInput",
+    "FlatRelationKernel",
     "FlatRelationalGNN",
+    "FlatRelationalOutput",
+    "RelationBlockCompatible",
+    "RelationBlockSpec",
+    "RelationProgram",
     "TwoLayerPointwiseRelationMLP",
     "PreNormTwoLayerPointwiseRelationMLP",
     "PostNormTwoLayerPointwiseRelationMLP",

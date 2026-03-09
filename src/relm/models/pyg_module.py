@@ -9,12 +9,10 @@ from torch.nn import Module
 from torch_geometric.data import Batch, Data, HeteroData
 from torch_geometric.typing import Adj
 
+from .flat_contract import FlatBatchInput
 from .mixins import DeviceAwareMixin
 
-try:  # pragma: no cover - optional runtime dependency
-    import mifrost  # type: ignore
-except Exception:  # pragma: no cover - keep module importable without mifrost
-    mifrost = None  # type: ignore
+import mifrost  # type: ignore
 
 
 class PyGModule(DeviceAwareMixin, Module, ABC):
@@ -38,15 +36,11 @@ class PyGModule(DeviceAwareMixin, Module, ABC):
             return super().__call__(x, edge_index, batch, *args[3:], **kwargs)
         if isinstance(data, (Data, Batch)):
             return super().__call__(*self.unpack(data), *args[1:], **kwargs)
-        if mifrost is not None and isinstance(
-            data, (mifrost.BatchEncoding, mifrost.HomoBatchEncodingView)
-        ):
+        if isinstance(data, (mifrost.BatchEncoding, mifrost.HomoBatchEncodingView)):
             return super().__call__(*self.unpack_native(data), *args[1:], **kwargs)
         raise NotImplementedError(f"Invalid input type {type(data)!r} for '__call__'")
 
     def unpack_native(self, data):
-        if mifrost is None:
-            raise RuntimeError("mifrost is not available.")
         if isinstance(data, mifrost.BatchEncoding):
             data = data.as_homo()
         return (
@@ -87,15 +81,11 @@ class PyGHeteroModule(DeviceAwareMixin, Module, ABC):
             )
         if isinstance(data, Batch):
             return super().__call__(*self.unpack(data), *args[1:], **kwargs)
-        if mifrost is not None and isinstance(
-            data, (mifrost.BatchEncoding, mifrost.HeteroBatchEncodingView)
-        ):
+        if isinstance(data, (mifrost.BatchEncoding, mifrost.HeteroBatchEncodingView)):
             return super().__call__(*self.unpack_native(data), *args[1:], **kwargs)
         raise NotImplementedError(f"Invalid input type {type(data)!r} for '__call__'")
 
     def unpack_native(self, data):
-        if mifrost is None:
-            raise RuntimeError("mifrost is not available.")
         if isinstance(data, mifrost.BatchEncoding):
             data = data.as_hetero()
         data = data.to(self.device)
@@ -115,79 +105,37 @@ class PyGHeteroModule(DeviceAwareMixin, Module, ABC):
 
 class PyGFlatModule(DeviceAwareMixin, Module, ABC):
     @abstractmethod
-    def forward(
-        self,
-        x: Tensor,
-        relation_counts: Tensor,
-        relation_args: Tensor,
-        relation_arities: Tensor | None = None,
-        **kwargs,
-    ): ...
+    def forward(self, data: FlatBatchInput, **kwargs): ...
 
     def __call__(self, *args, **kwargs):
         if not args:
             raise NotImplementedError("No input for '__call__'")
         data = args[0]
-        if getattr(data, "_relm_flat_prepared", False):
-            forward_prepared = getattr(self, "forward_prepared", None)
+        if getattr(data, "_relm_flat_prepared_batch", False):
+            forward_prepared = getattr(self, "_forward_prepared_batch", None)
             if not callable(forward_prepared):
                 raise NotImplementedError(
-                    f"{type(self)!r} does not implement 'forward_prepared' for prepared flat inputs."
+                    f"{type(self)!r} does not implement internal prepared flat-batch dispatch."
                 )
             return forward_prepared(data, *args[1:], **kwargs)
-        if torch.is_tensor(data):
-            relation_counts = args[1] if len(args) > 1 else kwargs.pop("relation_counts")
-            relation_args = args[2] if len(args) > 2 else kwargs.pop("relation_args")
-            relation_arities = (
-                args[3] if len(args) > 3 else kwargs.pop("relation_arities", None)
-            )
-            return super().__call__(
-                data, relation_counts, relation_args, relation_arities, *args[4:], **kwargs
-            )
-        if isinstance(data, dict):
-            x = data["x"]
-            relation_counts = data["relation_counts"]
-            relation_args = data["relation_args"]
-            relation_arities = data.get("relation_arities", kwargs.pop("relation_arities", None))
-            rest = {
-                key: value
-                for key, value in data.items()
-                if key not in {"x", "relation_counts", "relation_args", "relation_arities"}
-            }
-            rest.update(kwargs)
-            return super().__call__(
-                x, relation_counts, relation_args, relation_arities, *args[1:], **rest
-            )
         if isinstance(data, (Data, Batch)) and hasattr(data, "relation_counts") and hasattr(data, "relation_args"):
-            unpacked = self.unpack(data)
-            extras = unpacked[-1]
-            return super().__call__(*unpacked[:-1], *args[1:], **(extras | kwargs))
+            return super().__call__(data, *args[1:], **kwargs)
         if (
-            mifrost is not None
-            and isinstance(data, mifrost.BatchEncoding)
+            isinstance(data, mifrost.BatchEncoding)
             and hasattr(data, "relation_counts")
             and hasattr(data, "relation_args")
         ):
-            unpacked = self.unpack_native_flat(data)
-            extras = unpacked[-1]
-            return super().__call__(*unpacked[:-1], *args[1:], **(extras | kwargs))
-        if (
-            hasattr(data, "x")
-            and hasattr(data, "relation_counts")
-            and hasattr(data, "relation_args")
-        ):
-            unpacked = self.unpack_attr(data)
-            extras = unpacked[-1]
-            return super().__call__(*unpacked[:-1], *args[1:], **(extras | kwargs))
-        raise NotImplementedError(f"Invalid input type {type(data)!r} for '__call__'")
+            return super().__call__(data, *args[1:], **kwargs)
+        raise TypeError(
+            "Flat relational models accept only mifrost flat BatchEncoding inputs "
+            "or PyG Data/Batch objects with relation_counts and relation_args."
+        )
 
     @classmethod
     def unpack(cls, data: Data | Batch):
-        return cls.unpack_attr(data)
+        return cls.unpack_pyg_flat(data)
 
     def unpack_native_flat(self, data):
-        if mifrost is None:
-            raise RuntimeError("mifrost is not available.")
         if isinstance(data, mifrost.BatchEncoding):
             data = data.to(self.device)
 
@@ -233,7 +181,7 @@ class PyGFlatModule(DeviceAwareMixin, Module, ABC):
         return x, relation_counts, relation_args, relation_arities, extras
 
     @classmethod
-    def unpack_attr(cls, data):
+    def unpack_pyg_flat(cls, data: Data | Batch):
         extras = {}
         for key in (
             "relation_names",

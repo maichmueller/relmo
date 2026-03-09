@@ -22,8 +22,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import torch
+from torch_geometric.data import Data
 
-from relm.models import ArityMLPFactory, FlatRelationalGNN
+from relm.models import ArityMLPFactory, FlatExecutionPolicy, FlatRelationalGNN
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,8 @@ def _zero_grad(model: torch.nn.Module) -> None:
 def _loss_from_output(output: Any) -> torch.Tensor:
     if isinstance(output, tuple):
         output = output[0]
+    if hasattr(output, "entity") and torch.is_tensor(getattr(output, "entity")):
+        return output.entity.square().mean()
     if isinstance(output, dict):
         if not output:
             raise RuntimeError("Expected non-empty dict output for benchmark loss.")
@@ -584,6 +587,20 @@ def _append_zero_count_relations_to_flat_payload(
     return out
 
 
+def _flat_payload_to_pyg_data(payload: dict[str, Any]) -> Data:
+    data = Data(
+        x=payload["x"],
+        relation_counts=payload["relation_counts"],
+        relation_args=payload["relation_args"],
+        relation_arities=payload.get("relation_arities"),
+    )
+    for key, value in payload.items():
+        if key in {"x", "relation_counts", "relation_args", "relation_arities"}:
+            continue
+        setattr(data, key, value)
+    return data
+
+
 def _make_pymimir_model(
     *,
     domain: Any,
@@ -973,8 +990,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--domain-case", default="blocks")
     parser.add_argument("--problem-case", default="probBLOCKS-4-0")
     parser.add_argument("--max-states", type=int, default=16)
-    parser.add_argument("--relm-fused-two-layer-mish", type=int, default=None)
-    parser.add_argument("--relm-fused-relation-gather", type=int, default=None)
+    parser.add_argument("--relm-relation-kernels", choices=("auto", "off"), default="auto")
+    parser.add_argument("--relm-program-kernels", choices=("auto", "off"), default="auto")
+    parser.add_argument("--relm-relation-gather", choices=("auto", "off", "on"), default="auto")
     parser.add_argument("--relm-mlp-layers", type=int, default=1)
     parser.add_argument(
         "--encoder-mode",
@@ -1189,43 +1207,30 @@ def main() -> int:
         layers=int(args.relm_mlp_layers),
         activation="mish",
     )
+    execution_policy = FlatExecutionPolicy(
+        relation_kernels=args.relm_relation_kernels,
+        program_kernels=args.relm_program_kernels,
+        relation_gather=args.relm_relation_gather,
+    )
     relm_eager = FlatRelationalGNN(
         embedding_size=int(args.embedding_size),
-        num_layer=int(args.num_layers),
-        aggr=args.aggr,
-        relation_dict=relation_dict,
+        num_layers=int(args.num_layers),
+        aggregation=args.aggr,
+        relations=relation_dict,
         relation_module_factory=relation_factory,
+        execution_policy=execution_policy,
         compile_forward=False,
-        fused_two_layer_mish_execution=(
-            None
-            if args.relm_fused_two_layer_mish is None
-            else bool(int(args.relm_fused_two_layer_mish))
-        ),
-        fused_relation_gather=(
-            None
-            if args.relm_fused_relation_gather is None
-            else bool(int(args.relm_fused_relation_gather))
-        ),
     ).to(device)
     relm_compile = None
     if args.include_compile_lane:
         relm_compile = FlatRelationalGNN(
             embedding_size=int(args.embedding_size),
-            num_layer=int(args.num_layers),
-            aggr=args.aggr,
-            relation_dict=relation_dict,
+            num_layers=int(args.num_layers),
+            aggregation=args.aggr,
+            relations=relation_dict,
             relation_module_factory=relation_factory,
+            execution_policy=execution_policy,
             compile_forward=True,
-            fused_two_layer_mish_execution=(
-                None
-                if args.relm_fused_two_layer_mish is None
-                else bool(int(args.relm_fused_two_layer_mish))
-            ),
-            fused_relation_gather=(
-                None
-                if args.relm_fused_relation_gather is None
-                else bool(int(args.relm_fused_relation_gather))
-            ),
         ).to(device)
     relm_linear_shapes = _extract_relm_relation_linear_shapes(relm_eager)
     pymimir_linear_shapes = _extract_pymimir_relation_linear_shapes(pymimir_model)
@@ -1265,18 +1270,19 @@ def main() -> int:
             f"{relation_count_mismatches}"
         )
 
-    relm_prepared = relm_eager.prepare(relm_flat_payload)
-    relm_prepared_compile = relm_compile.prepare(relm_flat_payload) if relm_compile is not None else None
+    relm_flat_data = _flat_payload_to_pyg_data(relm_flat_payload)
+    relm_prepared = relm_eager._prepare_batch(relm_flat_data)
+    relm_prepared_compile = relm_compile._prepare_batch(relm_flat_data) if relm_compile is not None else None
 
     def relm_compute() -> Any:
-        return relm_eager.forward_prepared_entity_embeddings(relm_prepared)
+        return relm_eager._compute_entity_embeddings_prepared(relm_prepared)
 
     def relm_compute_compile() -> Any:
         if relm_compile is None:
             raise RuntimeError("Compile lane disabled.")
         if relm_prepared_compile is None:
             raise RuntimeError("Compile prepared inputs missing.")
-        return relm_compile.forward_prepared_entity_embeddings(relm_prepared_compile)
+        return relm_compile._compute_entity_embeddings_prepared(relm_prepared_compile)
 
     def relm_full() -> Any:
         if args.encoder_mode == "shared_pymimir":
@@ -1304,8 +1310,7 @@ def main() -> int:
                 payload=payload,
                 extra_relations=relm_native_zero_pad_relations,
             )
-        prepared = relm_eager.prepare(payload)
-        return relm_eager.forward_prepared_entity_embeddings(prepared)
+        return relm_eager.compute_entity_embeddings(_flat_payload_to_pyg_data(payload))
 
     def relm_full_compile() -> Any:
         if relm_compile is None:
@@ -1335,8 +1340,7 @@ def main() -> int:
                 payload=payload,
                 extra_relations=relm_native_zero_pad_relations,
             )
-        prepared = relm_compile.prepare(payload)
-        return relm_compile.forward_prepared_entity_embeddings(prepared)
+        return relm_compile.compute_entity_embeddings(_flat_payload_to_pyg_data(payload))
 
     def pymimir_compute() -> Any:
         return pymimir_model._mpnn_module.forward(pymimir_encoded)
@@ -1451,8 +1455,9 @@ def main() -> int:
             "strict_parity": bool(args.strict_parity),
             "include_goal": bool(args.include_goal),
             "relm_mlp_layers": int(args.relm_mlp_layers),
-            "relm_fused_two_layer_mish": args.relm_fused_two_layer_mish,
-            "relm_fused_relation_gather": args.relm_fused_relation_gather,
+            "relm_relation_kernels": args.relm_relation_kernels,
+            "relm_program_kernels": args.relm_program_kernels,
+            "relm_relation_gather": args.relm_relation_gather,
             "warmup": int(args.warmup),
             "rounds": int(args.rounds),
             "pymimir_normalize_updates": bool(args.pymimir_normalize_updates),
