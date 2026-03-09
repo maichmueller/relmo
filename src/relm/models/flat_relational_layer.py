@@ -1053,6 +1053,23 @@ class FlatRelationalLayer(torch.nn.Module):
                 output_dim=int(expected_dim),
                 block_specs=(stage0.spec, stage1.spec),
             )
+        if (
+            stage0.spec.family == "prenorm_two_layer_silu_rmsnorm"
+            and stage1.spec.family == "two_layer_silu"
+        ):
+            return ProgramFamilySpec(
+                family="program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu",
+                signature=(
+                    stage0.spec.family,
+                    stage0.spec.signature,
+                    stage1.spec.family,
+                    stage1.spec.signature,
+                ),
+                arity=int(relation_slice.arity),
+                input_dim=int(expected_dim),
+                output_dim=int(expected_dim),
+                block_specs=(stage0.spec, stage1.spec),
+            )
         return None
 
     def _match_fused_relation(
@@ -2005,6 +2022,102 @@ class FlatRelationalLayer(torch.nn.Module):
                     ln_weight_stack,
                     ln_bias_stack,
                     float(ln_eps),
+                )
+            if all(
+                item[1].program_family is not None
+                and item[1].program_family.family
+                == "program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu"
+                for item in batch_items
+            ):
+                norm_signature = stage0_matches[0].spec.signature[5]
+                if norm_signature is None or str(norm_signature[0]) != "rmsnorm":
+                    return None
+                if any(match.spec.signature[5] != norm_signature for match in stage0_matches[1:]):
+                    return None
+                rms_eps = float(norm_signature[2] if norm_signature[2] is not None else 1e-5)
+                program_key = (
+                    "manual_program",
+                    grouped_batch.family,
+                    grouped_batch.arity,
+                    grouped_batch.signature,
+                )
+                if stage0_matches[0].norm_modules[0].weight is not None:
+                    rms_weight_stack = self._get_grouped_param_stack(
+                        cache_key=("rms_weight", program_key),
+                        tensors=[
+                            cast(Tensor, match.norm_modules[0].weight)
+                            for match in stage0_matches
+                            if match.norm_modules[0].weight is not None
+                        ],
+                        forward_cache=grouped_param_stacks,
+                        allow_persistent=allow_persistent_stacks,
+                    )
+                else:
+                    rms_weight_stack = stage0_matches[0].linears[1].weight.new_empty((0,))
+                w10_stack = self._get_grouped_param_stack(
+                    cache_key=("w10", program_key),
+                    tensors=[match.linears[0].weight for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b10_stack = self._get_grouped_param_stack(
+                    cache_key=("b10", program_key),
+                    tensors=[cast(Tensor, match.linears[0].bias) for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                w20_stack = self._get_grouped_param_stack(
+                    cache_key=("w20", program_key),
+                    tensors=[match.linears[1].weight for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b20_stack = self._get_grouped_param_stack(
+                    cache_key=("b20", program_key),
+                    tensors=[cast(Tensor, match.linears[1].bias) for match in stage0_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                w11_stack = self._get_grouped_param_stack(
+                    cache_key=("w11", program_key),
+                    tensors=[match.linears[0].weight for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b11_stack = self._get_grouped_param_stack(
+                    cache_key=("b11", program_key),
+                    tensors=[cast(Tensor, match.linears[0].bias) for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                w21_stack = self._get_grouped_param_stack(
+                    cache_key=("w21", program_key),
+                    tensors=[match.linears[1].weight for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                b21_stack = self._get_grouped_param_stack(
+                    cache_key=("b21", program_key),
+                    tensors=[cast(Tensor, match.linears[1].bias) for match in stage1_matches],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+                return relm_mp_ops.fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
+                    x,
+                    relation_args,
+                    slot_offsets_global,
+                    row_sizes,
+                    int(grouped_batch.arity),
+                    rms_weight_stack,
+                    float(rms_eps),
+                    w10_stack,
+                    b10_stack,
+                    w20_stack,
+                    b20_stack,
+                    w11_stack,
+                    b11_stack,
+                    w21_stack,
+                    b21_stack,
                 )
 
         current_x = x

@@ -20,6 +20,7 @@ from relm.models import flat_relational_layer as flat_relational_layer_module
 from relm.models.flat_relational_layer import build_flat_topology
 from relm.models.grouped_mlp import GroupedMLPSpec
 from relm.models.program_family_reference import (
+    execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference,
     execute_program_two_layer_silu_then_postnorm_two_layer_silu_reference,
     execute_program_two_layer_silu_then_two_layer_silu_reference,
 )
@@ -577,6 +578,29 @@ def test_flat_relational_layer_matches_staged_two_layer_silu_then_postnorm_progr
     assert match.program_family.family == "program_two_layer_silu_then_postnorm_two_layer_silu"
 
 
+def test_flat_relational_layer_matches_staged_prenorm_rmsnorm_then_two_layer_silu_program() -> None:
+    model, relation_slice = _make_family_model(
+        torch.nn.Sequential(
+            PreNormTwoLayerPointwiseRelationMLP(8, 16, activation="silu", norm="rmsnorm"),
+            TwoLayerPointwiseRelationMLP(8, 12, activation="silu"),
+        ),
+        embedding_size=4,
+        arity=2,
+    )
+    match = model.relational_layer._match_fused_relation(relation_slice)
+    assert match is not None
+    assert match.spec.family == "program"
+    assert tuple(stage.spec.family for stage in match.program_matches) == (
+        "prenorm_two_layer_silu_rmsnorm",
+        "two_layer_silu",
+    )
+    assert match.program_family is not None
+    assert (
+        match.program_family.family
+        == "program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu"
+    )
+
+
 def test_flat_relational_layer_non_exact_program_has_no_manual_program_family() -> None:
     model, relation_slice = _make_family_model(
         torch.nn.Sequential(
@@ -593,6 +617,8 @@ def test_flat_relational_layer_non_exact_program_has_no_manual_program_family() 
 
 
 def test_manual_program_reference_matches_loop_reference_forward_and_gradients() -> None:
+    dtype = torch.float64
+
     def loop_reference(
         packed_rows: torch.Tensor,
         row_sizes: torch.Tensor,
@@ -625,18 +651,18 @@ def test_manual_program_reference_matches_loop_reference_forward_and_gradients()
         return out
 
     torch.manual_seed(0)
-    packed_rows = torch.randn(7, 8, requires_grad=True)
+    packed_rows = torch.randn(7, 8, dtype=dtype, requires_grad=True)
     packed_rows_ref = packed_rows.detach().clone().requires_grad_(True)
     row_sizes = torch.tensor([2, 3, 2], dtype=torch.long)
     params = [
-        torch.randn(3, 16, 8, requires_grad=True),
-        torch.randn(3, 16, requires_grad=True),
-        torch.randn(3, 8, 16, requires_grad=True),
-        torch.randn(3, 8, requires_grad=True),
-        torch.randn(3, 12, 8, requires_grad=True),
-        torch.randn(3, 12, requires_grad=True),
-        torch.randn(3, 8, 12, requires_grad=True),
-        torch.randn(3, 8, requires_grad=True),
+        torch.randn(3, 16, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 16, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, 16, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 12, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 12, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, 12, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
     ]
     params_ref = [param.detach().clone().requires_grad_(True) for param in params]
 
@@ -661,6 +687,8 @@ def test_manual_program_reference_matches_loop_reference_forward_and_gradients()
 
 
 def test_manual_postnorm_program_reference_matches_loop_reference_forward_and_gradients() -> None:
+    dtype = torch.float64
+
     def loop_reference(
         packed_rows: torch.Tensor,
         row_sizes: torch.Tensor,
@@ -703,20 +731,20 @@ def test_manual_postnorm_program_reference_matches_loop_reference_forward_and_gr
         return out
 
     torch.manual_seed(0)
-    packed_rows = torch.randn(7, 8, requires_grad=True)
+    packed_rows = torch.randn(7, 8, dtype=dtype, requires_grad=True)
     packed_rows_ref = packed_rows.detach().clone().requires_grad_(True)
     row_sizes = torch.tensor([2, 3, 2], dtype=torch.long)
     params = [
-        torch.randn(3, 16, 8, requires_grad=True),
-        torch.randn(3, 16, requires_grad=True),
-        torch.randn(3, 8, 16, requires_grad=True),
-        torch.randn(3, 8, requires_grad=True),
-        torch.randn(3, 12, 8, requires_grad=True),
-        torch.randn(3, 12, requires_grad=True),
-        torch.randn(3, 8, 12, requires_grad=True),
-        torch.randn(3, 8, requires_grad=True),
-        torch.randn(3, 8, requires_grad=True),
-        torch.randn(3, 8, requires_grad=True),
+        torch.randn(3, 16, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 16, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, 16, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 12, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 12, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, 12, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
     ]
     params_ref = [param.detach().clone().requires_grad_(True) for param in params]
     ln_eps = 1e-5
@@ -732,6 +760,87 @@ def test_manual_postnorm_program_reference_matches_loop_reference_forward_and_gr
         row_sizes,
         *params_ref,
         ln_eps,
+    )
+
+    assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5)
+
+    out.square().sum().backward()
+    ref.square().sum().backward()
+    assert torch.allclose(packed_rows.grad, packed_rows_ref.grad, atol=1e-4, rtol=1e-4)
+    for param, param_ref in zip(params, params_ref):
+        assert torch.allclose(param.grad, param_ref.grad, atol=1e-4, rtol=1e-4)
+
+
+def test_manual_prenorm_rmsnorm_program_reference_matches_loop_reference_forward_and_gradients() -> None:
+    dtype = torch.float64
+
+    def loop_reference(
+        packed_rows: torch.Tensor,
+        row_sizes: torch.Tensor,
+        rms_weight_stack: torch.Tensor,
+        rms_eps: float,
+        w10_stack: torch.Tensor,
+        b10_stack: torch.Tensor,
+        w20_stack: torch.Tensor,
+        b20_stack: torch.Tensor,
+        w11_stack: torch.Tensor,
+        b11_stack: torch.Tensor,
+        w21_stack: torch.Tensor,
+        b21_stack: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.empty_like(packed_rows)
+        cursor = 0
+        for gid, row_size_t in enumerate(row_sizes):
+            row_count = int(row_size_t.item())
+            rows = packed_rows[cursor : cursor + row_count]
+            sq_mean = rows.square().mean(dim=-1, keepdim=True)
+            normed = rows * torch.rsqrt(sq_mean + float(rms_eps))
+            normed = normed * rms_weight_stack[gid].unsqueeze(0)
+            stage1 = torch.nn.functional.linear(
+                torch.nn.functional.silu(torch.nn.functional.linear(normed, w10_stack[gid], b10_stack[gid])),
+                w20_stack[gid],
+                b20_stack[gid],
+            )
+            stage2 = torch.nn.functional.linear(
+                torch.nn.functional.silu(torch.nn.functional.linear(stage1, w11_stack[gid], b11_stack[gid])),
+                w21_stack[gid],
+                b21_stack[gid],
+            )
+            out[cursor : cursor + row_count] = rows + stage2
+            cursor += row_count
+        return out
+
+    torch.manual_seed(0)
+    packed_rows = torch.randn(7, 8, dtype=dtype, requires_grad=True)
+    packed_rows_ref = packed_rows.detach().clone().requires_grad_(True)
+    row_sizes = torch.tensor([2, 3, 2], dtype=torch.long)
+    params = [
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 16, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 16, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, 16, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 12, 8, dtype=dtype, requires_grad=True),
+        torch.randn(3, 12, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, 12, dtype=dtype, requires_grad=True),
+        torch.randn(3, 8, dtype=dtype, requires_grad=True),
+    ]
+    params_ref = [param.detach().clone().requires_grad_(True) for param in params]
+    rms_eps = 1e-5
+
+    out = execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference(
+        packed_rows,
+        row_sizes,
+        params[0],
+        rms_eps,
+        *params[1:],
+    )
+    ref = loop_reference(
+        packed_rows_ref,
+        row_sizes,
+        params_ref[0],
+        rms_eps,
+        *params_ref[1:],
     )
 
     assert torch.allclose(out, ref, atol=1e-6, rtol=1e-5)
@@ -808,6 +917,82 @@ def test_flat_relational_layer_fused_staged_two_layer_silu_then_postnorm_program
         torch.nn.Sequential(
             TwoLayerPointwiseRelationMLP(4, 12, activation="silu"),
             PostNormTwoLayerPointwiseRelationMLP(4, 10, activation="silu", norm="layernorm"),
+        ),
+    ]
+    _replace_relation_modules(model, modules)
+    _replace_relation_modules(ref_model, copy.deepcopy(modules))
+
+    x = torch.randn(6, 4, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    relation_counts = torch.tensor([[2, 2, 1]], dtype=torch.long)
+    relation_args = torch.tensor([0, 1, 2, 3, 4, 5, 0, 1, 2], dtype=torch.long)
+    relation_arities = torch.tensor([2, 2, 1], dtype=torch.long)
+
+    topology = model.relational_layer.get_topology(relation_counts, relation_arities)
+    out = model.relational_layer(
+        x,
+        relation_counts,
+        relation_args,
+        relation_arities=relation_arities,
+        topology=topology,
+        cache={},
+    )
+    ref = ref_model.relational_layer(
+        x_ref,
+        relation_counts,
+        relation_args,
+        relation_arities=relation_arities,
+        topology=topology,
+        cache={},
+    )
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
+
+    loss = out.square().sum()
+    loss_ref = ref.square().sum()
+    loss.backward()
+    loss_ref.backward()
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    for (_, param), (_, param_ref) in zip(
+        model.relational_layer.named_parameters(),
+        ref_model.relational_layer.named_parameters(),
+    ):
+        if param.grad is None or param_ref.grad is None:
+            continue
+        assert torch.allclose(param.grad, param_ref.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_flat_relational_layer_fused_staged_prenorm_rmsnorm_then_two_layer_silu_program_matches_direct() -> None:
+    relation_dict = {"rel_a": 2, "rel_b": 2, "rel_c": 1}
+    torch.manual_seed(0)
+    model = FlatRelationalGNN(
+        embedding_size=4,
+        num_layer=1,
+        aggr="sum",
+        relation_dict=relation_dict,
+        fused_two_layer_pointwise_execution=True,
+        fused_relation_gather=False,
+    )
+    torch.manual_seed(0)
+    ref_model = FlatRelationalGNN(
+        embedding_size=4,
+        num_layer=1,
+        aggr="sum",
+        relation_dict=relation_dict,
+        fused_two_layer_pointwise_execution=False,
+        fused_relation_gather=False,
+    )
+    modules = [
+        torch.nn.Sequential(
+            PreNormTwoLayerPointwiseRelationMLP(8, 16, activation="silu", norm="rmsnorm"),
+            TwoLayerPointwiseRelationMLP(8, 12, activation="silu"),
+        ),
+        torch.nn.Sequential(
+            PreNormTwoLayerPointwiseRelationMLP(8, 16, activation="silu", norm="rmsnorm"),
+            TwoLayerPointwiseRelationMLP(8, 12, activation="silu"),
+        ),
+        torch.nn.Sequential(
+            PreNormTwoLayerPointwiseRelationMLP(4, 12, activation="silu", norm="rmsnorm"),
+            TwoLayerPointwiseRelationMLP(4, 10, activation="silu"),
         ),
     ]
     _replace_relation_modules(model, modules)
@@ -1889,6 +2074,86 @@ def test_flat_relational_layer_fused_staged_two_layer_silu_then_postnorm_program
         torch.nn.Sequential(
             TwoLayerPointwiseRelationMLP(4, 12, activation="silu"),
             PostNormTwoLayerPointwiseRelationMLP(4, 10, activation="silu", norm="layernorm"),
+        ).cuda(),
+    ]
+    _replace_relation_modules(model, modules)
+    _replace_relation_modules(ref_model, copy.deepcopy(modules))
+
+    x = torch.randn(6, 4, device="cuda", requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    relation_counts = torch.tensor([[2, 2, 1]], dtype=torch.long, device="cuda")
+    relation_args = torch.tensor([0, 1, 2, 3, 4, 5, 0, 1, 2], dtype=torch.long, device="cuda")
+    relation_arities = torch.tensor([2, 2, 1], dtype=torch.long, device="cuda")
+
+    topology = model.relational_layer.get_topology(relation_counts, relation_arities)
+    out = model.relational_layer(
+        x,
+        relation_counts,
+        relation_args,
+        relation_arities=relation_arities,
+        topology=topology,
+        cache={},
+    )
+    ref = ref_model.relational_layer(
+        x_ref,
+        relation_counts,
+        relation_args,
+        relation_arities=relation_arities,
+        topology=topology,
+        cache={},
+    )
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
+
+    loss = out.square().sum()
+    loss_ref = ref.square().sum()
+    loss.backward()
+    loss_ref.backward()
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    for (_, param), (_, param_ref) in zip(
+        model.relational_layer.named_parameters(),
+        ref_model.relational_layer.named_parameters(),
+    ):
+        if param.grad is None or param_ref.grad is None:
+            continue
+        assert torch.allclose(param.grad, param_ref.grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flat_relational_layer_fused_staged_prenorm_rmsnorm_then_two_layer_silu_program_cuda_custom_backward_matches_direct() -> None:
+    if not relm_mp_module.available():
+        pytest.skip("Custom mp ops are unavailable.")
+
+    relation_dict = {"rel_a": 2, "rel_b": 2, "rel_c": 1}
+    torch.manual_seed(0)
+    model = FlatRelationalGNN(
+        embedding_size=4,
+        num_layer=1,
+        aggr="sum",
+        relation_dict=relation_dict,
+        fused_two_layer_pointwise_execution=True,
+        fused_relation_gather=False,
+    ).cuda()
+    torch.manual_seed(0)
+    ref_model = FlatRelationalGNN(
+        embedding_size=4,
+        num_layer=1,
+        aggr="sum",
+        relation_dict=relation_dict,
+        fused_two_layer_pointwise_execution=False,
+        fused_relation_gather=False,
+    ).cuda()
+    modules = [
+        torch.nn.Sequential(
+            PreNormTwoLayerPointwiseRelationMLP(8, 16, activation="silu", norm="rmsnorm"),
+            TwoLayerPointwiseRelationMLP(8, 12, activation="silu"),
+        ).cuda(),
+        torch.nn.Sequential(
+            PreNormTwoLayerPointwiseRelationMLP(8, 16, activation="silu", norm="rmsnorm"),
+            TwoLayerPointwiseRelationMLP(8, 12, activation="silu"),
+        ).cuda(),
+        torch.nn.Sequential(
+            PreNormTwoLayerPointwiseRelationMLP(4, 12, activation="silu", norm="rmsnorm"),
+            TwoLayerPointwiseRelationMLP(4, 10, activation="silu"),
         ).cuda(),
     ]
     _replace_relation_modules(model, modules)

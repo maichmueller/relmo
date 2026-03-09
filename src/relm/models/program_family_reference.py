@@ -129,7 +129,52 @@ def execute_program_two_layer_silu_then_postnorm_two_layer_silu_reference(
     return _scatter_padded_group_rows(out_rows, row_sizes_long, safe_idx, out_rows=int(packed_rows.size(0)))
 
 
+def execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference(
+    packed_rows: torch.Tensor,
+    row_sizes: torch.Tensor,
+    rms_weight_stack: torch.Tensor,
+    rms_eps: float,
+    w10_stack: torch.Tensor,
+    b10_stack: torch.Tensor,
+    w20_stack: torch.Tensor,
+    b20_stack: torch.Tensor,
+    w11_stack: torch.Tensor,
+    b11_stack: torch.Tensor,
+    w21_stack: torch.Tensor,
+    b21_stack: torch.Tensor,
+) -> torch.Tensor:
+    x_rows, safe_idx = _gather_padded_group_rows(packed_rows, row_sizes)
+    if int(x_rows.numel()) == 0:
+        return torch.empty_like(packed_rows)
+
+    row_sizes_long = row_sizes.to(device=packed_rows.device, dtype=torch.long)
+    base = torch.arange(int(x_rows.size(1)), device=packed_rows.device, dtype=torch.long).unsqueeze(0)
+    mask = base < row_sizes_long.unsqueeze(1)
+    mask_f = mask.unsqueeze(-1).to(dtype=packed_rows.dtype)
+
+    x_rows = x_rows * mask_f
+    dims = tuple(int(v) for v in x_rows.shape)
+    norm_chunks: list[torch.Tensor] = []
+    for gid in range(int(x_rows.size(0))):
+        rows = x_rows[gid]
+        rms_weight = rms_weight_stack[gid] if int(rms_weight_stack.numel()) > 0 else None
+        sq_mean = rows.square().mean(dim=-1, keepdim=True)
+        normed = rows * torch.rsqrt(sq_mean + float(rms_eps))
+        if rms_weight is not None:
+            normed = normed * rms_weight.unsqueeze(0)
+        norm_chunks.append(normed)
+    norm_rows = (torch.stack(norm_chunks, dim=0) if norm_chunks else x_rows.new_empty(dims)) * mask_f
+
+    pre1 = (torch.bmm(norm_rows, w10_stack.transpose(1, 2)) + b10_stack.unsqueeze(1)) * mask_f
+    stage1 = (torch.bmm(torch.nn.functional.silu(pre1), w20_stack.transpose(1, 2)) + b20_stack.unsqueeze(1)) * mask_f
+    pre2 = (torch.bmm(stage1, w11_stack.transpose(1, 2)) + b11_stack.unsqueeze(1)) * mask_f
+    stage2 = (torch.bmm(torch.nn.functional.silu(pre2), w21_stack.transpose(1, 2)) + b21_stack.unsqueeze(1)) * mask_f
+    out_rows = x_rows + stage2
+    return _scatter_padded_group_rows(out_rows, row_sizes_long, safe_idx, out_rows=int(packed_rows.size(0)))
+
+
 __all__ = [
+    "execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference",
     "execute_program_two_layer_silu_then_two_layer_silu_reference",
     "execute_program_two_layer_silu_then_postnorm_two_layer_silu_reference",
 ]

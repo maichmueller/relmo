@@ -1980,6 +1980,511 @@ void launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indic
 }
 
 template < typename scalar_t, typename index_t >
+__global__ void fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda_kernel(
+   const scalar_t* x_ptr,
+   const index_t* relation_args_ptr,
+   const int64_t* slot_offsets_ptr,
+   const int64_t* row_offsets_ptr,
+   const int64_t* out_offsets_ptr,
+   int64_t groups,
+   int64_t arity,
+   int64_t emb,
+   const scalar_t* rms_weight_ptr,
+   bool has_rms_weight,
+   scalar_t rms_eps,
+   const scalar_t* w10_ptr,
+   const scalar_t* b10_ptr,
+   int64_t hidden1,
+   const scalar_t* w20_ptr,
+   const scalar_t* b20_ptr,
+   const scalar_t* w11_ptr,
+   const scalar_t* b11_ptr,
+   int64_t hidden2,
+   const scalar_t* w21_ptr,
+   const scalar_t* b21_ptr,
+   scalar_t* out_ptr,
+   int64_t* node_idx_ptr
+)
+{
+   const int64_t row = static_cast< int64_t >(blockIdx.x);
+   if(row >= row_offsets_ptr[groups]) {
+      return;
+   }
+
+   int64_t group = 0;
+   while(group + 1 < groups && row >= row_offsets_ptr[group + 1]) {
+      ++group;
+   }
+   const int64_t row_in_group = row - row_offsets_ptr[group];
+   const int64_t slot_base = slot_offsets_ptr[group] + row_in_group * arity;
+   const int64_t out_base = out_offsets_ptr[group] + row_in_group * arity;
+   const int64_t in_dim = arity * emb;
+
+   extern __shared__ unsigned char smem_raw[];
+   scalar_t* input = reinterpret_cast< scalar_t* >(smem_raw);
+   scalar_t* norm_buf = input + in_dim;
+   scalar_t* hidden1_buf = norm_buf + in_dim;
+   scalar_t* stage1_buf = hidden1_buf + hidden1;
+   scalar_t* hidden2_buf = stage1_buf + in_dim;
+   __shared__ scalar_t inv_rms_val;
+
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      const int64_t slot = i / emb;
+      const int64_t dim = i - slot * emb;
+      const int64_t node = static_cast< int64_t >(relation_args_ptr[slot_base + slot]);
+      input[i] = x_ptr[node * emb + dim];
+   }
+   for(int64_t slot = threadIdx.x; slot < arity; slot += blockDim.x) {
+      node_idx_ptr[out_base + slot] = static_cast< int64_t >(relation_args_ptr[slot_base + slot]);
+   }
+   __syncthreads();
+
+   if(threadIdx.x == 0) {
+      scalar_t sq_mean = static_cast< scalar_t >(0);
+      for(int64_t i = 0; i < in_dim; ++i) {
+         sq_mean += input[i] * input[i];
+      }
+      sq_mean /= static_cast< scalar_t >(in_dim);
+      inv_rms_val = static_cast< scalar_t >(1) / sqrt(sq_mean + rms_eps);
+   }
+   __syncthreads();
+
+   const scalar_t* rms_weight_group = has_rms_weight ? (rms_weight_ptr + group * in_dim) : nullptr;
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      scalar_t normed = input[i] * inv_rms_val;
+      if(has_rms_weight) {
+         normed *= rms_weight_group[i];
+      }
+      norm_buf[i] = normed;
+   }
+   __syncthreads();
+
+   const scalar_t* w10_group = w10_ptr + group * hidden1 * in_dim;
+   const scalar_t* b10_group = b10_ptr + group * hidden1;
+   for(int64_t h = threadIdx.x; h < hidden1; h += blockDim.x) {
+      scalar_t acc = b10_group[h];
+      const scalar_t* w_row = w10_group + h * in_dim;
+      for(int64_t i = 0; i < in_dim; ++i) {
+         acc += w_row[i] * norm_buf[i];
+      }
+      hidden1_buf[h] = silu_compat(acc);
+   }
+   __syncthreads();
+
+   const scalar_t* w20_group = w20_ptr + group * in_dim * hidden1;
+   const scalar_t* b20_group = b20_ptr + group * in_dim;
+   for(int64_t o = threadIdx.x; o < in_dim; o += blockDim.x) {
+      scalar_t acc = b20_group[o];
+      const scalar_t* w_row = w20_group + o * hidden1;
+      for(int64_t h = 0; h < hidden1; ++h) {
+         acc += w_row[h] * hidden1_buf[h];
+      }
+      stage1_buf[o] = acc;
+   }
+   __syncthreads();
+
+   const scalar_t* w11_group = w11_ptr + group * hidden2 * in_dim;
+   const scalar_t* b11_group = b11_ptr + group * hidden2;
+   for(int64_t h = threadIdx.x; h < hidden2; h += blockDim.x) {
+      scalar_t acc = b11_group[h];
+      const scalar_t* w_row = w11_group + h * in_dim;
+      for(int64_t i = 0; i < in_dim; ++i) {
+         acc += w_row[i] * stage1_buf[i];
+      }
+      hidden2_buf[h] = silu_compat(acc);
+   }
+   __syncthreads();
+
+   const scalar_t* w21_group = w21_ptr + group * in_dim * hidden2;
+   const scalar_t* b21_group = b21_ptr + group * in_dim;
+   for(int64_t o = threadIdx.x; o < in_dim; o += blockDim.x) {
+      scalar_t acc = b21_group[o];
+      const scalar_t* w_row = w21_group + o * hidden2;
+      for(int64_t h = 0; h < hidden2; ++h) {
+         acc += w_row[h] * hidden2_buf[h];
+      }
+      const int64_t slot = o / emb;
+      const int64_t dim = o - slot * emb;
+      out_ptr[(out_base + slot) * emb + dim] = input[o] + acc;
+   }
+}
+
+template < typename scalar_t, typename index_t >
+void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   scalar_t rms_eps,
+   const Tensor& w10_stack,
+   const Tensor& b10_stack,
+   const Tensor& w20_stack,
+   const Tensor& b20_stack,
+   const Tensor& w11_stack,
+   const Tensor& b11_stack,
+   const Tensor& w21_stack,
+   const Tensor& b21_stack,
+   Tensor& rel_cat,
+   Tensor& node_idx,
+   cudaStream_t stream
+)
+{
+   const int64_t groups = slot_offsets.size(0);
+   if(total_rows <= 0) {
+      return;
+   }
+   const int64_t emb = x.size(1);
+   const int64_t hidden1 = w10_stack.size(1);
+   const int64_t hidden2 = w11_stack.size(1);
+   const int64_t in_dim = arity * emb;
+   const size_t shared_bytes =
+      static_cast< size_t >(3 * in_dim + hidden1 + hidden2) * sizeof(scalar_t);
+   const dim3 grid(static_cast< unsigned int >(total_rows));
+   fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda_kernel< scalar_t, index_t >
+      <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
+         x.data_ptr< scalar_t >(),
+         relation_args.data_ptr< index_t >(),
+         slot_offsets.data_ptr< int64_t >(),
+         row_offsets.data_ptr< int64_t >(),
+         out_offsets.data_ptr< int64_t >(),
+         groups,
+         arity,
+         emb,
+         rms_weight_stack.numel() > 0 ? rms_weight_stack.data_ptr< scalar_t >() : nullptr,
+         rms_weight_stack.numel() > 0,
+         rms_eps,
+         w10_stack.data_ptr< scalar_t >(),
+         b10_stack.data_ptr< scalar_t >(),
+         hidden1,
+         w20_stack.data_ptr< scalar_t >(),
+         b20_stack.data_ptr< scalar_t >(),
+         w11_stack.data_ptr< scalar_t >(),
+         b11_stack.data_ptr< scalar_t >(),
+         hidden2,
+         w21_stack.data_ptr< scalar_t >(),
+         b21_stack.data_ptr< scalar_t >(),
+         rel_cat.data_ptr< scalar_t >(),
+         node_idx.data_ptr< int64_t >()
+      );
+   check_kernel_launch(
+      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda_kernel"
+   );
+}
+
+template < typename scalar_t, typename index_t >
+__global__ void fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda_kernel(
+   const scalar_t* grad_rel_ptr,
+   const scalar_t* x_ptr,
+   const index_t* relation_args_ptr,
+   const int64_t* slot_offsets_ptr,
+   const int64_t* row_offsets_ptr,
+   const int64_t* out_offsets_ptr,
+   int64_t groups,
+   int64_t arity,
+   int64_t emb,
+   const scalar_t* rms_weight_ptr,
+   bool has_rms_weight,
+   scalar_t rms_eps,
+   const scalar_t* w10_ptr,
+   const scalar_t* b10_ptr,
+   int64_t hidden1,
+   const scalar_t* w20_ptr,
+   const scalar_t* b20_ptr,
+   const scalar_t* w11_ptr,
+   const scalar_t* b11_ptr,
+   int64_t hidden2,
+   const scalar_t* w21_ptr,
+   const scalar_t* b21_ptr,
+   scalar_t* grad_x_ptr,
+   scalar_t* grad_rms_weight_ptr,
+   scalar_t* grad_w10_ptr,
+   scalar_t* grad_b10_ptr,
+   scalar_t* grad_w20_ptr,
+   scalar_t* grad_b20_ptr,
+   scalar_t* grad_w11_ptr,
+   scalar_t* grad_b11_ptr,
+   scalar_t* grad_w21_ptr,
+   scalar_t* grad_b21_ptr
+)
+{
+   const int64_t row = static_cast< int64_t >(blockIdx.x);
+   if(row >= row_offsets_ptr[groups]) {
+      return;
+   }
+
+   int64_t group = 0;
+   while(group + 1 < groups && row >= row_offsets_ptr[group + 1]) {
+      ++group;
+   }
+   const int64_t row_in_group = row - row_offsets_ptr[group];
+   const int64_t slot_base = slot_offsets_ptr[group] + row_in_group * arity;
+   const int64_t out_base = out_offsets_ptr[group] + row_in_group * arity;
+   const int64_t in_dim = arity * emb;
+
+   extern __shared__ unsigned char smem_raw[];
+   scalar_t* input = reinterpret_cast< scalar_t* >(smem_raw);
+   scalar_t* norm_buf = input + in_dim;
+   scalar_t* z1 = norm_buf + in_dim;
+   scalar_t* hidden1_buf = z1 + hidden1;
+   scalar_t* stage1_buf = hidden1_buf + hidden1;
+   scalar_t* z2 = stage1_buf + in_dim;
+   scalar_t* hidden2_buf = z2 + hidden2;
+   scalar_t* grad_stage1 = hidden2_buf + hidden2;
+   scalar_t* grad_norm = grad_stage1 + in_dim;
+   __shared__ scalar_t inv_rms_val;
+   __shared__ scalar_t mean_grad_norm_xhat;
+
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      const int64_t slot = i / emb;
+      const int64_t dim = i - slot * emb;
+      const int64_t node = static_cast< int64_t >(relation_args_ptr[slot_base + slot]);
+      input[i] = x_ptr[node * emb + dim];
+      grad_stage1[i] = static_cast< scalar_t >(0);
+   }
+   __syncthreads();
+
+   if(threadIdx.x == 0) {
+      scalar_t sq_mean = static_cast< scalar_t >(0);
+      for(int64_t i = 0; i < in_dim; ++i) {
+         sq_mean += input[i] * input[i];
+      }
+      sq_mean /= static_cast< scalar_t >(in_dim);
+      inv_rms_val = static_cast< scalar_t >(1) / sqrt(sq_mean + rms_eps);
+   }
+   __syncthreads();
+
+   const scalar_t* rms_weight_group = has_rms_weight ? (rms_weight_ptr + group * in_dim) : nullptr;
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      scalar_t xhat = input[i] * inv_rms_val;
+      norm_buf[i] = has_rms_weight ? (xhat * rms_weight_group[i]) : xhat;
+   }
+   __syncthreads();
+
+   const scalar_t* w10_group = w10_ptr + group * hidden1 * in_dim;
+   const scalar_t* b10_group = b10_ptr + group * hidden1;
+   for(int64_t h = threadIdx.x; h < hidden1; h += blockDim.x) {
+      scalar_t acc = b10_group[h];
+      const scalar_t* w_row = w10_group + h * in_dim;
+      for(int64_t i = 0; i < in_dim; ++i) {
+         acc += w_row[i] * norm_buf[i];
+      }
+      z1[h] = acc;
+      hidden1_buf[h] = silu_compat(acc);
+   }
+   __syncthreads();
+
+   const scalar_t* w20_group = w20_ptr + group * in_dim * hidden1;
+   const scalar_t* b20_group = b20_ptr + group * in_dim;
+   for(int64_t o = threadIdx.x; o < in_dim; o += blockDim.x) {
+      scalar_t acc = b20_group[o];
+      const scalar_t* w_row = w20_group + o * hidden1;
+      for(int64_t h = 0; h < hidden1; ++h) {
+         acc += w_row[h] * hidden1_buf[h];
+      }
+      stage1_buf[o] = acc;
+   }
+   __syncthreads();
+
+   const scalar_t* w11_group = w11_ptr + group * hidden2 * in_dim;
+   const scalar_t* b11_group = b11_ptr + group * hidden2;
+   for(int64_t h = threadIdx.x; h < hidden2; h += blockDim.x) {
+      scalar_t acc = b11_group[h];
+      const scalar_t* w_row = w11_group + h * in_dim;
+      for(int64_t i = 0; i < in_dim; ++i) {
+         acc += w_row[i] * stage1_buf[i];
+      }
+      z2[h] = acc;
+      hidden2_buf[h] = silu_compat(acc);
+   }
+   __syncthreads();
+
+   const scalar_t* w21_group = w21_ptr + group * in_dim * hidden2;
+   const scalar_t* b21_group = b21_ptr + group * in_dim;
+   for(int64_t o = threadIdx.x; o < in_dim; o += blockDim.x) {
+      const int64_t slot = o / emb;
+      const int64_t dim = o - slot * emb;
+      const scalar_t go = grad_rel_ptr[(out_base + slot) * emb + dim];
+      atomic_add_compat(grad_b21_ptr + group * in_dim + o, go);
+      for(int64_t h = 0; h < hidden2; ++h) {
+         atomic_add_compat(
+            grad_w21_ptr + (group * in_dim + o) * hidden2 + h,
+            go * hidden2_buf[h]
+         );
+      }
+   }
+   __syncthreads();
+
+   for(int64_t h = threadIdx.x; h < hidden2; h += blockDim.x) {
+      scalar_t grad_h2 = static_cast< scalar_t >(0);
+      for(int64_t o = 0; o < in_dim; ++o) {
+         const int64_t slot = o / emb;
+         const int64_t dim = o - slot * emb;
+         grad_h2 += w21_group[o * hidden2 + h] * grad_rel_ptr[(out_base + slot) * emb + dim];
+      }
+      const scalar_t grad_pre2 = grad_h2 * silu_grad_from_pre_activation_compat(z2[h]);
+      atomic_add_compat(grad_b11_ptr + group * hidden2 + h, grad_pre2);
+      for(int64_t i = 0; i < in_dim; ++i) {
+         atomic_add_compat(
+            grad_w11_ptr + (group * hidden2 + h) * in_dim + i,
+            grad_pre2 * stage1_buf[i]
+         );
+         atomic_add_compat(grad_stage1 + i, w11_group[h * in_dim + i] * grad_pre2);
+      }
+   }
+   __syncthreads();
+
+   for(int64_t o = threadIdx.x; o < in_dim; o += blockDim.x) {
+      const scalar_t gs1 = grad_stage1[o];
+      atomic_add_compat(grad_b20_ptr + group * in_dim + o, gs1);
+      for(int64_t h = 0; h < hidden1; ++h) {
+         atomic_add_compat(
+            grad_w20_ptr + (group * in_dim + o) * hidden1 + h,
+            gs1 * hidden1_buf[h]
+         );
+      }
+   }
+   __syncthreads();
+
+   for(int64_t h = threadIdx.x; h < hidden1; h += blockDim.x) {
+      scalar_t grad_h1 = static_cast< scalar_t >(0);
+      for(int64_t o = 0; o < in_dim; ++o) {
+         grad_h1 += w20_group[o * hidden1 + h] * grad_stage1[o];
+      }
+      const scalar_t gp1 = grad_h1 * silu_grad_from_pre_activation_compat(z1[h]);
+      z1[h] = gp1;
+      atomic_add_compat(grad_b10_ptr + group * hidden1 + h, gp1);
+      for(int64_t i = 0; i < in_dim; ++i) {
+         atomic_add_compat(
+            grad_w10_ptr + (group * hidden1 + h) * in_dim + i,
+            gp1 * norm_buf[i]
+         );
+      }
+   }
+   __syncthreads();
+
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      scalar_t grad_i = static_cast< scalar_t >(0);
+      for(int64_t h = 0; h < hidden1; ++h) {
+         grad_i += w10_group[h * in_dim + i] * z1[h];
+      }
+      if(grad_rms_weight_ptr != nullptr) {
+         atomic_add_compat(grad_rms_weight_ptr + group * in_dim + i, grad_i * input[i] * inv_rms_val);
+      }
+      grad_norm[i] = has_rms_weight ? (grad_i * rms_weight_group[i]) : grad_i;
+   }
+   __syncthreads();
+
+   if(threadIdx.x == 0) {
+      scalar_t accum = static_cast< scalar_t >(0);
+      for(int64_t i = 0; i < in_dim; ++i) {
+         const scalar_t xhat = input[i] * inv_rms_val;
+         accum += grad_norm[i] * xhat;
+      }
+      mean_grad_norm_xhat = accum / static_cast< scalar_t >(in_dim);
+   }
+   __syncthreads();
+
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      const scalar_t xhat = input[i] * inv_rms_val;
+      const scalar_t grad_in_norm =
+         inv_rms_val * (grad_norm[i] - xhat * mean_grad_norm_xhat);
+      const int64_t slot = i / emb;
+      const int64_t dim = i - slot * emb;
+      const scalar_t grad_residual = grad_rel_ptr[(out_base + slot) * emb + dim];
+      const int64_t node = static_cast< int64_t >(relation_args_ptr[slot_base + slot]);
+      atomic_add_compat(grad_x_ptr + node * emb + dim, grad_in_norm + grad_residual);
+   }
+}
+
+template < typename scalar_t, typename index_t >
+void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   scalar_t rms_eps,
+   const Tensor& w10_stack,
+   const Tensor& b10_stack,
+   const Tensor& w20_stack,
+   const Tensor& b20_stack,
+   const Tensor& w11_stack,
+   const Tensor& b11_stack,
+   const Tensor& w21_stack,
+   const Tensor& b21_stack,
+   Tensor& grad_x,
+   Tensor& grad_rms_weight,
+   Tensor& grad_w10,
+   Tensor& grad_b10,
+   Tensor& grad_w20,
+   Tensor& grad_b20,
+   Tensor& grad_w11,
+   Tensor& grad_b11,
+   Tensor& grad_w21,
+   Tensor& grad_b21,
+   cudaStream_t stream
+)
+{
+   const int64_t groups = slot_offsets.size(0);
+   if(total_rows <= 0) {
+      return;
+   }
+   const int64_t emb = x.size(1);
+   const int64_t hidden1 = w10_stack.size(1);
+   const int64_t hidden2 = w11_stack.size(1);
+   const int64_t in_dim = arity * emb;
+   const size_t shared_bytes =
+      static_cast< size_t >(5 * in_dim + 2 * hidden1 + 2 * hidden2) * sizeof(scalar_t);
+   const dim3 grid(static_cast< unsigned int >(total_rows));
+   fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda_kernel< scalar_t, index_t >
+      <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
+         grad_rel.data_ptr< scalar_t >(),
+         x.data_ptr< scalar_t >(),
+         relation_args.data_ptr< index_t >(),
+         slot_offsets.data_ptr< int64_t >(),
+         row_offsets.data_ptr< int64_t >(),
+         out_offsets.data_ptr< int64_t >(),
+         groups,
+         arity,
+         emb,
+         rms_weight_stack.numel() > 0 ? rms_weight_stack.data_ptr< scalar_t >() : nullptr,
+         rms_weight_stack.numel() > 0,
+         rms_eps,
+         w10_stack.data_ptr< scalar_t >(),
+         b10_stack.data_ptr< scalar_t >(),
+         hidden1,
+         w20_stack.data_ptr< scalar_t >(),
+         b20_stack.data_ptr< scalar_t >(),
+         w11_stack.data_ptr< scalar_t >(),
+         b11_stack.data_ptr< scalar_t >(),
+         hidden2,
+         w21_stack.data_ptr< scalar_t >(),
+         b21_stack.data_ptr< scalar_t >(),
+         grad_x.data_ptr< scalar_t >(),
+         grad_rms_weight.numel() > 0 ? grad_rms_weight.data_ptr< scalar_t >() : nullptr,
+         grad_w10.data_ptr< scalar_t >(),
+         grad_b10.data_ptr< scalar_t >(),
+         grad_w20.data_ptr< scalar_t >(),
+         grad_b20.data_ptr< scalar_t >(),
+         grad_w11.data_ptr< scalar_t >(),
+         grad_b11.data_ptr< scalar_t >(),
+         grad_w21.data_ptr< scalar_t >(),
+         grad_b21.data_ptr< scalar_t >()
+      );
+   check_kernel_launch(
+      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda_kernel"
+   );
+}
+
+template < typename scalar_t, typename index_t >
 __global__ void fused_two_layer_pointwise_from_indices_backward_cuda_kernel(
    const scalar_t* grad_rel_ptr,
    const scalar_t* x_ptr,
@@ -3406,6 +3911,433 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
       grad_b21,
       grad_ln_weight,
       grad_ln_bias
+   );
+}
+
+std::tuple< Tensor, Tensor >
+fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t total_slots,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   double rms_eps,
+   const Tensor& w10_stack,
+   const Tensor& b10_stack,
+   const Tensor& w20_stack,
+   const Tensor& b20_stack,
+   const Tensor& w11_stack,
+   const Tensor& b11_stack,
+   const Tensor& w21_stack,
+   const Tensor& b21_stack
+)
+{
+   c10::cuda::CUDAGuard device_guard(x.device());
+   check_same_cuda_device(x, relation_args, "x", "relation_args");
+   check_same_cuda_device(x, slot_offsets, "x", "slot_offsets");
+   check_same_cuda_device(x, row_offsets, "x", "row_offsets");
+   check_same_cuda_device(x, out_offsets, "x", "out_offsets");
+   check_same_cuda_device(x, w10_stack, "x", "w10_stack");
+   check_same_cuda_device(x, b10_stack, "x", "b10_stack");
+   check_same_cuda_device(x, w20_stack, "x", "w20_stack");
+   check_same_cuda_device(x, b20_stack, "x", "b20_stack");
+   check_same_cuda_device(x, w11_stack, "x", "w11_stack");
+   check_same_cuda_device(x, b11_stack, "x", "b11_stack");
+   check_same_cuda_device(x, w21_stack, "x", "w21_stack");
+   check_same_cuda_device(x, b21_stack, "x", "b21_stack");
+   if(rms_weight_stack.numel() > 0) {
+      check_same_cuda_device(x, rms_weight_stack, "x", "rms_weight_stack");
+   }
+
+   const int64_t emb = x.size(1);
+   Tensor rel_cat = at::empty({total_slots, emb}, x.options());
+   Tensor node_idx = at::empty({total_slots}, relation_args.options().dtype(at::kLong));
+   if(total_slots <= 0) {
+      return std::make_tuple(rel_cat, node_idx);
+   }
+
+   Tensor x_work = ensure_contiguous(x);
+   Tensor relation_args_work = ensure_contiguous(relation_args);
+   Tensor slot_offsets_work = ensure_contiguous(slot_offsets);
+   Tensor row_offsets_work = ensure_contiguous(row_offsets);
+   Tensor out_offsets_work = ensure_contiguous(out_offsets);
+   Tensor rms_weight_work =
+      rms_weight_stack.numel() > 0 ? ensure_contiguous(rms_weight_stack) : rms_weight_stack;
+   Tensor w10_work = ensure_contiguous(w10_stack);
+   Tensor b10_work = ensure_contiguous(b10_stack);
+   Tensor w20_work = ensure_contiguous(w20_stack);
+   Tensor b20_work = ensure_contiguous(b20_stack);
+   Tensor w11_work = ensure_contiguous(w11_stack);
+   Tensor b11_work = ensure_contiguous(b11_stack);
+   Tensor w21_work = ensure_contiguous(w21_stack);
+   Tensor b21_work = ensure_contiguous(b21_stack);
+   cudaStream_t stream = current_cuda_stream(x_work);
+
+   if(dtype_of(relation_args_work) == at::kInt) {
+      dispatch_float_or_double(
+         x_work,
+         [&]() {
+            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< float, int >(
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               out_offsets_work,
+               total_rows,
+               arity,
+               rms_weight_work,
+               static_cast< float >(rms_eps),
+               w10_work,
+               b10_work,
+               w20_work,
+               b20_work,
+               w11_work,
+               b11_work,
+               w21_work,
+               b21_work,
+               rel_cat,
+               node_idx,
+               stream
+            );
+         },
+         [&]() {
+            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< double, int >(
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               out_offsets_work,
+               total_rows,
+               arity,
+               rms_weight_work,
+               static_cast< double >(rms_eps),
+               w10_work,
+               b10_work,
+               w20_work,
+               b20_work,
+               w11_work,
+               b11_work,
+               w21_work,
+               b21_work,
+               rel_cat,
+               node_idx,
+               stream
+            );
+         },
+         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda"
+      );
+      return std::make_tuple(rel_cat, node_idx);
+   }
+
+   dispatch_float_or_double(
+      x_work,
+      [&]() {
+         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< float, int64_t >(
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            out_offsets_work,
+            total_rows,
+            arity,
+            rms_weight_work,
+            static_cast< float >(rms_eps),
+            w10_work,
+            b10_work,
+            w20_work,
+            b20_work,
+            w11_work,
+            b11_work,
+            w21_work,
+            b21_work,
+            rel_cat,
+            node_idx,
+            stream
+         );
+      },
+      [&]() {
+         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< double, int64_t >(
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            out_offsets_work,
+            total_rows,
+            arity,
+            rms_weight_work,
+            static_cast< double >(rms_eps),
+            w10_work,
+            b10_work,
+            w20_work,
+            b20_work,
+            w11_work,
+            b11_work,
+            w21_work,
+            b21_work,
+            rel_cat,
+            node_idx,
+            stream
+         );
+      },
+      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda"
+   );
+   return std::make_tuple(rel_cat, node_idx);
+}
+
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
+fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda(
+   const Tensor& grad_rel,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& rms_weight_stack,
+   double rms_eps,
+   const Tensor& w10_stack,
+   const Tensor& b10_stack,
+   const Tensor& w20_stack,
+   const Tensor& b20_stack,
+   const Tensor& w11_stack,
+   const Tensor& b11_stack,
+   const Tensor& w21_stack,
+   const Tensor& b21_stack
+)
+{
+   c10::cuda::CUDAGuard device_guard(x.device());
+   check_same_cuda_device(grad_rel, x, "grad_rel", "x");
+   check_same_cuda_device(x, relation_args, "x", "relation_args");
+   check_same_cuda_device(x, slot_offsets, "x", "slot_offsets");
+   check_same_cuda_device(x, row_offsets, "x", "row_offsets");
+   check_same_cuda_device(x, out_offsets, "x", "out_offsets");
+   check_same_cuda_device(x, w10_stack, "x", "w10_stack");
+   check_same_cuda_device(x, b10_stack, "x", "b10_stack");
+   check_same_cuda_device(x, w20_stack, "x", "w20_stack");
+   check_same_cuda_device(x, b20_stack, "x", "b20_stack");
+   check_same_cuda_device(x, w11_stack, "x", "w11_stack");
+   check_same_cuda_device(x, b11_stack, "x", "b11_stack");
+   check_same_cuda_device(x, w21_stack, "x", "w21_stack");
+   check_same_cuda_device(x, b21_stack, "x", "b21_stack");
+   if(rms_weight_stack.numel() > 0) {
+      check_same_cuda_device(x, rms_weight_stack, "x", "rms_weight_stack");
+   }
+
+   Tensor grad_x = at::zeros_like(x);
+   Tensor grad_rms_weight =
+      rms_weight_stack.numel() > 0 ? at::zeros_like(rms_weight_stack) : at::zeros_like(rms_weight_stack);
+   Tensor grad_w10 = at::zeros_like(w10_stack);
+   Tensor grad_b10 = at::zeros_like(b10_stack);
+   Tensor grad_w20 = at::zeros_like(w20_stack);
+   Tensor grad_b20 = at::zeros_like(b20_stack);
+   Tensor grad_w11 = at::zeros_like(w11_stack);
+   Tensor grad_b11 = at::zeros_like(b11_stack);
+   Tensor grad_w21 = at::zeros_like(w21_stack);
+   Tensor grad_b21 = at::zeros_like(b21_stack);
+   if(total_rows <= 0) {
+      return std::make_tuple(
+         grad_x,
+         grad_rms_weight,
+         grad_w10,
+         grad_b10,
+         grad_w20,
+         grad_b20,
+         grad_w11,
+         grad_b11,
+         grad_w21,
+         grad_b21
+      );
+   }
+
+   Tensor grad_rel_work = ensure_contiguous(grad_rel);
+   Tensor x_work = ensure_contiguous(x);
+   Tensor relation_args_work = ensure_contiguous(relation_args);
+   Tensor slot_offsets_work = ensure_contiguous(slot_offsets);
+   Tensor row_offsets_work = ensure_contiguous(row_offsets);
+   Tensor out_offsets_work = ensure_contiguous(out_offsets);
+   Tensor rms_weight_work =
+      rms_weight_stack.numel() > 0 ? ensure_contiguous(rms_weight_stack) : rms_weight_stack;
+   Tensor w10_work = ensure_contiguous(w10_stack);
+   Tensor b10_work = ensure_contiguous(b10_stack);
+   Tensor w20_work = ensure_contiguous(w20_stack);
+   Tensor b20_work = ensure_contiguous(b20_stack);
+   Tensor w11_work = ensure_contiguous(w11_stack);
+   Tensor b11_work = ensure_contiguous(b11_stack);
+   Tensor w21_work = ensure_contiguous(w21_stack);
+   Tensor b21_work = ensure_contiguous(b21_stack);
+   cudaStream_t stream = current_cuda_stream(grad_rel_work);
+
+   if(dtype_of(relation_args_work) == at::kInt) {
+      dispatch_float_or_double(
+         grad_rel_work,
+         [&]() {
+            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< float, int >(
+               grad_rel_work,
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               out_offsets_work,
+               total_rows,
+               arity,
+               rms_weight_work,
+               static_cast< float >(rms_eps),
+               w10_work,
+               b10_work,
+               w20_work,
+               b20_work,
+               w11_work,
+               b11_work,
+               w21_work,
+               b21_work,
+               grad_x,
+               grad_rms_weight,
+               grad_w10,
+               grad_b10,
+               grad_w20,
+               grad_b20,
+               grad_w11,
+               grad_b11,
+               grad_w21,
+               grad_b21,
+               stream
+            );
+         },
+         [&]() {
+            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< double, int >(
+               grad_rel_work,
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               out_offsets_work,
+               total_rows,
+               arity,
+               rms_weight_work,
+               static_cast< double >(rms_eps),
+               w10_work,
+               b10_work,
+               w20_work,
+               b20_work,
+               w11_work,
+               b11_work,
+               w21_work,
+               b21_work,
+               grad_x,
+               grad_rms_weight,
+               grad_w10,
+               grad_b10,
+               grad_w20,
+               grad_b20,
+               grad_w11,
+               grad_b11,
+               grad_w21,
+               grad_b21,
+               stream
+            );
+         },
+         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda"
+      );
+      return std::make_tuple(
+         grad_x,
+         grad_rms_weight,
+         grad_w10,
+         grad_b10,
+         grad_w20,
+         grad_b20,
+         grad_w11,
+         grad_b11,
+         grad_w21,
+         grad_b21
+      );
+   }
+
+   dispatch_float_or_double(
+      grad_rel_work,
+      [&]() {
+         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< float, int64_t >(
+            grad_rel_work,
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            out_offsets_work,
+            total_rows,
+            arity,
+            rms_weight_work,
+            static_cast< float >(rms_eps),
+            w10_work,
+            b10_work,
+            w20_work,
+            b20_work,
+            w11_work,
+            b11_work,
+            w21_work,
+            b21_work,
+            grad_x,
+            grad_rms_weight,
+            grad_w10,
+            grad_b10,
+            grad_w20,
+            grad_b20,
+            grad_w11,
+            grad_b11,
+            grad_w21,
+            grad_b21,
+            stream
+         );
+      },
+      [&]() {
+         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< double, int64_t >(
+            grad_rel_work,
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            out_offsets_work,
+            total_rows,
+            arity,
+            rms_weight_work,
+            static_cast< double >(rms_eps),
+            w10_work,
+            b10_work,
+            w20_work,
+            b20_work,
+            w11_work,
+            b11_work,
+            w21_work,
+            b21_work,
+            grad_x,
+            grad_rms_weight,
+            grad_w10,
+            grad_b10,
+            grad_w20,
+            grad_b20,
+            grad_w11,
+            grad_b11,
+            grad_w21,
+            grad_b21,
+            stream
+         );
+      },
+      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda"
+   );
+   return std::make_tuple(
+      grad_x,
+      grad_rms_weight,
+      grad_w10,
+      grad_b10,
+      grad_w20,
+      grad_b20,
+      grad_w11,
+      grad_b11,
+      grad_w21,
+      grad_b21
    );
 }
 
