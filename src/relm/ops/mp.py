@@ -62,12 +62,12 @@ def _env_first(names: tuple[str, ...], default: str | None = None) -> str | None
 
 
 def _fallback_mode() -> str:
-    raw = (_env_first(("RELM_MP_FALLBACK", "RELM_RELMP_FALLBACK"), "python") or "python")
+    raw = (_env_first(("RELM_MP_FALLBACK",), "python") or "python")
     raw = raw.strip().lower()
     return raw if raw in {"python", "error"} else "python"
 
 
-def pointwise_code_from_signature(signature: tuple[object, ...] | None) -> int | None:
+def activation_code(signature: tuple[object, ...] | None) -> int | None:
     if not signature:
         return None
     kind = str(signature[0])
@@ -124,11 +124,6 @@ def _candidate_libraries() -> list[Path]:
         "relm_mp_ops*.pyd",
         "librelm_mp_ops*.so",
         "librelm_mp_ops*.dylib",
-        "relm_relmp_ops*.so",
-        "relm_relmp_ops*.dylib",
-        "relm_relmp_ops*.pyd",
-        "librelm_relmp_ops*.so",
-        "librelm_relmp_ops*.dylib",
     )
     candidates: list[Path] = []
     for pattern in patterns:
@@ -244,7 +239,7 @@ def available() -> bool:
 
 
 def _should_use_custom(op_name: str) -> bool:
-    if not _env_bool_any(("RELM_MP_ENABLE", "RELM_RELMP_ENABLE"), True):
+    if not _env_bool_any(("RELM_MP_ENABLE",), True):
         return False
     try:
         _ensure_runtime_compat_once()
@@ -407,7 +402,7 @@ def _apply_pointwise_code(x: torch.Tensor, code: int) -> torch.Tensor:
     raise ValueError(f"Unsupported pointwise code: {code_i!r}.")
 
 
-def _fused_two_layer_pointwise_from_indices_python(
+def _block_pointwise_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -420,30 +415,30 @@ def _fused_two_layer_pointwise_from_indices_python(
     pointwise_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
-        raise ValueError("fused_two_layer_pointwise_from_indices expects x to be rank-2.")
+        raise ValueError("block_pointwise expects x to be rank-2.")
     if relation_args.dim() != 1:
         raise ValueError(
-            "fused_two_layer_pointwise_from_indices expects relation_args to be rank-1."
+            "block_pointwise expects relation_args to be rank-1."
         )
     if len(slot_offsets) != len(row_sizes):
         raise ValueError(
-            "fused_two_layer_pointwise_from_indices expects slot_offsets and row_sizes with equal lengths."
+            "block_pointwise expects slot_offsets and row_sizes with equal lengths."
         )
     arity_i = int(arity)
     if arity_i <= 0:
-        raise ValueError("fused_two_layer_pointwise_from_indices expects arity > 0.")
+        raise ValueError("block_pointwise expects arity > 0.")
 
     relation_args_i64 = relation_args.to(dtype=torch.int64)
     emb = int(x.size(1))
     in_dim = int(emb * arity_i)
     groups = len(slot_offsets)
     if w1_stack.dim() != 3 or w2_stack.dim() != 3:
-        raise ValueError("fused_two_layer_pointwise_from_indices expects rank-3 weight stacks.")
+        raise ValueError("block_pointwise expects rank-3 weight stacks.")
     if int(w1_stack.size(0)) != groups or int(w2_stack.size(0)) != groups:
-        raise ValueError("fused_two_layer_pointwise_from_indices weight stacks must match group count.")
+        raise ValueError("block_pointwise weight stacks must match group count.")
     if int(w1_stack.size(2)) != in_dim or int(w2_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_two_layer_pointwise_from_indices weight stack dims do not match arity * emb."
+            "block_pointwise weight stack dims do not match arity * emb."
         )
 
     rel_parts: list[torch.Tensor] = []
@@ -478,7 +473,7 @@ def _fused_two_layer_pointwise_from_indices_python(
     return rel_cat, node_idx
 
 
-def _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
+def _program_silu_pair_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -495,20 +490,20 @@ def _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects x to be rank-2."
+            "program_silu_pair expects x to be rank-2."
         )
     if relation_args.dim() != 1:
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects relation_args to be rank-1."
+            "program_silu_pair expects relation_args to be rank-1."
         )
     if len(slot_offsets) != len(row_sizes):
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects slot_offsets and row_sizes with equal lengths."
+            "program_silu_pair expects slot_offsets and row_sizes with equal lengths."
         )
     arity_i = int(arity)
     if arity_i <= 0:
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects arity > 0."
+            "program_silu_pair expects arity > 0."
         )
     relation_args_i64 = relation_args.to(dtype=torch.int64)
     emb = int(x.size(1))
@@ -527,31 +522,31 @@ def _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
     for name, tensor, rank in stacks:
         if tensor.dim() != rank:
             raise ValueError(
-                f"fused_program_two_layer_silu_then_two_layer_silu_from_indices expects {name} rank-{rank}."
+                f"program_silu_pair expects {name} rank-{rank}."
             )
         if int(tensor.size(0)) != groups:
             raise ValueError(
-                "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects all parameter stacks to match group count."
+                "program_silu_pair expects all parameter stacks to match group count."
             )
     if int(w10_stack.size(2)) != in_dim or int(w20_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-1 dims do not match arity * emb."
+            "program_silu_pair stage-1 dims do not match arity * emb."
         )
     if int(w11_stack.size(2)) != in_dim or int(w21_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-2 dims do not match arity * emb."
+            "program_silu_pair stage-2 dims do not match arity * emb."
         )
     if int(w20_stack.size(2)) != int(w10_stack.size(1)) or int(b10_stack.size(1)) != int(w10_stack.size(1)):
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-1 hidden dims do not match."
+            "program_silu_pair stage-1 hidden dims do not match."
         )
     if int(w21_stack.size(2)) != int(w11_stack.size(1)) or int(b11_stack.size(1)) != int(w11_stack.size(1)):
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-2 hidden dims do not match."
+            "program_silu_pair stage-2 hidden dims do not match."
         )
     if int(b20_stack.size(1)) != in_dim or int(b21_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices output bias dims do not match arity * emb."
+            "program_silu_pair output bias dims do not match arity * emb."
         )
 
     packed_rows_parts: list[torch.Tensor] = []
@@ -611,7 +606,7 @@ def _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
     return rel_cat, node_idx
 
 
-def _fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_python(
+def _program_silu_postnorm_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -631,20 +626,20 @@ def _fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_pyth
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects x to be rank-2."
+            "program_silu_postnorm expects x to be rank-2."
         )
     if relation_args.dim() != 1:
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects relation_args to be rank-1."
+            "program_silu_postnorm expects relation_args to be rank-1."
         )
     if len(slot_offsets) != len(row_sizes):
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects slot_offsets and row_sizes with equal lengths."
+            "program_silu_postnorm expects slot_offsets and row_sizes with equal lengths."
         )
     arity_i = int(arity)
     if arity_i <= 0:
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects arity > 0."
+            "program_silu_postnorm expects arity > 0."
         )
     relation_args_i64 = relation_args.to(dtype=torch.int64)
     emb = int(x.size(1))
@@ -663,49 +658,49 @@ def _fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_pyth
     for name, tensor, rank in stacks:
         if tensor.dim() != rank:
             raise ValueError(
-                f"fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects {name} rank-{rank}."
+                f"program_silu_postnorm expects {name} rank-{rank}."
             )
         if int(tensor.size(0)) != groups:
             raise ValueError(
-                "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects all parameter stacks to match group count."
+                "program_silu_postnorm expects all parameter stacks to match group count."
             )
     if int(w10_stack.size(2)) != in_dim or int(w20_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-1 dims do not match arity * emb."
+            "program_silu_postnorm stage-1 dims do not match arity * emb."
         )
     if int(w11_stack.size(2)) != in_dim or int(w21_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-2 dims do not match arity * emb."
+            "program_silu_postnorm stage-2 dims do not match arity * emb."
         )
     if int(w20_stack.size(2)) != int(w10_stack.size(1)) or int(b10_stack.size(1)) != int(w10_stack.size(1)):
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-1 hidden dims do not match."
+            "program_silu_postnorm stage-1 hidden dims do not match."
         )
     if int(w21_stack.size(2)) != int(w11_stack.size(1)) or int(b11_stack.size(1)) != int(w11_stack.size(1)):
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-2 hidden dims do not match."
+            "program_silu_postnorm stage-2 hidden dims do not match."
         )
     if int(b20_stack.size(1)) != in_dim or int(b21_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices output bias dims do not match arity * emb."
+            "program_silu_postnorm output bias dims do not match arity * emb."
         )
     if ln_weight_stack.numel() > 0:
         if ln_weight_stack.dim() != 2 or int(ln_weight_stack.size(0)) != groups:
             raise ValueError(
-                "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices ln_weight_stack must have shape [groups, in_dim] when non-empty."
+                "program_silu_postnorm ln_weight_stack must have shape [groups, in_dim] when non-empty."
             )
         if int(ln_weight_stack.size(1)) != in_dim:
             raise ValueError(
-                "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices ln_weight_stack dims do not match arity * emb."
+                "program_silu_postnorm ln_weight_stack dims do not match arity * emb."
             )
     if ln_bias_stack.numel() > 0:
         if ln_bias_stack.dim() != 2 or int(ln_bias_stack.size(0)) != groups:
             raise ValueError(
-                "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices ln_bias_stack must have shape [groups, in_dim] when non-empty."
+                "program_silu_postnorm ln_bias_stack must have shape [groups, in_dim] when non-empty."
             )
         if int(ln_bias_stack.size(1)) != in_dim:
             raise ValueError(
-                "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices ln_bias_stack dims do not match arity * emb."
+                "program_silu_postnorm ln_bias_stack dims do not match arity * emb."
             )
 
     rel_parts: list[torch.Tensor] = []
@@ -746,7 +741,7 @@ def _fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_pyth
     return rel_cat, node_idx
 
 
-def _fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_python(
+def _program_rmsnorm_silu_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -765,20 +760,20 @@ def _fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indic
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects x to be rank-2."
+            "program_rmsnorm_silu expects x to be rank-2."
         )
     if relation_args.dim() != 1:
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects relation_args to be rank-1."
+            "program_rmsnorm_silu expects relation_args to be rank-1."
         )
     if len(slot_offsets) != len(row_sizes):
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects slot_offsets and row_sizes with equal lengths."
+            "program_rmsnorm_silu expects slot_offsets and row_sizes with equal lengths."
         )
     arity_i = int(arity)
     if arity_i <= 0:
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects arity > 0."
+            "program_rmsnorm_silu expects arity > 0."
         )
     relation_args_i64 = relation_args.to(dtype=torch.int64)
     emb = int(x.size(1))
@@ -787,11 +782,11 @@ def _fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indic
     if rms_weight_stack.numel() > 0:
         if rms_weight_stack.dim() != 2 or int(rms_weight_stack.size(0)) != groups:
             raise ValueError(
-                "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices rms_weight_stack must have shape [groups, in_dim] when non-empty."
+                "program_rmsnorm_silu rms_weight_stack must have shape [groups, in_dim] when non-empty."
             )
         if int(rms_weight_stack.size(1)) != in_dim:
             raise ValueError(
-                "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices rms_weight_stack dims do not match arity * emb."
+                "program_rmsnorm_silu rms_weight_stack dims do not match arity * emb."
             )
     stacks = (
         ("w10_stack", w10_stack, 3),
@@ -806,31 +801,31 @@ def _fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indic
     for name, tensor, rank in stacks:
         if tensor.dim() != rank:
             raise ValueError(
-                f"fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects {name} rank-{rank}."
+                f"program_rmsnorm_silu expects {name} rank-{rank}."
             )
         if int(tensor.size(0)) != groups:
             raise ValueError(
-                "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects all parameter stacks to match group count."
+                "program_rmsnorm_silu expects all parameter stacks to match group count."
             )
     if int(w10_stack.size(2)) != in_dim or int(w20_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-1 dims do not match arity * emb."
+            "program_rmsnorm_silu stage-1 dims do not match arity * emb."
         )
     if int(w11_stack.size(2)) != in_dim or int(w21_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-2 dims do not match arity * emb."
+            "program_rmsnorm_silu stage-2 dims do not match arity * emb."
         )
     if int(w20_stack.size(2)) != int(w10_stack.size(1)) or int(b10_stack.size(1)) != int(w10_stack.size(1)):
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-1 hidden dims do not match."
+            "program_rmsnorm_silu stage-1 hidden dims do not match."
         )
     if int(w21_stack.size(2)) != int(w11_stack.size(1)) or int(b11_stack.size(1)) != int(w11_stack.size(1)):
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-2 hidden dims do not match."
+            "program_rmsnorm_silu stage-2 hidden dims do not match."
         )
     if int(b20_stack.size(1)) != in_dim or int(b21_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices output bias dims do not match arity * emb."
+            "program_rmsnorm_silu output bias dims do not match arity * emb."
         )
 
     rel_parts: list[torch.Tensor] = []
@@ -868,32 +863,7 @@ def _fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indic
     return rel_cat, node_idx
 
 
-def _fused_two_layer_mish_from_indices_python(
-    x: torch.Tensor,
-    relation_args: torch.Tensor,
-    slot_offsets: list[int],
-    row_sizes: list[int],
-    arity: int,
-    w1_stack: torch.Tensor,
-    b1_stack: torch.Tensor,
-    w2_stack: torch.Tensor,
-    b2_stack: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _fused_two_layer_pointwise_from_indices_python(
-        x,
-        relation_args,
-        slot_offsets,
-        row_sizes,
-        arity,
-        w1_stack,
-        b1_stack,
-        w2_stack,
-        b2_stack,
-        _PW_MISH,
-    )
-
-
-def _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
+def _block_postnorm_ln_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -910,20 +880,20 @@ def _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects x to be rank-2."
+            "block_postnorm_ln expects x to be rank-2."
         )
     if relation_args.dim() != 1:
         raise ValueError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects relation_args to be rank-1."
+            "block_postnorm_ln expects relation_args to be rank-1."
         )
     if len(slot_offsets) != len(row_sizes):
         raise ValueError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+            "block_postnorm_ln expects slot_offsets and row_sizes with equal lengths."
         )
     arity_i = int(arity)
     if arity_i <= 0:
         raise ValueError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects arity > 0."
+            "block_postnorm_ln expects arity > 0."
         )
 
     relation_args_i64 = relation_args.to(dtype=torch.int64)
@@ -932,33 +902,33 @@ def _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
     groups = len(slot_offsets)
     if w1_stack.dim() != 3 or w2_stack.dim() != 3:
         raise ValueError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects rank-3 weight stacks."
+            "block_postnorm_ln expects rank-3 weight stacks."
         )
     if int(w1_stack.size(0)) != groups or int(w2_stack.size(0)) != groups:
         raise ValueError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stacks must match group count."
+            "block_postnorm_ln weight stacks must match group count."
         )
     if int(w1_stack.size(2)) != in_dim or int(w2_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stack dims do not match arity * emb."
+            "block_postnorm_ln weight stack dims do not match arity * emb."
         )
     if ln_weight_stack.numel() > 0:
         if ln_weight_stack.dim() != 2 or int(ln_weight_stack.size(0)) != groups:
             raise ValueError(
-                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_weight_stack must have shape [groups, in_dim] when non-empty."
+                "block_postnorm_ln ln_weight_stack must have shape [groups, in_dim] when non-empty."
             )
         if int(ln_weight_stack.size(1)) != in_dim:
             raise ValueError(
-                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_weight_stack dims do not match arity * emb."
+                "block_postnorm_ln ln_weight_stack dims do not match arity * emb."
             )
     if ln_bias_stack.numel() > 0:
         if ln_bias_stack.dim() != 2 or int(ln_bias_stack.size(0)) != groups:
             raise ValueError(
-                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_bias_stack must have shape [groups, in_dim] when non-empty."
+                "block_postnorm_ln ln_bias_stack must have shape [groups, in_dim] when non-empty."
             )
         if int(ln_bias_stack.size(1)) != in_dim:
             raise ValueError(
-                "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_bias_stack dims do not match arity * emb."
+                "block_postnorm_ln ln_bias_stack dims do not match arity * emb."
             )
 
     rel_parts: list[torch.Tensor] = []
@@ -1000,7 +970,7 @@ def _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
     return rel_cat, node_idx
 
 
-def _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
+def _block_prenorm_rms_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -1016,20 +986,20 @@ def _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects x to be rank-2."
+            "block_prenorm_rms expects x to be rank-2."
         )
     if relation_args.dim() != 1:
         raise ValueError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects relation_args to be rank-1."
+            "block_prenorm_rms expects relation_args to be rank-1."
         )
     if len(slot_offsets) != len(row_sizes):
         raise ValueError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+            "block_prenorm_rms expects slot_offsets and row_sizes with equal lengths."
         )
     arity_i = int(arity)
     if arity_i <= 0:
         raise ValueError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects arity > 0."
+            "block_prenorm_rms expects arity > 0."
         )
 
     relation_args_i64 = relation_args.to(dtype=torch.int64)
@@ -1039,23 +1009,23 @@ def _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
     if rms_weight_stack.numel() > 0:
         if rms_weight_stack.dim() != 2 or int(rms_weight_stack.size(0)) != groups:
             raise ValueError(
-                "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices rms_weight_stack must have shape [groups, in_dim] when non-empty."
+                "block_prenorm_rms rms_weight_stack must have shape [groups, in_dim] when non-empty."
             )
         if int(rms_weight_stack.size(1)) != in_dim:
             raise ValueError(
-                "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices rms_weight_stack dims do not match arity * emb."
+                "block_prenorm_rms rms_weight_stack dims do not match arity * emb."
             )
     if w1_stack.dim() != 3 or w2_stack.dim() != 3:
         raise ValueError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects rank-3 weight stacks."
+            "block_prenorm_rms expects rank-3 weight stacks."
         )
     if int(w1_stack.size(0)) != groups or int(w2_stack.size(0)) != groups:
         raise ValueError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stacks must match group count."
+            "block_prenorm_rms weight stacks must match group count."
         )
     if int(w1_stack.size(2)) != in_dim or int(w2_stack.size(1)) != in_dim:
         raise ValueError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stack dims do not match arity * emb."
+            "block_prenorm_rms weight stack dims do not match arity * emb."
         )
 
     rel_parts: list[torch.Tensor] = []
@@ -1369,12 +1339,12 @@ if torch is not None:
             used_custom = (
                 x.is_cuda
                 and ctx.pointwise_code in _CUSTOM_TWO_LAYER_POINTWISE_CODES
-                and _should_use_custom("fused_two_layer_pointwise_from_indices")
-                and _namespace_has_op("fused_two_layer_pointwise_from_indices")
+                and _should_use_custom("block_pointwise")
+                and _namespace_has_op("block_pointwise")
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
-                return _ops_namespace().fused_two_layer_pointwise_from_indices(
+                return _ops_namespace().block_pointwise(
                     x,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -1386,7 +1356,7 @@ if torch is not None:
                     b2_stack,
                     int(ctx.pointwise_code),
                 )
-            return _fused_two_layer_pointwise_from_indices_python(
+            return _block_pointwise_python(
                 x,
                 relation_args,
                 list(ctx.slot_offsets),
@@ -1426,11 +1396,11 @@ if torch is not None:
             if (
                 bool(getattr(ctx, "used_custom", False))
                 and grad_rel.is_cuda
-                and _should_use_custom("fused_two_layer_pointwise_from_indices_backward")
-                and _namespace_has_op("fused_two_layer_pointwise_from_indices_backward")
+                and _should_use_custom("block_pointwise_backward")
+                and _namespace_has_op("block_pointwise_backward")
             ):
                 grad_x, grad_w1, grad_b1, grad_w2, grad_b2 = (
-                    _ops_namespace().fused_two_layer_pointwise_from_indices_backward(
+                    _ops_namespace().block_pointwise_backward(
                         grad_rel,
                         x,
                         relation_args,
@@ -1469,7 +1439,7 @@ if torch is not None:
                     if b2_stack.numel() > 0
                     else b2_stack
                 )
-                rel_cat, _ = _fused_two_layer_pointwise_from_indices_python(
+                rel_cat, _ = _block_pointwise_python(
                     x_req,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -1537,12 +1507,12 @@ if torch is not None:
             )
             used_custom = (
                 x.is_cuda
-                and _should_use_custom("fused_program_two_layer_silu_then_two_layer_silu_from_indices")
-                and _namespace_has_op("fused_program_two_layer_silu_then_two_layer_silu_from_indices")
+                and _should_use_custom("program_silu_pair")
+                and _namespace_has_op("program_silu_pair")
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
-                return _ops_namespace().fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+                return _ops_namespace().program_silu_pair(
                     x,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -1557,7 +1527,7 @@ if torch is not None:
                     w21_stack,
                     b21_stack,
                 )
-            return _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
+            return _program_silu_pair_python(
                 x,
                 relation_args,
                 list(ctx.slot_offsets),
@@ -1600,10 +1570,10 @@ if torch is not None:
                 bool(getattr(ctx, "used_custom", False))
                 and grad_rel.is_cuda
                 and _should_use_custom(
-                    "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward"
+                    "program_silu_pair_backward"
                 )
                 and _namespace_has_op(
-                    "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward"
+                    "program_silu_pair_backward"
                 )
             ):
                 (
@@ -1616,7 +1586,7 @@ if torch is not None:
                     grad_b11,
                     grad_w21,
                     grad_b21,
-                ) = _ops_namespace().fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
+                ) = _ops_namespace().program_silu_pair_backward(
                     grad_rel,
                     x,
                     relation_args,
@@ -1661,7 +1631,7 @@ if torch is not None:
                 b11_req = b11_stack.detach().requires_grad_(bool(needs[10]))
                 w21_req = w21_stack.detach().requires_grad_(bool(needs[11]))
                 b21_req = b21_stack.detach().requires_grad_(bool(needs[12]))
-                rel_cat, _ = _fused_program_two_layer_silu_then_two_layer_silu_from_indices_python(
+                rel_cat, _ = _program_silu_pair_python(
                     x_req,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -1740,14 +1710,14 @@ if torch is not None:
             )
             used_custom = (
                 x.is_cuda
-                and _should_use_custom("fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices")
+                and _should_use_custom("program_silu_postnorm")
                 and _namespace_has_op(
-                    "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices"
+                    "program_silu_postnorm"
                 )
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
-                return _ops_namespace().fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(
+                return _ops_namespace().program_silu_postnorm(
                     x,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -1765,7 +1735,7 @@ if torch is not None:
                     ln_bias_stack,
                     float(ctx.ln_eps),
                 )
-            return _fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_python(
+            return _program_silu_postnorm_python(
                 x,
                 relation_args,
                 list(ctx.slot_offsets),
@@ -1813,10 +1783,10 @@ if torch is not None:
                 bool(getattr(ctx, "used_custom", False))
                 and grad_rel.is_cuda
                 and _should_use_custom(
-                    "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward"
+                    "program_silu_postnorm_backward"
                 )
                 and _namespace_has_op(
-                    "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward"
+                    "program_silu_postnorm_backward"
                 )
             ):
                 (
@@ -1831,7 +1801,7 @@ if torch is not None:
                     grad_b21,
                     grad_ln_weight,
                     grad_ln_bias,
-                ) = _ops_namespace().fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
+                ) = _ops_namespace().program_silu_postnorm_backward(
                     grad_rel,
                     x,
                     relation_args,
@@ -1893,7 +1863,7 @@ if torch is not None:
                     if ln_bias_stack.numel() > 0
                     else ln_bias_stack
                 )
-                rel_cat, _ = _fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_python(
+                rel_cat, _ = _program_silu_postnorm_python(
                     x_req,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -1976,15 +1946,15 @@ if torch is not None:
             used_custom = (
                 x.is_cuda
                 and _should_use_custom(
-                    "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices"
+                    "program_rmsnorm_silu"
                 )
                 and _namespace_has_op(
-                    "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices"
+                    "program_rmsnorm_silu"
                 )
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
-                return _ops_namespace().fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
+                return _ops_namespace().program_rmsnorm_silu(
                     x,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -2001,7 +1971,7 @@ if torch is not None:
                     w21_stack,
                     b21_stack,
                 )
-            return _fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_python(
+            return _program_rmsnorm_silu_python(
                 x,
                 relation_args,
                 list(ctx.slot_offsets),
@@ -2047,10 +2017,10 @@ if torch is not None:
                 bool(getattr(ctx, "used_custom", False))
                 and grad_rel.is_cuda
                 and _should_use_custom(
-                    "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward"
+                    "program_rmsnorm_silu_backward"
                 )
                 and _namespace_has_op(
-                    "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward"
+                    "program_rmsnorm_silu_backward"
                 )
             ):
                 (
@@ -2064,7 +2034,7 @@ if torch is not None:
                     grad_b11,
                     grad_w21,
                     grad_b21,
-                ) = _ops_namespace().fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward(
+                ) = _ops_namespace().program_rmsnorm_silu_backward(
                     grad_rel,
                     x,
                     relation_args,
@@ -2118,7 +2088,7 @@ if torch is not None:
                 b11_req = b11_stack.detach().requires_grad_(bool(needs[12]))
                 w21_req = w21_stack.detach().requires_grad_(bool(needs[13]))
                 b21_req = b21_stack.detach().requires_grad_(bool(needs[14]))
-                rel_cat, _ = _fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_python(
+                rel_cat, _ = _program_rmsnorm_silu_python(
                     x_req,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -2157,10 +2127,6 @@ if torch is not None:
                 grad_map[idx] = grad
             return tuple(grad_map)
 
-
-    class _FusedTwoLayerMishFromIndicesFunction(_FusedTwoLayerPointwiseFromIndicesFunction):
-        pass
-
     class _FusedPostNormTwoLayerPointwiseLayerNormFromIndicesFunction(torch.autograd.Function):
         @staticmethod
         def forward(
@@ -2197,12 +2163,12 @@ if torch is not None:
             used_custom = (
                 x.is_cuda
                 and ctx.pointwise_code in _CUSTOM_TWO_LAYER_POINTWISE_CODES
-                and _should_use_custom("fused_postnorm_two_layer_pointwise_layernorm_from_indices")
-                and _namespace_has_op("fused_postnorm_two_layer_pointwise_layernorm_from_indices")
+                and _should_use_custom("block_postnorm_ln")
+                and _namespace_has_op("block_postnorm_ln")
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
-                return _ops_namespace().fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+                return _ops_namespace().block_postnorm_ln(
                     x,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -2217,7 +2183,7 @@ if torch is not None:
                     float(ctx.ln_eps),
                     int(ctx.pointwise_code),
                 )
-            return _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
+            return _block_postnorm_ln_python(
                 x,
                 relation_args,
                 list(ctx.slot_offsets),
@@ -2278,14 +2244,14 @@ if torch is not None:
                 bool(getattr(ctx, "used_custom", False))
                 and grad_rel.is_cuda
                 and _should_use_custom(
-                    "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward"
+                    "block_postnorm_ln_backward"
                 )
                 and _namespace_has_op(
-                    "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward"
+                    "block_postnorm_ln_backward"
                 )
             ):
                 grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_ln_weight, grad_ln_bias = (
-                    _ops_namespace().fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
+                    _ops_namespace().block_postnorm_ln_backward(
                         grad_rel,
                         x,
                         relation_args,
@@ -2342,7 +2308,7 @@ if torch is not None:
                     if ln_bias_stack.numel() > 0
                     else ln_bias_stack
                 )
-                rel_cat, _ = _fused_postnorm_two_layer_pointwise_layernorm_from_indices_python(
+                rel_cat, _ = _block_postnorm_ln_python(
                     x_req,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -2414,12 +2380,12 @@ if torch is not None:
             used_custom = (
                 x.is_cuda
                 and ctx.pointwise_code in _CUSTOM_TWO_LAYER_POINTWISE_CODES
-                and _should_use_custom("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices")
-                and _namespace_has_op("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices")
+                and _should_use_custom("block_prenorm_rms")
+                and _namespace_has_op("block_prenorm_rms")
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
-                return _ops_namespace().fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
+                return _ops_namespace().block_prenorm_rms(
                     x,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -2433,7 +2399,7 @@ if torch is not None:
                     b2_stack,
                     int(ctx.pointwise_code),
                 )
-            return _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
+            return _block_prenorm_rms_python(
                 x,
                 relation_args,
                 list(ctx.slot_offsets),
@@ -2477,11 +2443,11 @@ if torch is not None:
             if (
                 bool(getattr(ctx, "used_custom", False))
                 and grad_rel.is_cuda
-                and _should_use_custom("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward")
-                and _namespace_has_op("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward")
+                and _should_use_custom("block_prenorm_rms_backward")
+                and _namespace_has_op("block_prenorm_rms_backward")
             ):
                 grad_x, grad_rms_weight, grad_w1, grad_b1, grad_w2, grad_b2 = (
-                    _ops_namespace().fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
+                    _ops_namespace().block_prenorm_rms_backward(
                         grad_rel,
                         x,
                         relation_args,
@@ -2530,7 +2496,7 @@ if torch is not None:
                     if b2_stack.numel() > 0
                     else b2_stack
                 )
-                rel_cat, _ = _fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_python(
+                rel_cat, _ = _block_prenorm_rms_python(
                     x_req,
                     relation_args,
                     list(ctx.slot_offsets),
@@ -2735,7 +2701,7 @@ def fanin_pack_from_edges(
     )
 
 
-def fused_two_layer_pointwise_from_indices(
+def block_pointwise(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -2747,9 +2713,16 @@ def fused_two_layer_pointwise_from_indices(
     b2_stack: torch.Tensor,
     pointwise_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a width-preserving 2-layer pointwise block over packed relation rows.
+
+    Computes ``Linear -> activation -> Linear`` on each packed tuple row and
+    returns:
+    1. packed residual messages with the gathered tuple input added once
+    2. packed destination entity indices
+    """
     if torch is None:
         raise ModuleNotFoundError(
-            "fused_two_layer_pointwise_from_indices requires torch."
+            "block_pointwise requires torch."
         ) from _TORCH_IMPORT_ERROR
     return _FusedTwoLayerPointwiseFromIndicesFunction.apply(
         x,
@@ -2765,7 +2738,7 @@ def fused_two_layer_pointwise_from_indices(
     )
 
 
-def fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+def block_postnorm_ln(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -2780,9 +2753,10 @@ def fused_postnorm_two_layer_pointwise_layernorm_from_indices(
     ln_eps: float,
     pointwise_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ``Linear -> activation -> Linear -> LayerNorm`` on packed relation rows."""
     if torch is None:
         raise ModuleNotFoundError(
-            "fused_postnorm_two_layer_pointwise_layernorm_from_indices requires torch."
+            "block_postnorm_ln requires torch."
         ) from _TORCH_IMPORT_ERROR
     return _FusedPostNormTwoLayerPointwiseLayerNormFromIndicesFunction.apply(
         x,
@@ -2801,7 +2775,7 @@ def fused_postnorm_two_layer_pointwise_layernorm_from_indices(
     )
 
 
-def fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
+def block_prenorm_rms(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -2815,9 +2789,10 @@ def fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
     b2_stack: torch.Tensor,
     pointwise_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ``RMSNorm -> Linear -> activation -> Linear`` on packed relation rows."""
     if torch is None:
         raise ModuleNotFoundError(
-            "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices requires torch."
+            "block_prenorm_rms requires torch."
         ) from _TORCH_IMPORT_ERROR
     return _FusedPreNormTwoLayerPointwiseRMSNormFromIndicesFunction.apply(
         x,
@@ -2835,7 +2810,7 @@ def fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
     )
 
 
-def fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+def program_silu_pair(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -2850,9 +2825,10 @@ def fused_program_two_layer_silu_then_two_layer_silu_from_indices(
     w21_stack: torch.Tensor,
     b21_stack: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the exact 2-stage SiLU relation program on packed relation rows."""
     if torch is None:
         raise ModuleNotFoundError(
-            "fused_program_two_layer_silu_then_two_layer_silu_from_indices requires torch."
+            "program_silu_pair requires torch."
         ) from _TORCH_IMPORT_ERROR
     return _FusedProgramTwoLayerSiLUThenTwoLayerSiLUFromIndicesFunction.apply(
         x,
@@ -2871,7 +2847,7 @@ def fused_program_two_layer_silu_then_two_layer_silu_from_indices(
     )
 
 
-def fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(
+def program_silu_postnorm(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -2889,9 +2865,10 @@ def fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(
     ln_bias_stack: torch.Tensor,
     ln_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the exact SiLU then post-norm SiLU relation program."""
     if torch is None:
         raise ModuleNotFoundError(
-            "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices requires torch."
+            "program_silu_postnorm requires torch."
         ) from _TORCH_IMPORT_ERROR
     return _FusedProgramTwoLayerSiLUThenPostNormTwoLayerSiLUFromIndicesFunction.apply(
         x,
@@ -2913,7 +2890,7 @@ def fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(
     )
 
 
-def fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
+def program_rmsnorm_silu(
     x: torch.Tensor,
     relation_args: torch.Tensor,
     slot_offsets: list[int],
@@ -2930,9 +2907,10 @@ def fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indice
     w21_stack: torch.Tensor,
     b21_stack: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the exact pre-norm RMSNorm then SiLU relation program."""
     if torch is None:
         raise ModuleNotFoundError(
-            "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices requires torch."
+            "program_rmsnorm_silu requires torch."
         ) from _TORCH_IMPORT_ERROR
     return _FusedProgramPreNormTwoLayerSiLURMSNormThenTwoLayerSiLUFromIndicesFunction.apply(
         x,
@@ -2951,37 +2929,6 @@ def fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indice
         w21_stack,
         b21_stack,
     )
-
-
-def fused_two_layer_mish_from_indices(
-    x: torch.Tensor,
-    relation_args: torch.Tensor,
-    slot_offsets: list[int],
-    row_sizes: list[int],
-    arity: int,
-    w1_stack: torch.Tensor,
-    b1_stack: torch.Tensor,
-    w2_stack: torch.Tensor,
-    b2_stack: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if torch is None:
-        raise ModuleNotFoundError(
-            "fused_two_layer_mish_from_indices requires torch."
-        ) from _TORCH_IMPORT_ERROR
-    return fused_two_layer_pointwise_from_indices(
-        x,
-        relation_args,
-        list(slot_offsets),
-        list(row_sizes),
-        int(arity),
-        w1_stack,
-        b1_stack,
-        w2_stack,
-        b2_stack,
-        _PW_MISH,
-    )
-
-
 __all__ = [
     "fanout_scatter",
     "fanin_reduce",
@@ -2989,14 +2936,13 @@ __all__ = [
     "fanin_pack_multi",
     "fanout_pack_from_edges",
     "fanin_pack_from_edges",
-    "fused_two_layer_pointwise_from_indices",
-    "fused_postnorm_two_layer_pointwise_layernorm_from_indices",
-    "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices",
-    "fused_program_two_layer_silu_then_two_layer_silu_from_indices",
-    "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices",
-    "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices",
-    "fused_two_layer_mish_from_indices",
-    "pointwise_code_from_signature",
+    "block_pointwise",
+    "block_postnorm_ln",
+    "block_prenorm_rms",
+    "program_silu_pair",
+    "program_silu_postnorm",
+    "program_rmsnorm_silu",
+    "activation_code",
     "available",
     "assert_runtime_compat",
 ]

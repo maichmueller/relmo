@@ -85,7 +85,7 @@ FanoutBackwardKernelMode fanout_backward_kernel_mode()
          return FanoutBackwardKernelMode::kAuto;
       }
       const std::string value(raw);
-      if(value == "1d" || value == "legacy") {
+      if(value == "1d") {
          return FanoutBackwardKernelMode::k1D;
       }
       if(value == "2d") {
@@ -128,7 +128,7 @@ FaninLogSumExpForwardMode fanin_logsumexp_forward_mode()
          return FaninLogSumExpForwardMode::kAuto;
       }
       const std::string value(raw);
-      if(value == "atomic" || value == "legacy" || value == "1d") {
+      if(value == "atomic" || value == "1d") {
          return FaninLogSumExpForwardMode::kAtomic;
       }
       if(value == "segmented" || value == "sorted") {
@@ -892,7 +892,7 @@ void dispatch_float_or_double(
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_two_layer_pointwise_from_indices_cuda_kernel(
+__global__ void block_pointwise_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
    const int64_t* slot_offsets_ptr,
@@ -969,7 +969,7 @@ __global__ void fused_two_layer_pointwise_from_indices_cuda_kernel(
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda_kernel(
+__global__ void program_silu_pair_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
    const int64_t* slot_offsets_ptr,
@@ -1074,7 +1074,7 @@ __global__ void fused_program_two_layer_silu_then_two_layer_silu_from_indices_cu
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_two_layer_pointwise_from_indices(
+void launch_block_pointwise(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -1102,7 +1102,7 @@ void launch_fused_two_layer_pointwise_from_indices(
    const size_t shared_bytes =
       static_cast< size_t >(in_dim + hidden) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_two_layer_pointwise_from_indices_cuda_kernel< scalar_t, index_t >
+   block_pointwise_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          x.data_ptr< scalar_t >(),
          relation_args.data_ptr< index_t >(),
@@ -1123,11 +1123,11 @@ void launch_fused_two_layer_pointwise_from_indices(
          rel_cat.data_ptr< scalar_t >(),
          node_idx.data_ptr< int64_t >()
       );
-   check_kernel_launch("fused_two_layer_pointwise_from_indices_cuda_kernel");
+   check_kernel_launch("block_pointwise_cuda_kernel");
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+void launch_program_silu_pair(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -1159,7 +1159,7 @@ void launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices(
    const size_t shared_bytes =
       static_cast< size_t >(2 * in_dim + hidden1 + hidden2) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda_kernel< scalar_t, index_t >
+   program_silu_pair_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          x.data_ptr< scalar_t >(),
          relation_args.data_ptr< index_t >(),
@@ -1182,11 +1182,11 @@ void launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices(
          rel_cat.data_ptr< scalar_t >(),
          node_idx.data_ptr< int64_t >()
       );
-   check_kernel_launch("fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda_kernel");
+   check_kernel_launch("program_silu_pair_cuda_kernel");
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda_kernel(
+__global__ void program_silu_pair_backward_cuda_kernel(
    const scalar_t* grad_rel_ptr,
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -1354,7 +1354,7 @@ __global__ void fused_program_two_layer_silu_then_two_layer_silu_from_indices_ba
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
+void launch_program_silu_pair_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -1394,7 +1394,7 @@ void launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices_backwa
    const size_t shared_bytes =
       static_cast< size_t >(4 * in_dim + 3 * hidden1 + 2 * hidden2) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda_kernel< scalar_t, index_t >
+   program_silu_pair_backward_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          grad_rel.data_ptr< scalar_t >(),
          x.data_ptr< scalar_t >(),
@@ -1426,12 +1426,12 @@ void launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices_backwa
          grad_b21.data_ptr< scalar_t >()
       );
    check_kernel_launch(
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda_kernel"
+      "program_silu_pair_backward_cuda_kernel"
    );
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda_kernel(
+__global__ void program_silu_postnorm_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
    const int64_t* slot_offsets_ptr,
@@ -1575,7 +1575,7 @@ __global__ void fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_i
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(
+void launch_program_silu_postnorm(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -1610,7 +1610,7 @@ void launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indic
    const size_t shared_bytes =
       static_cast< size_t >(3 * in_dim + hidden1 + hidden2) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda_kernel< scalar_t, index_t >
+   program_silu_postnorm_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          x.data_ptr< scalar_t >(),
          relation_args.data_ptr< index_t >(),
@@ -1639,12 +1639,12 @@ void launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indic
          node_idx.data_ptr< int64_t >()
       );
    check_kernel_launch(
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda_kernel"
+      "program_silu_postnorm_cuda_kernel"
    );
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda_kernel(
+__global__ void program_silu_postnorm_backward_cuda_kernel(
    const scalar_t* grad_rel_ptr,
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -1891,7 +1891,7 @@ __global__ void fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_i
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
+void launch_program_silu_postnorm_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -1936,7 +1936,7 @@ void launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indic
    const size_t shared_bytes =
       static_cast< size_t >(5 * in_dim + 2 * hidden1 + 2 * hidden2) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda_kernel< scalar_t, index_t >
+   program_silu_postnorm_backward_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          grad_rel.data_ptr< scalar_t >(),
          x.data_ptr< scalar_t >(),
@@ -1975,12 +1975,12 @@ void launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indic
          grad_ln_bias.numel() > 0 ? grad_ln_bias.data_ptr< scalar_t >() : nullptr
       );
    check_kernel_launch(
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda_kernel"
+      "program_silu_postnorm_backward_cuda_kernel"
    );
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda_kernel(
+__global__ void program_rmsnorm_silu_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
    const int64_t* slot_offsets_ptr,
@@ -2110,7 +2110,7 @@ __global__ void fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
+void launch_program_rmsnorm_silu(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -2144,7 +2144,7 @@ void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_fro
    const size_t shared_bytes =
       static_cast< size_t >(3 * in_dim + hidden1 + hidden2) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda_kernel< scalar_t, index_t >
+   program_rmsnorm_silu_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          x.data_ptr< scalar_t >(),
          relation_args.data_ptr< index_t >(),
@@ -2171,12 +2171,12 @@ void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_fro
          node_idx.data_ptr< int64_t >()
       );
    check_kernel_launch(
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda_kernel"
+      "program_rmsnorm_silu_cuda_kernel"
    );
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda_kernel(
+__global__ void program_rmsnorm_silu_backward_cuda_kernel(
    const scalar_t* grad_rel_ptr,
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -2401,7 +2401,7 @@ __global__ void fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward(
+void launch_program_rmsnorm_silu_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -2444,7 +2444,7 @@ void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_fro
    const size_t shared_bytes =
       static_cast< size_t >(5 * in_dim + 2 * hidden1 + 2 * hidden2) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda_kernel< scalar_t, index_t >
+   program_rmsnorm_silu_backward_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          grad_rel.data_ptr< scalar_t >(),
          x.data_ptr< scalar_t >(),
@@ -2480,12 +2480,12 @@ void launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_fro
          grad_b21.data_ptr< scalar_t >()
       );
    check_kernel_launch(
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda_kernel"
+      "program_rmsnorm_silu_backward_cuda_kernel"
    );
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_two_layer_pointwise_from_indices_backward_cuda_kernel(
+__global__ void block_pointwise_backward_cuda_kernel(
    const scalar_t* grad_rel_ptr,
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -2601,7 +2601,7 @@ __global__ void fused_two_layer_pointwise_from_indices_backward_cuda_kernel(
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_two_layer_pointwise_from_indices_backward(
+void launch_block_pointwise_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -2633,7 +2633,7 @@ void launch_fused_two_layer_pointwise_from_indices_backward(
    const size_t shared_bytes =
       static_cast< size_t >(2 * in_dim + 3 * hidden) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_two_layer_pointwise_from_indices_backward_cuda_kernel< scalar_t, index_t >
+   block_pointwise_backward_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          grad_rel.data_ptr< scalar_t >(),
          x.data_ptr< scalar_t >(),
@@ -2658,7 +2658,7 @@ void launch_fused_two_layer_pointwise_from_indices_backward(
          grad_w2.data_ptr< scalar_t >(),
          grad_b2.numel() > 0 ? grad_b2.data_ptr< scalar_t >() : nullptr
       );
-   check_kernel_launch("fused_two_layer_pointwise_from_indices_backward_cuda_kernel");
+   check_kernel_launch("block_pointwise_backward_cuda_kernel");
 }
 
 }  // namespace
@@ -2926,7 +2926,7 @@ Tensor fanin_reduce_logsumexp_backward_cuda(
    return grad_rel;
 }
 
-std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
+std::tuple< Tensor, Tensor > block_pointwise_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -2978,7 +2978,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_two_layer_pointwise_from_indices< float, int >(
+            launch_block_pointwise< float, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -2997,7 +2997,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
             );
          },
          [&]() {
-            launch_fused_two_layer_pointwise_from_indices< double, int >(
+            launch_block_pointwise< double, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -3015,7 +3015,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
                stream
             );
          },
-         "fused_two_layer_pointwise_from_indices_cuda"
+         "block_pointwise_cuda"
       );
       return std::make_tuple(rel_cat, node_idx);
    }
@@ -3023,7 +3023,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_two_layer_pointwise_from_indices< float, int64_t >(
+         launch_block_pointwise< float, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -3042,7 +3042,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
          );
       },
       [&]() {
-         launch_fused_two_layer_pointwise_from_indices< double, int64_t >(
+         launch_block_pointwise< double, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -3060,12 +3060,12 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
             stream
          );
       },
-      "fused_two_layer_pointwise_from_indices_cuda"
+      "block_pointwise_cuda"
    );
    return std::make_tuple(rel_cat, node_idx);
 }
 
-std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda(
+std::tuple< Tensor, Tensor > program_silu_pair_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -3124,7 +3124,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices< float, int >(
+            launch_program_silu_pair< float, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -3146,7 +3146,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
             );
          },
          [&]() {
-            launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices< double, int >(
+            launch_program_silu_pair< double, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -3167,7 +3167,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
                stream
             );
          },
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda"
+         "program_silu_pair_cuda"
       );
       return std::make_tuple(rel_cat, node_idx);
    }
@@ -3175,7 +3175,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices< float, int64_t >(
+         launch_program_silu_pair< float, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -3197,7 +3197,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
          );
       },
       [&]() {
-         launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices< double, int64_t >(
+         launch_program_silu_pair< double, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -3218,13 +3218,13 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
             stream
          );
       },
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda"
+      "program_silu_pair_cuda"
    );
    return std::make_tuple(rel_cat, node_idx);
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
+program_silu_pair_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -3302,7 +3302,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward< float, int >(
+            launch_program_silu_pair_backward< float, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -3332,7 +3332,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
             );
          },
          [&]() {
-            launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward< double, int >(
+            launch_program_silu_pair_backward< double, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -3361,7 +3361,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
                stream
             );
          },
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda"
+         "program_silu_pair_backward_cuda"
       );
       return std::make_tuple(
          grad_x,
@@ -3379,7 +3379,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward< float, int64_t >(
+         launch_program_silu_pair_backward< float, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -3409,7 +3409,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
          );
       },
       [&]() {
-         launch_fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward< double, int64_t >(
+         launch_program_silu_pair_backward< double, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -3438,7 +3438,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
             stream
          );
       },
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda"
+      "program_silu_pair_backward_cuda"
    );
    return std::make_tuple(
       grad_x,
@@ -3453,7 +3453,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
    );
 }
 
-std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda(
+std::tuple< Tensor, Tensor > program_silu_postnorm_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -3524,7 +3524,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices< float, int >(
+            launch_program_silu_postnorm< float, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -3549,7 +3549,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
             );
          },
          [&]() {
-            launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices< double, int >(
+            launch_program_silu_postnorm< double, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -3573,7 +3573,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
                stream
             );
          },
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda"
+         "program_silu_postnorm_cuda"
       );
       return std::make_tuple(rel_cat, node_idx);
    }
@@ -3581,7 +3581,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices< float, int64_t >(
+         launch_program_silu_postnorm< float, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -3606,7 +3606,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
          );
       },
       [&]() {
-         launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices< double, int64_t >(
+         launch_program_silu_postnorm< double, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -3630,13 +3630,13 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
             stream
          );
       },
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda"
+      "program_silu_postnorm_cuda"
    );
    return std::make_tuple(rel_cat, node_idx);
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda(
+program_silu_postnorm_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -3731,7 +3731,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward<
+            launch_program_silu_postnorm_backward<
                float,
                int >(
                grad_rel_work,
@@ -3768,7 +3768,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
             );
          },
          [&]() {
-            launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward<
+            launch_program_silu_postnorm_backward<
                double,
                int >(
                grad_rel_work,
@@ -3804,7 +3804,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
                stream
             );
          },
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda"
+         "program_silu_postnorm_backward_cuda"
       );
       return std::make_tuple(
          grad_x,
@@ -3824,7 +3824,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward<
+         launch_program_silu_postnorm_backward<
             float,
             int64_t >(
             grad_rel_work,
@@ -3861,7 +3861,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
          );
       },
       [&]() {
-         launch_fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward<
+         launch_program_silu_postnorm_backward<
             double,
             int64_t >(
             grad_rel_work,
@@ -3897,7 +3897,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
             stream
          );
       },
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda"
+      "program_silu_postnorm_backward_cuda"
    );
    return std::make_tuple(
       grad_x,
@@ -3915,7 +3915,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
 }
 
 std::tuple< Tensor, Tensor >
-fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda(
+program_rmsnorm_silu_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -3981,7 +3981,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cu
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< float, int >(
+            launch_program_rmsnorm_silu< float, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -4005,7 +4005,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cu
             );
          },
          [&]() {
-            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< double, int >(
+            launch_program_rmsnorm_silu< double, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -4028,7 +4028,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cu
                stream
             );
          },
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda"
+         "program_rmsnorm_silu_cuda"
       );
       return std::make_tuple(rel_cat, node_idx);
    }
@@ -4036,7 +4036,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cu
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< float, int64_t >(
+         launch_program_rmsnorm_silu< float, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -4060,7 +4060,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cu
          );
       },
       [&]() {
-         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices< double, int64_t >(
+         launch_program_rmsnorm_silu< double, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -4083,13 +4083,13 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cu
             stream
          );
       },
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda"
+      "program_rmsnorm_silu_cuda"
    );
    return std::make_tuple(rel_cat, node_idx);
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda(
+program_rmsnorm_silu_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -4176,7 +4176,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
       dispatch_float_or_double(
          grad_rel_work,
          [&]() {
-            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< float, int >(
+            launch_program_rmsnorm_silu_backward< float, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -4209,7 +4209,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
             );
          },
          [&]() {
-            launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< double, int >(
+            launch_program_rmsnorm_silu_backward< double, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -4241,7 +4241,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
                stream
             );
          },
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda"
+         "program_rmsnorm_silu_backward_cuda"
       );
       return std::make_tuple(
          grad_x,
@@ -4260,7 +4260,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
    dispatch_float_or_double(
       grad_rel_work,
       [&]() {
-         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< float, int64_t >(
+         launch_program_rmsnorm_silu_backward< float, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -4293,7 +4293,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
          );
       },
       [&]() {
-         launch_fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward< double, int64_t >(
+         launch_program_rmsnorm_silu_backward< double, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -4325,7 +4325,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
             stream
          );
       },
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda"
+      "program_rmsnorm_silu_backward_cuda"
    );
    return std::make_tuple(
       grad_x,
@@ -4342,7 +4342,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_two_layer_pointwise_from_indices_backward_cuda(
+block_pointwise_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -4398,7 +4398,7 @@ fused_two_layer_pointwise_from_indices_backward_cuda(
       dispatch_float_or_double(
          grad_rel_work,
          [&]() {
-            launch_fused_two_layer_pointwise_from_indices_backward< float, int >(
+            launch_block_pointwise_backward< float, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -4421,7 +4421,7 @@ fused_two_layer_pointwise_from_indices_backward_cuda(
             );
          },
          [&]() {
-            launch_fused_two_layer_pointwise_from_indices_backward< double, int >(
+            launch_block_pointwise_backward< double, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -4443,7 +4443,7 @@ fused_two_layer_pointwise_from_indices_backward_cuda(
                stream
             );
          },
-         "fused_two_layer_pointwise_from_indices_backward_cuda"
+         "block_pointwise_backward_cuda"
       );
       return std::make_tuple(grad_x, grad_w1, grad_b1, grad_w2, grad_b2);
    }
@@ -4451,7 +4451,7 @@ fused_two_layer_pointwise_from_indices_backward_cuda(
    dispatch_float_or_double(
       grad_rel_work,
       [&]() {
-         launch_fused_two_layer_pointwise_from_indices_backward< float, int64_t >(
+         launch_block_pointwise_backward< float, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -4474,7 +4474,7 @@ fused_two_layer_pointwise_from_indices_backward_cuda(
          );
       },
       [&]() {
-         launch_fused_two_layer_pointwise_from_indices_backward< double, int64_t >(
+         launch_block_pointwise_backward< double, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -4496,13 +4496,13 @@ fused_two_layer_pointwise_from_indices_backward_cuda(
             stream
          );
       },
-      "fused_two_layer_pointwise_from_indices_backward_cuda"
+      "block_pointwise_backward_cuda"
    );
    return std::make_tuple(grad_x, grad_w1, grad_b1, grad_w2, grad_b2);
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda_kernel(
+__global__ void block_postnorm_ln_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
    const int64_t* slot_offsets_ptr,
@@ -4618,7 +4618,7 @@ __global__ void fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda_k
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+void launch_block_postnorm_ln(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -4649,7 +4649,7 @@ void launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices(
    const size_t shared_bytes =
       static_cast< size_t >(2 * in_dim + hidden) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda_kernel< scalar_t, index_t >
+   block_postnorm_ln_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          x.data_ptr< scalar_t >(),
          relation_args.data_ptr< index_t >(),
@@ -4675,11 +4675,11 @@ void launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices(
          rel_cat.data_ptr< scalar_t >(),
          node_idx.data_ptr< int64_t >()
       );
-   check_kernel_launch("fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda_kernel");
+   check_kernel_launch("block_postnorm_ln_cuda_kernel");
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda_kernel(
+__global__ void block_postnorm_ln_backward_cuda_kernel(
    const scalar_t* grad_rel_ptr,
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -4866,7 +4866,7 @@ __global__ void fused_postnorm_two_layer_pointwise_layernorm_from_indices_backwa
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
+void launch_block_postnorm_ln_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -4903,7 +4903,7 @@ void launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
    const size_t shared_bytes =
       static_cast< size_t >(3 * in_dim + 3 * hidden) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda_kernel< scalar_t, index_t >
+   block_postnorm_ln_backward_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          grad_rel.data_ptr< scalar_t >(),
          x.data_ptr< scalar_t >(),
@@ -4936,11 +4936,11 @@ void launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
          grad_ln_bias.numel() > 0 ? grad_ln_bias.data_ptr< scalar_t >() : nullptr
       );
    check_kernel_launch(
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda_kernel"
+      "block_postnorm_ln_backward_cuda_kernel"
    );
 }
 
-std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda(
+std::tuple< Tensor, Tensor > block_postnorm_ln_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -5004,7 +5004,7 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices< float, int >(
+            launch_block_postnorm_ln< float, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -5026,7 +5026,7 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
             );
          },
          [&]() {
-            launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices< double, int >(
+            launch_block_postnorm_ln< double, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -5047,7 +5047,7 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
                stream
             );
          },
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda"
+         "block_postnorm_ln_cuda"
       );
       return std::make_tuple(rel_cat, node_idx);
    }
@@ -5055,7 +5055,7 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices< float, int64_t >(
+         launch_block_postnorm_ln< float, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -5077,7 +5077,7 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
          );
       },
       [&]() {
-         launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices< double, int64_t >(
+         launch_block_postnorm_ln< double, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -5098,13 +5098,13 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
             stream
          );
       },
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda"
+      "block_postnorm_ln_cuda"
    );
    return std::make_tuple(rel_cat, node_idx);
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
+block_postnorm_ln_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -5178,7 +5178,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
       dispatch_float_or_double(
          grad_rel_work,
          [&]() {
-            launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward<
+            launch_block_postnorm_ln_backward<
                float,
                int >(
                grad_rel_work,
@@ -5208,7 +5208,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
             );
          },
          [&]() {
-            launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward<
+            launch_block_postnorm_ln_backward<
                double,
                int >(
                grad_rel_work,
@@ -5237,7 +5237,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
                stream
             );
          },
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda"
+         "block_postnorm_ln_backward_cuda"
       );
       return std::make_tuple(
          grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_ln_weight, grad_ln_bias
@@ -5247,7 +5247,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
    dispatch_float_or_double(
       grad_rel_work,
       [&]() {
-         launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward<
+         launch_block_postnorm_ln_backward<
             float,
             int64_t >(
             grad_rel_work,
@@ -5277,7 +5277,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
          );
       },
       [&]() {
-         launch_fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward<
+         launch_block_postnorm_ln_backward<
             double,
             int64_t >(
             grad_rel_work,
@@ -5306,7 +5306,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
             stream
          );
       },
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda"
+      "block_postnorm_ln_backward_cuda"
    );
    return std::make_tuple(
       grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_ln_weight, grad_ln_bias
@@ -5314,7 +5314,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda_kernel(
+__global__ void block_prenorm_rms_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
    const int64_t* slot_offsets_ptr,
@@ -5416,7 +5416,7 @@ __global__ void fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda_kern
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
+void launch_block_prenorm_rms(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -5446,7 +5446,7 @@ void launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
    const size_t shared_bytes =
       static_cast< size_t >(2 * in_dim + hidden) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda_kernel< scalar_t, index_t >
+   block_prenorm_rms_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          x.data_ptr< scalar_t >(),
          relation_args.data_ptr< index_t >(),
@@ -5470,11 +5470,11 @@ void launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
          rel_cat.data_ptr< scalar_t >(),
          node_idx.data_ptr< int64_t >()
       );
-   check_kernel_launch("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda_kernel");
+   check_kernel_launch("block_prenorm_rms_cuda_kernel");
 }
 
 template < typename scalar_t, typename index_t >
-__global__ void fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda_kernel(
+__global__ void block_prenorm_rms_backward_cuda_kernel(
    const scalar_t* grad_rel_ptr,
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -5645,7 +5645,7 @@ __global__ void fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_
 }
 
 template < typename scalar_t, typename index_t >
-void launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
+void launch_block_prenorm_rms_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -5680,7 +5680,7 @@ void launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
    const size_t shared_bytes =
       static_cast< size_t >(4 * in_dim + 2 * hidden) * sizeof(scalar_t);
    const dim3 grid(static_cast< unsigned int >(total_rows));
-   fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda_kernel< scalar_t, index_t >
+   block_prenorm_rms_backward_cuda_kernel< scalar_t, index_t >
       <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
          grad_rel.data_ptr< scalar_t >(),
          x.data_ptr< scalar_t >(),
@@ -5709,10 +5709,10 @@ void launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
          grad_w2.data_ptr< scalar_t >(),
          grad_b2.numel() > 0 ? grad_b2.data_ptr< scalar_t >() : nullptr
       );
-   check_kernel_launch("fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda_kernel");
+   check_kernel_launch("block_prenorm_rms_backward_cuda_kernel");
 }
 
-std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda(
+std::tuple< Tensor, Tensor > block_prenorm_rms_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -5771,7 +5771,7 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
       dispatch_float_or_double(
          x_work,
          [&]() {
-            launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices< float, int >(
+            launch_block_prenorm_rms< float, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -5792,7 +5792,7 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
             );
          },
          [&]() {
-            launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices< double, int >(
+            launch_block_prenorm_rms< double, int >(
                x_work,
                relation_args_work,
                slot_offsets_work,
@@ -5812,7 +5812,7 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
                stream
             );
          },
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda"
+         "block_prenorm_rms_cuda"
       );
       return std::make_tuple(rel_cat, node_idx);
    }
@@ -5820,7 +5820,7 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
    dispatch_float_or_double(
       x_work,
       [&]() {
-         launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices< float, int64_t >(
+         launch_block_prenorm_rms< float, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -5841,7 +5841,7 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
          );
       },
       [&]() {
-         launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices< double, int64_t >(
+         launch_block_prenorm_rms< double, int64_t >(
             x_work,
             relation_args_work,
             slot_offsets_work,
@@ -5861,13 +5861,13 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
             stream
          );
       },
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda"
+      "block_prenorm_rms_cuda"
    );
    return std::make_tuple(rel_cat, node_idx);
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
+block_prenorm_rms_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -5932,7 +5932,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
       dispatch_float_or_double(
          grad_rel_work,
          [&]() {
-            launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward< float, int >(
+            launch_block_prenorm_rms_backward< float, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -5958,7 +5958,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
             );
          },
          [&]() {
-            launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward< double, int >(
+            launch_block_prenorm_rms_backward< double, int >(
                grad_rel_work,
                x_work,
                relation_args_work,
@@ -5983,7 +5983,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
                stream
             );
          },
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda"
+         "block_prenorm_rms_backward_cuda"
       );
       return std::make_tuple(grad_x, grad_rms_weight, grad_w1, grad_b1, grad_w2, grad_b2);
    }
@@ -5991,7 +5991,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
    dispatch_float_or_double(
       grad_rel_work,
       [&]() {
-         launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward< float, int64_t >(
+         launch_block_prenorm_rms_backward< float, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -6017,7 +6017,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
          );
       },
       [&]() {
-         launch_fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward< double, int64_t >(
+         launch_block_prenorm_rms_backward< double, int64_t >(
             grad_rel_work,
             x_work,
             relation_args_work,
@@ -6042,7 +6042,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
             stream
          );
       },
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda"
+      "block_prenorm_rms_backward_cuda"
    );
    return std::make_tuple(grad_x, grad_rms_weight, grad_w1, grad_b1, grad_w2, grad_b2);
 }

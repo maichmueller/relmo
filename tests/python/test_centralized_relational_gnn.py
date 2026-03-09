@@ -228,10 +228,10 @@ def test_centralized_rgnn_rejects_conflicting_central_args() -> None:
     with pytest.raises(ValueError):
         CentralizedRelationalGNN(
             embedding_size=2,
-            num_layer=1,
-            aggr="sum",
+            num_layers=1,
+            aggregation="sum",
             symbol_type_ids="obj",
-            relation_dict=_build_relation_dict(),
+            relations=_build_relation_dict(),
             central_module=torch.nn.Identity(),
             central_module_factory=lambda *_: torch.nn.Identity(),
         )
@@ -241,10 +241,10 @@ def test_centralized_rgnn_rejects_invalid_condition_dim() -> None:
     with pytest.raises(ValueError):
         CentralizedRelationalGNN(
             embedding_size=2,
-            num_layer=1,
-            aggr="sum",
+            num_layers=1,
+            aggregation="sum",
             symbol_type_ids="obj",
-            relation_dict=_build_relation_dict(),
+            relations=_build_relation_dict(),
             relation_condition_dim=0,
         )
 
@@ -252,10 +252,10 @@ def test_centralized_rgnn_rejects_invalid_condition_dim() -> None:
 def test_centralized_rgnn_condition_embedding_can_be_static() -> None:
     model = CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         relation_condition_learnable=False,
     )
     assert model.relation_condition_embedding.weight.requires_grad is False
@@ -264,26 +264,26 @@ def test_centralized_rgnn_condition_embedding_can_be_static() -> None:
 def test_centralized_rgnn_default_central_module_types() -> None:
     model_residual = CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         central_residual=True,
     )
     assert isinstance(model_residual.central_module, ResidualModule)
 
     model_plain = CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         central_residual=False,
     )
     assert isinstance(model_plain.central_module, FiLMConcatMLP)
 
 
-def test_centralized_rgnn_uses_relation_module_factory_alias() -> None:
+def test_centralized_rgnn_uses_central_module_factory() -> None:
     calls: list[int] = []
 
     def factory(max_arity):
@@ -292,11 +292,11 @@ def test_centralized_rgnn_uses_relation_module_factory_alias() -> None:
 
     CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
-        relation_module_factory=factory,
+        relations=_build_relation_dict(),
+        central_module_factory=factory,
     )
     assert calls == [2]
 
@@ -318,26 +318,26 @@ def test_centralized_rgnn_resolves_central_module_factories() -> None:
 
     CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         central_module_factory=factory_one,
     )
     CentralizedRelationalGNN(
         embedding_size=3,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         central_module_factory=factory_two,
     )
     CentralizedRelationalGNN(
         embedding_size=4,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         central_module_factory=factory_three,
     )
 
@@ -353,10 +353,10 @@ def test_centralized_rgnn_single_central_call() -> None:
     central = _CountingModule(out_size=embedding_size * 2)
     model = CentralizedRelationalGNN(
         embedding_size=embedding_size,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         relation_condition_dim=cond_dim,
         central_module=central,
         condition_position="pre",
@@ -381,10 +381,10 @@ def test_centralized_relational_gnn_condition_embedding_gets_gradients() -> None
     central = torch.nn.Linear(cond_dim + max_arity * embedding_size, max_arity * embedding_size)
     model = CentralizedRelationalGNN(
         embedding_size=embedding_size,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         relation_condition_dim=cond_dim,
         central_module=central,
         condition_position="pre",
@@ -392,7 +392,7 @@ def test_centralized_relational_gnn_condition_embedding_gets_gradients() -> None
         central_slot_mask=False,
     )
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type="obj",
         relation_sizes={"relA": 4, "relB": 3},
         num_symbols=6,
@@ -412,16 +412,16 @@ def test_centralized_relational_gnn_condition_embedding_gets_gradients() -> None
 def test_centralized_relational_gnn_static_condition_embedding_stays_grad_free() -> None:
     model = CentralizedRelationalGNN(
         embedding_size=4,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict={"relA": 1, "relB": 2},
+        relations={"relA": 1, "relB": 2},
         relation_condition_learnable=False,
         central_layer_mode="modular",
         central_slot_mask=False,
     )
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict={"relA": 1, "relB": 2},
+        relations={"relA": 1, "relB": 2},
         symbol_type="obj",
         relation_sizes={"relA": 3, "relB": 2},
         num_symbols=4,
@@ -439,7 +439,7 @@ def test_centralized_relational_gnn_fused_matches_modular_forward_and_gradients(
 ) -> None:
     relation_dict = {"relA": 1, "relB": 2}
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type="obj",
         relation_sizes={"relA": 4, "relB": 3},
         num_symbols=6,
@@ -448,20 +448,20 @@ def test_centralized_relational_gnn_fused_matches_modular_forward_and_gradients(
     torch.manual_seed(0)
     modular = CentralizedRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         central_layer_mode="modular",
         central_slot_mask=False,
     )
     torch.manual_seed(0)
     fused = CentralizedRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         central_layer_mode="fused",
         central_slot_mask=False,
     )
@@ -481,13 +481,13 @@ def test_centralized_relational_gnn_fused_matches_modular_forward_and_gradients(
 def test_centralized_relational_gnn_fused_schema_churn_matches_fresh_model() -> None:
     relation_dict = {"relA": 1, "relB": 2}
     x_a, e_a = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type="obj",
         relation_sizes={"relA": 4, "relB": 2},
         num_symbols=6,
     )
     x_b, e_b = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type="obj",
         relation_sizes={"relA": 2, "relB": 5},
         num_symbols=5,
@@ -496,19 +496,19 @@ def test_centralized_relational_gnn_fused_schema_churn_matches_fresh_model() -> 
     torch.manual_seed(99)
     model_a_then_b = CentralizedRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         central_layer_mode="fused",
         central_slot_mask=False,
     )
     model_b_only = CentralizedRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         central_layer_mode="fused",
         central_slot_mask=False,
     )
@@ -529,7 +529,7 @@ def test_centralized_relational_gnn_fused_cuda_custom_ops_matches_python(
 
     relation_dict = {"relA": 1, "relB": 2}
     x_dict_cpu, edge_index_cpu = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type="obj",
         relation_sizes={"relA": 5, "relB": 4},
         num_symbols=7,
@@ -541,19 +541,19 @@ def test_centralized_relational_gnn_fused_cuda_custom_ops_matches_python(
     torch.manual_seed(11)
     model_python = CentralizedRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         central_layer_mode="fused",
         central_slot_mask=False,
     ).cuda()
     model_custom = CentralizedRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         central_layer_mode="fused",
         central_slot_mask=False,
     ).cuda()
@@ -582,10 +582,10 @@ def test_centralized_rgnn_uses_arity_factory() -> None:
     factory = ArityMLPFactory(feature_size=2, layers=1)
     model = CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         central_module_factory=factory,
         central_slot_mask=False,
     )
@@ -596,10 +596,10 @@ def test_centralized_rgnn_accepts_central_film_factory_with_mask() -> None:
     factory = CentralFiLMFactory(layers=["x2"])
     model = CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict=_build_relation_dict(),
+        relations=_build_relation_dict(),
         central_module_factory=factory,
         condition_position="post",
         central_slot_mask=True,
@@ -613,10 +613,10 @@ def test_centralized_rgnn_accepts_central_film_factory_with_mask() -> None:
 def test_centralized_rgnn_default_zero_arity_module() -> None:
     model = CentralizedRelationalGNN(
         embedding_size=2,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="obj",
-        relation_dict={"relZero": 0},
+        relations={"relZero": 0},
     )
     assert isinstance(model.central_module, ZeroOut)
 

@@ -7,7 +7,7 @@ import torch
 
 def build_relation_graph(
     *,
-    relation_dict: Mapping[str, int],
+    relations: Mapping[str, int],
     symbol_type: str = "_symbol_",
     num_symbols: int = 5,
     relation_sizes: Mapping[str, int] | None = None,
@@ -18,7 +18,7 @@ def build_relation_graph(
     edge_index_dict: dict[tuple[str, str, str], torch.Tensor] = {}
     n_symbols = int(num_symbols)
 
-    for predicate, arity in relation_dict.items():
+    for predicate, arity in relations.items():
         arity = int(arity)
         n_rel = int(relation_sizes.get(predicate, max(2, arity + 1)))
         rel_ids = torch.arange(n_rel, dtype=torch.long)
@@ -39,7 +39,7 @@ def add_lgan_edges(
     *,
     x_dict: Mapping[str, torch.Tensor],
     edge_index_dict: dict[tuple[str, str, str], torch.Tensor],
-    relation_dict: Mapping[str, int],
+    relations: Mapping[str, int],
     symbol_type: str = "_symbol_",
     tn_label: str = "_lgan_tn_",
     nn_label: str = "_lgan_nn_",
@@ -47,7 +47,7 @@ def add_lgan_edges(
 ) -> None:
     """Add deterministic TN/NN/RR edge families required by LGANRelationalGNN."""
     n_symbols = int(x_dict[symbol_type].size(0))
-    for predicate in relation_dict:
+    for predicate in relations:
         n_rel = int(x_dict[predicate].size(0))
         rel_ids = torch.arange(n_rel, dtype=torch.long)
         edge_index_dict[(predicate, tn_label, symbol_type)] = torch.stack(

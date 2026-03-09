@@ -68,14 +68,14 @@ def test_lgan_relational_gnn_with_custom_label() -> None:
     custom_nn = "custom_nn"
     custom_rr = "custom_rr"
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 3, "rel_b": 2},
     )
     add_lgan_edges(
         x_dict=x_dict,
         edge_index_dict=edge_index_dict,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         tn_label=custom_tn,
         nn_label=custom_nn,
@@ -84,10 +84,10 @@ def test_lgan_relational_gnn_with_custom_label() -> None:
 
     model = LGANRelationalGNN(
         embedding_size=8,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         lgan_tn_edge_pos=custom_tn,
         lgan_nn_edge_pos=custom_nn,
         lgan_rr_edge_pos=custom_rr,
@@ -106,23 +106,23 @@ def test_lgan_relational_gnn_default_labels() -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 3, "rel_b": 2},
     )
     add_lgan_edges(
         x_dict=x_dict,
         edge_index_dict=edge_index_dict,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
     )
 
     model = LGANRelationalGNN(
         embedding_size=4,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
     ).eval()
 
     assert model.lgan_tn_edge_pos == "_lgan_tn_"
@@ -138,13 +138,13 @@ def test_lgan_relational_gnn_requires_all_lgan_edge_families() -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
     )
     add_lgan_edges(
         x_dict=x_dict,
         edge_index_dict=edge_index_dict,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
     )
     for edge_type in list(edge_index_dict.keys()):
@@ -153,10 +153,10 @@ def test_lgan_relational_gnn_requires_all_lgan_edge_families() -> None:
 
     model = LGANRelationalGNN(
         embedding_size=8,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
     )
 
     with pytest.raises(ValueError, match="missing"):
@@ -167,18 +167,18 @@ def test_lgan_relational_gnn_batched_uses_batched_label_fanin_modules() -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     model_batched = LGANRelationalGNN(
         embedding_size=4,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="_symbol_",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     )
     model_modular = LGANRelationalGNN(
         embedding_size=4,
-        num_layer=1,
-        aggr="sum",
+        num_layers=1,
+        aggregation="sum",
         symbol_type_ids="_symbol_",
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="modular",
     )
 
@@ -197,7 +197,7 @@ def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients(
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 4, "rel_b": 3},
     )
@@ -205,19 +205,19 @@ def test_relational_gnn_batched_cached_matches_modular_forward_and_gradients(
     torch.manual_seed(0)
     modular = RelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="modular",
     )
     torch.manual_seed(0)
     batched = RelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     )
     batched.load_state_dict(modular.state_dict(), strict=True)
@@ -242,7 +242,7 @@ def test_relational_gnn_fast_fused_matches_modular_forward_and_gradients(
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 4, "rel_b": 3},
     )
@@ -250,19 +250,19 @@ def test_relational_gnn_fast_fused_matches_modular_forward_and_gradients(
     torch.manual_seed(0)
     modular = RelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="modular",
     )
     torch.manual_seed(0)
     fast = FastRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         compile_forward=False,
     )
     fast.embedding_updater.load_state_dict(modular.embedding_updater.state_dict(), strict=True)
@@ -293,10 +293,10 @@ def test_fast_relational_gnn_rejects_non_fast_mode() -> None:
     with pytest.raises(ValueError, match="only supports rel_layer_mode='fast_fused'"):
         FastRelationalGNN(
             embedding_size=8,
-            num_layer=1,
-            aggr="sum",
+            num_layers=1,
+            aggregation="sum",
             symbol_type_ids="_symbol_",
-            relation_dict={"rel_a": 2},
+            relations={"rel_a": 2},
             rel_layer_mode="modular",
         )
 
@@ -308,33 +308,33 @@ def test_lgan_relational_gnn_batched_cached_matches_modular_forward_and_gradient
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict, edge_index_dict = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 4, "rel_b": 3},
     )
     add_lgan_edges(
         x_dict=x_dict,
         edge_index_dict=edge_index_dict,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
     )
 
     torch.manual_seed(0)
     modular = LGANRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="modular",
     )
     torch.manual_seed(0)
     batched = LGANRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr=aggr,
+        num_layers=2,
+        aggregation=aggr,
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     )
     batched.load_state_dict(modular.state_dict(), strict=True)
@@ -356,10 +356,10 @@ def test_lgan_relational_gnn_batched_cached_rejects_logsumexp_string() -> None:
     with pytest.raises(ValueError, match="Could not resolve 'logsumexp'"):
         LGANRelationalGNN(
             embedding_size=8,
-            num_layer=1,
-            aggr="logsumexp",
+            num_layers=1,
+            aggregation="logsumexp",
             symbol_type_ids="_symbol_",
-            relation_dict={"rel_a": 2, "rel_b": 1},
+            relations={"rel_a": 2, "rel_b": 1},
             rel_layer_mode="batched_cached",
         )
 
@@ -368,13 +368,13 @@ def test_relational_gnn_batched_cached_schema_churn_matches_fresh_model() -> Non
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_a, e_a = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 4, "rel_b": 2},
         num_symbols=6,
     )
     x_b, e_b = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 2, "rel_b": 5},
         num_symbols=5,
@@ -383,18 +383,18 @@ def test_relational_gnn_batched_cached_schema_churn_matches_fresh_model() -> Non
     torch.manual_seed(123)
     model_a_then_b = RelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     )
     model_b_only = RelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     )
     model_b_only.load_state_dict(model_a_then_b.state_dict(), strict=True)
@@ -412,7 +412,7 @@ def test_lgan_relational_gnn_batched_cached_schema_churn_matches_fresh_model() -
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_a, e_a = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 4, "rel_b": 2},
         num_symbols=6,
@@ -420,11 +420,11 @@ def test_lgan_relational_gnn_batched_cached_schema_churn_matches_fresh_model() -
     add_lgan_edges(
         x_dict=x_a,
         edge_index_dict=e_a,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
     )
     x_b, e_b = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 2, "rel_b": 5},
         num_symbols=5,
@@ -432,25 +432,25 @@ def test_lgan_relational_gnn_batched_cached_schema_churn_matches_fresh_model() -
     add_lgan_edges(
         x_dict=x_b,
         edge_index_dict=e_b,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
     )
 
     torch.manual_seed(123)
     model_a_then_b = LGANRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     )
     model_b_only = LGANRelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     )
     model_b_only.load_state_dict(model_a_then_b.state_dict(), strict=True)
@@ -474,7 +474,7 @@ def test_relational_gnn_batched_cached_cuda_custom_ops_matches_python(
     relation_dict = {"rel_a": 2, "rel_b": 1}
     symbol_type = "_symbol_"
     x_dict_cpu, edge_index_cpu = build_relation_graph(
-        relation_dict=relation_dict,
+        relations=relation_dict,
         symbol_type=symbol_type,
         relation_sizes={"rel_a": 5, "rel_b": 4},
         num_symbols=7,
@@ -486,18 +486,18 @@ def test_relational_gnn_batched_cached_cuda_custom_ops_matches_python(
     torch.manual_seed(7)
     model_python = RelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     ).cuda()
     model_custom = RelationalGNN(
         embedding_size=8,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids=symbol_type,
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
     ).cuda()
     model_custom.load_state_dict(model_python.state_dict(), strict=True)

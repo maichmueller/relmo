@@ -62,10 +62,10 @@ def _mp_preset_name() -> str:
     return key if key in _PRESET_FLAGS else "tuned_train"
 
 
-def _mp_flag(name: str, legacy_default: bool) -> bool:
+def _mp_flag(name: str, default: bool) -> bool:
     preset = _PRESET_FLAGS.get(_mp_preset_name(), _PRESET_FLAGS["tuned_train"])
-    default = preset.get(name, legacy_default)
-    return _env_bool(name, default)
+    resolved_default = preset.get(name, default)
+    return _env_bool(name, resolved_default)
 
 def _use_model_mp_ops(ref: torch.Tensor) -> bool:
     if relm_mp_ops is None:

@@ -1538,7 +1538,7 @@ class FlatRelationalLayer(torch.nn.Module):
             batch_items.append((relation_slice, match))
 
         pointwise_signature = batch_items[0][1].spec.pointwise_signature
-        pointwise_code = relm_mp_ops.pointwise_code_from_signature(
+        pointwise_code = relm_mp_ops.activation_code(
             pointwise_signature
         )
         if pointwise_code is None:
@@ -1550,7 +1550,7 @@ class FlatRelationalLayer(torch.nn.Module):
             return None
 
         group_key = (
-            "fused_relation",
+            "block_pointwise",
             type(grouped_batch.kernel),
             grouped_batch.arity,
             grouped_batch.signature,
@@ -1597,7 +1597,7 @@ class FlatRelationalLayer(torch.nn.Module):
         else:
             b2_stack = w2_stack.new_empty((0,))
 
-        return relm_mp_ops.fused_two_layer_pointwise_from_indices(
+        return relm_mp_ops.block_pointwise(
             x,
             relation_args,
             [int(item[0].slot_start) for item in batch_items],
@@ -1646,7 +1646,7 @@ class FlatRelationalLayer(torch.nn.Module):
             batch_items.append((relation_slice, match))
 
         pointwise_signature = batch_items[0][1].spec.pointwise_signature
-        pointwise_code = relm_mp_ops.pointwise_code_from_signature(
+        pointwise_code = relm_mp_ops.activation_code(
             pointwise_signature
         )
         if pointwise_code is None:
@@ -1671,7 +1671,7 @@ class FlatRelationalLayer(torch.nn.Module):
             return None
 
         group_key = (
-            "fused_postnorm_relation",
+            "block_postnorm_ln",
             type(grouped_batch.kernel),
             grouped_batch.arity,
             grouped_batch.signature,
@@ -1740,7 +1740,7 @@ class FlatRelationalLayer(torch.nn.Module):
             ln_weight_stack = w2_stack.new_empty((0,))
             ln_bias_stack = w2_stack.new_empty((0,))
 
-        return relm_mp_ops.fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+        return relm_mp_ops.block_postnorm_ln(
             x,
             relation_args,
             [int(item[0].slot_start) for item in batch_items],
@@ -1791,7 +1791,7 @@ class FlatRelationalLayer(torch.nn.Module):
             batch_items.append((relation_slice, match))
 
         pointwise_signature = batch_items[0][1].spec.pointwise_signature
-        pointwise_code = relm_mp_ops.pointwise_code_from_signature(
+        pointwise_code = relm_mp_ops.activation_code(
             pointwise_signature
         )
         if pointwise_code is None:
@@ -1816,7 +1816,7 @@ class FlatRelationalLayer(torch.nn.Module):
             return None
 
         group_key = (
-            "fused_prenorm_rmsnorm_relation",
+            "block_prenorm_rms",
             type(grouped_batch.kernel),
             grouped_batch.arity,
             grouped_batch.signature,
@@ -1875,21 +1875,19 @@ class FlatRelationalLayer(torch.nn.Module):
         else:
             rms_weight_stack = w2_stack.new_empty((0,))
 
-        return (
-            relm_mp_ops.fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
-                x,
-                relation_args,
-                [int(item[0].slot_start) for item in batch_items],
-                [int(item[0].count) for item in batch_items],
-                int(grouped_batch.arity),
-                rms_weight_stack,
-                float(eps),
-                w1_stack,
-                b1_stack,
-                w2_stack,
-                b2_stack,
-                int(pointwise_code),
-            )
+        return relm_mp_ops.block_prenorm_rms(
+            x,
+            relation_args,
+            [int(item[0].slot_start) for item in batch_items],
+            [int(item[0].count) for item in batch_items],
+            int(grouped_batch.arity),
+            rms_weight_stack,
+            float(eps),
+            w1_stack,
+            b1_stack,
+            w2_stack,
+            b2_stack,
+            int(pointwise_code),
         )
 
     def _collect_program_batch_items(
@@ -1933,12 +1931,7 @@ class FlatRelationalLayer(torch.nn.Module):
         slot_offsets_global = [int(item[0].slot_start) for item in batch_items]
         stage0_matches = [item[1].program_matches[0] for item in batch_items]
         stage1_matches = [item[1].program_matches[1] for item in batch_items]
-        program_key = (
-            "manual_program",
-            type(grouped_batch.kernel),
-            grouped_batch.arity,
-            grouped_batch.signature,
-        )
+        program_key = ("program_kernel", type(grouped_batch.kernel), grouped_batch.arity, grouped_batch.signature)
         w10_stack = self._get_grouped_param_stack(
             cache_key=("w10", program_key),
             tensors=[match.linears[0].weight for match in stage0_matches],
@@ -1987,7 +1980,7 @@ class FlatRelationalLayer(torch.nn.Module):
             forward_cache=grouped_param_stacks,
             allow_persistent=allow_persistent_stacks,
         )
-        return relm_mp_ops.fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+        return relm_mp_ops.program_silu_pair(
             x,
             relation_args,
             slot_offsets_global,
@@ -2024,7 +2017,7 @@ class FlatRelationalLayer(torch.nn.Module):
         slot_offsets_global = [int(item[0].slot_start) for item in batch_items]
         stage0_matches = [item[1].program_matches[0] for item in batch_items]
         stage1_matches = [item[1].program_matches[1] for item in batch_items]
-        program_key = ("manual_program", type(grouped_batch.kernel), grouped_batch.arity, grouped_batch.signature)
+        program_key = ("program_kernel", type(grouped_batch.kernel), grouped_batch.arity, grouped_batch.signature)
         norm_signature = stage1_matches[0].spec.signature[-1]
         if norm_signature is None or str(norm_signature[0]) != "layernorm":
             return None
@@ -2105,7 +2098,7 @@ class FlatRelationalLayer(torch.nn.Module):
             )
         else:
             ln_bias_stack = w21_stack.new_empty((0,))
-        return relm_mp_ops.fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(
+        return relm_mp_ops.program_silu_postnorm(
             x,
             relation_args,
             slot_offsets_global,
@@ -2145,7 +2138,7 @@ class FlatRelationalLayer(torch.nn.Module):
         slot_offsets_global = [int(item[0].slot_start) for item in batch_items]
         stage0_matches = [item[1].program_matches[0] for item in batch_items]
         stage1_matches = [item[1].program_matches[1] for item in batch_items]
-        program_key = ("manual_program", type(grouped_batch.kernel), grouped_batch.arity, grouped_batch.signature)
+        program_key = ("program_kernel", type(grouped_batch.kernel), grouped_batch.arity, grouped_batch.signature)
         norm_signature = stage0_matches[0].spec.signature[-1]
         if norm_signature is None or str(norm_signature[0]) != "rmsnorm":
             return None
@@ -2213,7 +2206,7 @@ class FlatRelationalLayer(torch.nn.Module):
             forward_cache=grouped_param_stacks,
             allow_persistent=allow_persistent_stacks,
         )
-        return relm_mp_ops.fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
+        return relm_mp_ops.program_rmsnorm_silu(
             x,
             relation_args,
             slot_offsets_global,

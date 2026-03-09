@@ -544,11 +544,6 @@ class CentralFiLMFactory:
             activate_last_layer=self.activate_last_layer,
         )
 
-
-# Backward-compatible alias for older naming.
-CentralFilmFactory = CentralFiLMFactory
-
-
 # --- Tuple-aware, conditional-aware modules and helper ---
 class CondLinear(nn.Module):
     """Tuple-aware FiLM Linear.

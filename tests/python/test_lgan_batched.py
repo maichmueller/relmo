@@ -8,10 +8,10 @@ def test_lgan_batched_cached_label_fanin_smoke() -> None:
     relation_dict = {"rel_a": 2, "rel_b": 1}
     model = LGANRelationalGNN(
         embedding_size=embedding_size,
-        num_layer=2,
-        aggr="sum",
+        num_layers=2,
+        aggregation="sum",
         symbol_type_ids=("_symbol_",),
-        relation_dict=relation_dict,
+        relations=relation_dict,
         rel_layer_mode="batched_cached",
         include_lgan_edges=True,
     )

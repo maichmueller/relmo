@@ -14,7 +14,7 @@ from ._compile import optional_compile
 from ._logging import get_logger
 
 from .aggr import LogSumExpAggregation
-from .film import CentralFilmFactory, FiLMConcatMLP
+from .film import CentralFiLMFactory, FiLMConcatMLP
 from .hetero_mp import (
     CentralFanOutMP,
     CentralFusedLayerMP,
@@ -145,10 +145,10 @@ class RelationalGNN(PyGHeteroModule):
     def __init__(
         self,
         embedding_size: int,
-        num_layer: int,
-        aggr: Optional[str | pyg.nn.aggr.Aggregation],
+        num_layers: int,
+        aggregation: Optional[str | pyg.nn.aggr.Aggregation],
         symbol_type_ids: Iterable[str] | str,
-        relation_dict: RelationDict,
+        relations: RelationDict,
         relation_module_factory: Callable[[str, int], torch.nn.Module]
         | ArityMLPFactory
         | None = None,
@@ -167,10 +167,10 @@ class RelationalGNN(PyGHeteroModule):
     ):
         """
         :param embedding_size: The size of object embeddings.
-        :param num_layer: Total number of message exchange iterations.
-        :param aggr: Aggregation-function to be used for message passing.
+        :param num_layers: Total number of message exchange iterations.
+        :param aggregation: Aggregation-function to be used for message passing.
         :param symbol_type_ids: The type identifier(s) of objects in the x_dict.
-        :param relation_dict: A dictionary mapping predicates names to their arity.
+        :param relations: A dictionary mapping predicates names to their arity.
         :param activation: The activation function for all MLPs
             (Default: "mish", other options: "relu", "gelu", "silu", or a callable).
         :param relation_module_factory: A factory function that takes a predicate name and its arity
@@ -232,13 +232,13 @@ class RelationalGNN(PyGHeteroModule):
             )
             self.random_initialization = False
 
-        self.num_layer: int = num_layer
+        self.num_layers: int = num_layers
         self.symbol_type_ids: tuple[str, ...] = (
             (symbol_type_ids,)
             if isinstance(symbol_type_ids, str)
             else tuple(symbol_type_ids)
         )
-        self.relation_dict: RelationDict = relation_dict
+        self.relations: RelationDict = relations
 
         self.strict_ntype_filter = strict_ntype_filter
         # the module to pass node-features from symbols (objects, action, ...) to relations (atoms, action-schemas, ...)
@@ -252,17 +252,17 @@ class RelationalGNN(PyGHeteroModule):
         # resolve activation
         self.activation = activation or "mish"
         # resolve aggregation
-        if isinstance(aggr, str) or aggr is None:
-            if aggr is None or aggr.lower() == "logsumexp":
-                aggr = LogSumExpAggregation()
+        if isinstance(aggregation, str) or aggregation is None:
+            if aggregation is None or aggregation.lower() == "logsumexp":
+                aggregation = LogSumExpAggregation()
             else:
-                aggr = aggregation_resolver(aggr)
+                aggregation = aggregation_resolver(aggregation)
         else:
-            raise ValueError(f"Invalid aggregation type: {aggr}")
+            raise ValueError(f"Invalid aggregation type: {aggregation}")
         self._init_modules(
             embedding_size,
-            num_layer,
-            aggr,
+            num_layers,
+            aggregation,
             relation_module_factory,
             ignore_zero_arity_relations,
         )
@@ -299,8 +299,8 @@ class RelationalGNN(PyGHeteroModule):
     def _init_modules(
         self,
         embedding_size: int,
-        num_layer: int,
-        aggr: Optional[str | pyg.nn.aggr.Aggregation],
+        num_layers: int,
+        aggregation: Optional[str | pyg.nn.aggr.Aggregation],
         relation_module_factory: Callable[[str, int], torch.nn.Module],
         ignore_zero_arity_relations: bool = True,
     ):
@@ -321,7 +321,7 @@ class RelationalGNN(PyGHeteroModule):
             )
         relation_module_dict = {
             pred: relation_module_factory(arity)
-            for pred, arity in self.relation_dict.items()
+            for pred, arity in self.relations.items()
             if arity > 0 or not ignore_zero_arity_relations
         }
 
@@ -330,7 +330,7 @@ class RelationalGNN(PyGHeteroModule):
 
             relation_arities = {
                 pred: arity
-                for pred, arity in self.relation_dict.items()
+                for pred, arity in self.relations.items()
                 if arity > 0 or not ignore_zero_arity_relations
             }
             self.symbols_to_relations_mp = BatchedFanOutMP(
@@ -345,14 +345,14 @@ class RelationalGNN(PyGHeteroModule):
                 embedding_size=embedding_size,
                 dst_types=self.symbol_type_ids,
                 relation_arities=relation_arities,
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
                 validate_routing=self.rel_validate_routing,
             )
         elif self.rel_layer_mode == "fast_fused":
             relation_arities = {
                 pred: arity
-                for pred, arity in self.relation_dict.items()
+                for pred, arity in self.relations.items()
                 if arity > 0 or not ignore_zero_arity_relations
             }
             self.fast_fused_rel_layer_mp = FastFusedRelationalLayerMP(
@@ -361,11 +361,10 @@ class RelationalGNN(PyGHeteroModule):
                 embedding_size=embedding_size,
                 src_types=self.symbol_type_ids,
                 dst_types=self.symbol_type_ids,
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
                 validate_routing=self.rel_validate_routing,
             )
-            # Keep valid nn.Module attributes for compatibility with existing code paths.
             self.symbols_to_relations_mp = torch.nn.Identity()
             self.relations_to_symbols_mp = torch.nn.Identity()
         else:
@@ -377,7 +376,7 @@ class RelationalGNN(PyGHeteroModule):
             self.relations_to_symbols_mp = FanInMP(
                 embedding_size=embedding_size,
                 dst_types=self.symbol_type_ids,
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
             )
         # Updates object embedding from embedding of last iteration and current iteration:
@@ -507,7 +506,7 @@ class RelationalGNN(PyGHeteroModule):
         # Initialize embeddings for objects and atoms.
         x_dict, extra = self.initialize_embeddings(x_dict)
 
-        for _ in range(self.num_layer):
+        for _ in range(self.num_layers):
             self.layer(
                 x_dict, edge_index_dict, extra=extra, symbol_ntype_ids=symbol_ntype_ids
             )
@@ -559,11 +558,10 @@ class CentralizedRelationalGNN(RelationalGNN):
     def __init__(
         self,
         embedding_size: int,
-        num_layer: int,
-        aggr: Optional[str | pyg.nn.aggr.Aggregation],
+        num_layers: int,
+        aggregation: Optional[str | pyg.nn.aggr.Aggregation],
         symbol_type_ids: Iterable[str] | str,
-        relation_dict: RelationDict,
-        relation_module_factory: Callable[[int], torch.nn.Module] | None = None,
+        relations: RelationDict,
         *,
         relation_condition_dim: int | None = None,
         relation_condition_learnable: bool = True,
@@ -571,7 +569,7 @@ class CentralizedRelationalGNN(RelationalGNN):
         central_module: torch.nn.Module | None = None,
         central_module_factory: Callable[..., torch.nn.Module]
         | ArityMLPFactory
-        | CentralFilmFactory
+        | CentralFiLMFactory
         | None = None,
         central_residual: bool = True,
         central_conditioning: str = "film",
@@ -580,14 +578,10 @@ class CentralizedRelationalGNN(RelationalGNN):
         central_validate_routing: bool = False,
         **kwargs,
     ):
-        if central_module is not None and (
-            central_module_factory is not None or relation_module_factory is not None
-        ):
+        if central_module is not None and central_module_factory is not None:
             raise ValueError(
-                "Pass either central_module or central_module_factory/relation_module_factory, not both."
+                "Pass either central_module or central_module_factory, not both."
             )
-        if central_module_factory is None and relation_module_factory is not None:
-            central_module_factory = relation_module_factory
 
         self._relation_condition_dim = relation_condition_dim
         self.relation_condition_learnable = relation_condition_learnable
@@ -621,10 +615,10 @@ class CentralizedRelationalGNN(RelationalGNN):
 
         super().__init__(
             embedding_size=embedding_size,
-            num_layer=num_layer,
-            aggr=aggr,
+            num_layers=num_layers,
+            aggregation=aggregation,
             symbol_type_ids=symbol_type_ids,
-            relation_dict=relation_dict,
+            relations=relations,
             relation_module_factory=None,
             **kwargs,
         )
@@ -632,8 +626,8 @@ class CentralizedRelationalGNN(RelationalGNN):
     def _init_modules(
         self,
         embedding_size: int,
-        num_layer: int,
-        aggr: Optional[str | pyg.nn.aggr.Aggregation],
+        num_layers: int,
+        aggregation: Optional[str | pyg.nn.aggr.Aggregation],
         relation_module_factory: Callable[[str, int], torch.nn.Module],
         ignore_zero_arity_relations: bool = True,
     ):
@@ -645,15 +639,15 @@ class CentralizedRelationalGNN(RelationalGNN):
             )
         self.relation_condition_dim = self._relation_condition_dim
         self.relation_condition_index = {
-            predicate: idx for idx, predicate in enumerate(self.relation_dict)
+            predicate: idx for idx, predicate in enumerate(self.relations)
         }
         self.relation_condition_embedding = torch.nn.Embedding(
-            len(self.relation_dict), self.relation_condition_dim
+            len(self.relations), self.relation_condition_dim
         )
         if not self.relation_condition_learnable:
             self.relation_condition_embedding.weight.requires_grad_(False)
 
-        self.max_relation_arity: int = max(self.relation_dict.values(), default=0)
+        self.max_relation_arity: int = max(self.relations.values(), default=0)
         self.central_mask_dim = self.max_relation_arity if self.central_slot_mask else 0
         self.central_module = self._resolve_central_module(
             embedding_size,
@@ -669,11 +663,11 @@ class CentralizedRelationalGNN(RelationalGNN):
         relation_arities = (
             {
                 pred: arity
-                for pred, arity in self.relation_dict.items()
+                for pred, arity in self.relations.items()
                 if arity > 0 or not ignore_zero_arity_relations
             }
             if ignore_zero_arity_relations
-            else dict(self.relation_dict.items())
+            else dict(self.relations.items())
         )
         if self.central_layer_mode == "fused":
             self.central_fused_layer_mp = CentralFusedLayerMP(
@@ -687,11 +681,10 @@ class CentralizedRelationalGNN(RelationalGNN):
                 include_slot_mask=self.central_slot_mask,
                 symbol_type_ids=self.symbol_type_ids,
                 dst_symbol_type_ids=self.symbol_type_ids,
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
                 validate_routing=self.central_validate_routing,
             )
-            # Unused in fused mode, but kept as valid nn.Module attributes.
             self.symbols_to_relations_mp = torch.nn.Identity()
             self.relations_to_symbols_mp = torch.nn.Identity()
         else:
@@ -710,7 +703,7 @@ class CentralizedRelationalGNN(RelationalGNN):
             self.relations_to_symbols_mp = FanInMP(
                 embedding_size=embedding_size,
                 dst_types=self.symbol_type_ids,
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
             )
         self.embedding_updater = SimpleMLP(
@@ -807,7 +800,7 @@ class CentralizedRelationalGNN(RelationalGNN):
                 embedding_size, max_arity, condition_dim, mask_dim
             )
         factory = self._central_module_factory
-        if isinstance(factory, CentralFilmFactory):
+        if isinstance(factory, CentralFiLMFactory):
             return factory(
                 embedding_size=embedding_size,
                 max_arity=max_arity,
@@ -861,10 +854,10 @@ class LGANRelationalGNN(RelationalGNN):
     def __init__(
         self,
         embedding_size: int,
-        num_layer: int,
-        aggr: Optional[str | pyg.nn.aggr.Aggregation],
+        num_layers: int,
+        aggregation: Optional[str | pyg.nn.aggr.Aggregation],
         symbol_type_ids: Iterable[str] | str,
-        relation_dict: RelationDict,
+        relations: RelationDict,
         relation_module_factory: Callable[[str, int], torch.nn.Module] | None = None,
         ignore_zero_arity_relations: bool = True,
         include_lgan_edges: bool = True,
@@ -884,45 +877,45 @@ class LGANRelationalGNN(RelationalGNN):
         self.lgan_rr_edge_pos = str(lgan_rr_edge_pos)
         super().__init__(
             embedding_size=embedding_size,
-            num_layer=num_layer,
-            aggr=aggr,
+            num_layers=num_layers,
+            aggregation=aggregation,
             symbol_type_ids=symbol_type_ids,
-            relation_dict=relation_dict,
+            relations=relations,
             relation_module_factory=relation_module_factory,
             ignore_zero_arity_relations=ignore_zero_arity_relations,
             **kwargs,
         )
-        self._relation_type_ids = tuple(str(k) for k in self.relation_dict.keys())
+        self._relation_type_ids = tuple(str(k) for k in self.relations.keys())
         if self.rel_layer_mode == "batched_cached":
             from .hetero_mp import BatchedFanInMP
 
             self.tn_relations_to_symbols_mp = BatchedFanInMP(
                 embedding_size=self.embedding_size,
                 dst_types=self.symbol_type_ids,
-                relation_arities=self.relation_dict,
+                relation_arities=self.relations,
                 src_types=self._relation_type_ids,
                 edge_labels=(self.lgan_tn_edge_pos,),
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
                 validate_routing=self.rel_validate_routing,
             )
             self.nn_relations_to_symbols_mp = BatchedFanInMP(
                 embedding_size=self.embedding_size,
                 dst_types=self.symbol_type_ids,
-                relation_arities=self.relation_dict,
+                relation_arities=self.relations,
                 src_types=self._relation_type_ids,
                 edge_labels=(self.lgan_nn_edge_pos,),
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
                 validate_routing=self.rel_validate_routing,
             )
             self.rr_relations_to_relations_mp = BatchedFanInMP(
                 embedding_size=self.embedding_size,
                 dst_types=self._relation_type_ids,
-                relation_arities=self.relation_dict,
+                relation_arities=self.relations,
                 src_types=self._relation_type_ids,
                 edge_labels=(self.lgan_rr_edge_pos,),
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
                 validate_routing=self.rel_validate_routing,
             )
@@ -932,7 +925,7 @@ class LGANRelationalGNN(RelationalGNN):
                 dst_types=self.symbol_type_ids,
                 src_types=self._relation_type_ids,
                 edge_labels=(self.lgan_tn_edge_pos,),
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
             )
             self.nn_relations_to_symbols_mp = FanInMP(
@@ -940,7 +933,7 @@ class LGANRelationalGNN(RelationalGNN):
                 dst_types=self.symbol_type_ids,
                 src_types=self._relation_type_ids,
                 edge_labels=(self.lgan_nn_edge_pos,),
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
             )
             self.rr_relations_to_relations_mp = FanInMP(
@@ -948,7 +941,7 @@ class LGANRelationalGNN(RelationalGNN):
                 dst_types=self._relation_type_ids,
                 src_types=self._relation_type_ids,
                 edge_labels=(self.lgan_rr_edge_pos,),
-                aggr=aggr,
+                aggr=aggregation,
                 strict_filter_mode=self.strict_ntype_filter,
             )
         self.fusion_updater = SimpleMLP(
@@ -1031,7 +1024,7 @@ class LGANRelationalGNN(RelationalGNN):
                 raise ValueError(
                     f"Expected 2D relation embedding for {relation_type!r}, got dim={rel_x.dim()}."
                 )
-            arity = int(self.relation_dict[relation_type])
+            arity = int(self.relations[relation_type])
             if arity <= 0:
                 pooled[relation_type] = rel_x.new_zeros((rel_x.size(0), self.embedding_size))
                 continue

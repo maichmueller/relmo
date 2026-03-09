@@ -70,7 +70,7 @@ Tensor ensure_contiguous(const Tensor& t)
 }
 
 #if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
-std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
+std::tuple< Tensor, Tensor > block_pointwise_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -86,7 +86,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices_cuda(
    int64_t pointwise_code
 );
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_two_layer_pointwise_from_indices_backward_cuda(
+block_pointwise_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -101,7 +101,7 @@ fused_two_layer_pointwise_from_indices_backward_cuda(
    const Tensor& b2_stack,
    int64_t pointwise_code
 );
-std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda(
+std::tuple< Tensor, Tensor > block_postnorm_ln_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -120,7 +120,7 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
    int64_t pointwise_code
 );
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
+block_postnorm_ln_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -138,7 +138,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
    double ln_eps,
    int64_t pointwise_code
 );
-std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda(
+std::tuple< Tensor, Tensor > block_prenorm_rms_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -156,7 +156,7 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
    int64_t pointwise_code
 );
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
+block_prenorm_rms_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -173,7 +173,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
    const Tensor& b2_stack,
    int64_t pointwise_code
 );
-std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda(
+std::tuple< Tensor, Tensor > program_silu_pair_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -192,7 +192,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
    const Tensor& b21_stack
 );
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
+program_silu_pair_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -210,7 +210,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
    const Tensor& w21_stack,
    const Tensor& b21_stack
 );
-std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda(
+std::tuple< Tensor, Tensor > program_silu_postnorm_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -232,7 +232,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
    double ln_eps
 );
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda(
+program_silu_postnorm_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -254,7 +254,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_
    double ln_eps
 );
 std::tuple< Tensor, Tensor >
-fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda(
+program_rmsnorm_silu_cuda(
    const Tensor& x,
    const Tensor& relation_args,
    const Tensor& slot_offsets,
@@ -275,7 +275,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cu
    const Tensor& b21_stack
 );
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda(
+program_rmsnorm_silu_backward_cuda(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -488,7 +488,7 @@ std::tuple< Tensor, Tensor, Tensor > fanin_pack_multi(
    return std::make_tuple(rel_cat, flat_src, dst_idx);
 }
 
-std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
+std::tuple< Tensor, Tensor > block_pointwise(
    const Tensor& x,
    const Tensor& relation_args,
    const std::vector< int64_t >& slot_offsets,
@@ -505,39 +505,39 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device(),
-      "fused_two_layer_pointwise_from_indices expects x and relation_args on the same device."
+      "block_pointwise expects x and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_two_layer_pointwise_from_indices expects slot_offsets and row_sizes with equal lengths."
+      "block_pointwise expects slot_offsets and row_sizes with equal lengths."
    );
-   TORCH_CHECK(arity > 0, "fused_two_layer_pointwise_from_indices expects arity > 0.");
+   TORCH_CHECK(arity > 0, "block_pointwise expects arity > 0.");
    check_rank(w1_stack, 3, "w1_stack");
    check_rank(w2_stack, 3, "w2_stack");
    TORCH_CHECK(
       b1_stack.dim() <= 2,
-      "fused_two_layer_pointwise_from_indices expects b1_stack rank <= 2."
+      "block_pointwise expects b1_stack rank <= 2."
    );
    TORCH_CHECK(
       b2_stack.dim() <= 2,
-      "fused_two_layer_pointwise_from_indices expects b2_stack rank <= 2."
+      "block_pointwise expects b2_stack rank <= 2."
    );
 
    const int64_t groups = static_cast< int64_t >(slot_offsets.size());
    TORCH_CHECK(
       w1_stack.size(0) == groups && w2_stack.size(0) == groups,
-      "fused_two_layer_pointwise_from_indices weight stacks must have first dim equal to group count."
+      "block_pointwise weight stacks must have first dim equal to group count."
    );
    if(b1_stack.numel() > 0) {
       TORCH_CHECK(
          b1_stack.dim() == 2 && b1_stack.size(0) == groups,
-         "fused_two_layer_pointwise_from_indices b1_stack must have shape [groups, hidden] when non-empty."
+         "block_pointwise b1_stack must have shape [groups, hidden] when non-empty."
       );
    }
    if(b2_stack.numel() > 0) {
       TORCH_CHECK(
          b2_stack.dim() == 2 && b2_stack.size(0) == groups,
-         "fused_two_layer_pointwise_from_indices b2_stack must have shape [groups, out_dim] when non-empty."
+         "block_pointwise b2_stack must have shape [groups, out_dim] when non-empty."
       );
    }
 
@@ -545,7 +545,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       w1_stack.size(2) == in_dim,
-      "fused_two_layer_pointwise_from_indices expects w1_stack.shape[-1] == arity * emb, got ",
+      "block_pointwise expects w1_stack.shape[-1] == arity * emb, got ",
       w1_stack.size(2),
       " vs ",
       in_dim,
@@ -554,22 +554,22 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
    const int64_t hidden = w1_stack.size(1);
    TORCH_CHECK(
       w2_stack.size(2) == hidden,
-      "fused_two_layer_pointwise_from_indices expects w2_stack.shape[-1] == hidden."
+      "block_pointwise expects w2_stack.shape[-1] == hidden."
    );
    TORCH_CHECK(
       w2_stack.size(1) == in_dim,
-      "fused_two_layer_pointwise_from_indices expects w2_stack.shape[1] == arity * emb."
+      "block_pointwise expects w2_stack.shape[1] == arity * emb."
    );
    if(b1_stack.numel() > 0) {
       TORCH_CHECK(
          b1_stack.size(1) == hidden,
-         "fused_two_layer_pointwise_from_indices expects b1_stack.shape[1] == hidden."
+         "block_pointwise expects b1_stack.shape[1] == hidden."
       );
    }
    if(b2_stack.numel() > 0) {
       TORCH_CHECK(
          b2_stack.size(1) == in_dim,
-         "fused_two_layer_pointwise_from_indices expects b2_stack.shape[1] == arity * emb."
+         "block_pointwise expects b2_stack.shape[1] == arity * emb."
       );
    }
 
@@ -586,7 +586,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_two_layer_pointwise_from_indices row_sizes must be >= 0 at group ",
+         "block_pointwise row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -594,11 +594,11 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_two_layer_pointwise_from_indices expects non-negative slot offsets."
+         "block_pointwise expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_two_layer_pointwise_from_indices slice out of bounds at group ",
+         "block_pointwise slice out of bounds at group ",
          i,
          ": start=",
          start,
@@ -619,7 +619,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_two_layer_pointwise_from_indices_cuda(
+      return block_pointwise_cuda(
          x,
          relation_args_i64,
          slot_offsets_t,
@@ -673,7 +673,7 @@ std::tuple< Tensor, Tensor > fused_two_layer_pointwise_from_indices(
    return std::make_tuple(rel_cat, node_idx_cat);
 }
 
-std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_from_indices(
+std::tuple< Tensor, Tensor > program_silu_pair(
    const Tensor& x,
    const Tensor& relation_args,
    const std::vector< int64_t >& slot_offsets,
@@ -693,15 +693,15 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device(),
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects x and relation_args on the same device."
+      "program_silu_pair expects x and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects slot_offsets and row_sizes with equal lengths."
+      "program_silu_pair expects slot_offsets and row_sizes with equal lengths."
    );
    TORCH_CHECK(
       arity > 0,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects arity > 0."
+      "program_silu_pair expects arity > 0."
    );
    check_rank(w10_stack, 3, "w10_stack");
    check_rank(b10_stack, 2, "b10_stack");
@@ -718,26 +718,26 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
          && b20_stack.size(0) == groups && w11_stack.size(0) == groups
          && b11_stack.size(0) == groups && w21_stack.size(0) == groups
          && b21_stack.size(0) == groups,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices parameter stacks must match group count."
+      "program_silu_pair parameter stacks must match group count."
    );
 
    const int64_t emb = x.size(1);
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       w10_stack.size(2) == in_dim && w20_stack.size(1) == in_dim && b20_stack.size(1) == in_dim,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-1 dims must match arity * emb."
+      "program_silu_pair stage-1 dims must match arity * emb."
    );
    TORCH_CHECK(
       w11_stack.size(2) == in_dim && w21_stack.size(1) == in_dim && b21_stack.size(1) == in_dim,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-2 dims must match arity * emb."
+      "program_silu_pair stage-2 dims must match arity * emb."
    );
    TORCH_CHECK(
       b10_stack.size(1) == w10_stack.size(1) && w20_stack.size(2) == w10_stack.size(1),
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-1 hidden dims must match."
+      "program_silu_pair stage-1 hidden dims must match."
    );
    TORCH_CHECK(
       b11_stack.size(1) == w11_stack.size(1) && w21_stack.size(2) == w11_stack.size(1),
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices stage-2 hidden dims must match."
+      "program_silu_pair stage-2 hidden dims must match."
    );
 
    Tensor relation_args_i64 =
@@ -753,7 +753,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices row_sizes must be >= 0 at group ",
+         "program_silu_pair row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -761,11 +761,11 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices expects non-negative slot offsets."
+         "program_silu_pair expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices slice out of bounds at group ",
+         "program_silu_pair slice out of bounds at group ",
          i,
          "."
       );
@@ -780,7 +780,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_program_two_layer_silu_then_two_layer_silu_from_indices_cuda(
+      return program_silu_pair_cuda(
          x,
          relation_args_i64,
          slot_offsets_t,
@@ -831,7 +831,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_two_layer_silu_fr
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
+program_silu_pair_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -853,34 +853,34 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       grad_rel.device() == x.device() && x.device() == relation_args.device(),
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+      "program_silu_pair_backward expects grad_rel, x, and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+      "program_silu_pair_backward expects slot_offsets and row_sizes with equal lengths."
    );
    TORCH_CHECK(
       arity > 0,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward expects arity > 0."
+      "program_silu_pair_backward expects arity > 0."
    );
    const int64_t groups = static_cast< int64_t >(slot_offsets.size());
    const int64_t emb = x.size(1);
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       grad_rel.size(1) == emb,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward expects grad_rel.shape[1] == emb."
+      "program_silu_pair_backward expects grad_rel.shape[1] == emb."
    );
    TORCH_CHECK(
       w10_stack.size(0) == groups && b10_stack.size(0) == groups && w20_stack.size(0) == groups
          && b20_stack.size(0) == groups && w11_stack.size(0) == groups
          && b11_stack.size(0) == groups && w21_stack.size(0) == groups
          && b21_stack.size(0) == groups,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward parameter stacks must match group count."
+      "program_silu_pair_backward parameter stacks must match group count."
    );
    TORCH_CHECK(
       w10_stack.size(2) == in_dim && w20_stack.size(1) == in_dim && b20_stack.size(1) == in_dim
          && w11_stack.size(2) == in_dim && w21_stack.size(1) == in_dim && b21_stack.size(1) == in_dim,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward stack dims do not match arity * emb."
+      "program_silu_pair_backward stack dims do not match arity * emb."
    );
 
    Tensor relation_args_i64 =
@@ -896,7 +896,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward row_sizes must be >= 0 at group ",
+         "program_silu_pair_backward row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -904,11 +904,11 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward expects non-negative slot offsets."
+         "program_silu_pair_backward expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward slice out of bounds at group ",
+         "program_silu_pair_backward slice out of bounds at group ",
          i,
          "."
       );
@@ -917,7 +917,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
    }
    TORCH_CHECK(
       grad_rel.size(0) == out_offsets.back(),
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward expects grad_rel rows to match packed slot count."
+      "program_silu_pair_backward expects grad_rel rows to match packed slot count."
    );
 
 #if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
@@ -928,7 +928,7 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward_cuda(
+      return program_silu_pair_backward_cuda(
          grad_rel,
          x,
          relation_args_i64,
@@ -950,11 +950,11 @@ fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(
 #endif
    TORCH_CHECK(
       false,
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward currently supports only CUDA float32/float64 tensors."
+      "program_silu_pair_backward currently supports only CUDA float32/float64 tensors."
    );
 }
 
-std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(
+std::tuple< Tensor, Tensor > program_silu_postnorm(
    const Tensor& x,
    const Tensor& relation_args,
    const std::vector< int64_t >& slot_offsets,
@@ -977,15 +977,15 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device(),
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects x and relation_args on the same device."
+      "program_silu_postnorm expects x and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects slot_offsets and row_sizes with equal lengths."
+      "program_silu_postnorm expects slot_offsets and row_sizes with equal lengths."
    );
    TORCH_CHECK(
       arity > 0,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects arity > 0."
+      "program_silu_postnorm expects arity > 0."
    );
    check_rank(w10_stack, 3, "w10_stack");
    check_rank(b10_stack, 2, "b10_stack");
@@ -1002,39 +1002,39 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
          && b20_stack.size(0) == groups && w11_stack.size(0) == groups
          && b11_stack.size(0) == groups && w21_stack.size(0) == groups
          && b21_stack.size(0) == groups,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices parameter stacks must match group count."
+      "program_silu_postnorm parameter stacks must match group count."
    );
 
    const int64_t emb = x.size(1);
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       w10_stack.size(2) == in_dim && w20_stack.size(1) == in_dim && b20_stack.size(1) == in_dim,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-1 dims must match arity * emb."
+      "program_silu_postnorm stage-1 dims must match arity * emb."
    );
    TORCH_CHECK(
       w11_stack.size(2) == in_dim && w21_stack.size(1) == in_dim && b21_stack.size(1) == in_dim,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-2 dims must match arity * emb."
+      "program_silu_postnorm stage-2 dims must match arity * emb."
    );
    TORCH_CHECK(
       b10_stack.size(1) == w10_stack.size(1) && w20_stack.size(2) == w10_stack.size(1),
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-1 hidden dims must match."
+      "program_silu_postnorm stage-1 hidden dims must match."
    );
    TORCH_CHECK(
       b11_stack.size(1) == w11_stack.size(1) && w21_stack.size(2) == w11_stack.size(1),
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices stage-2 hidden dims must match."
+      "program_silu_postnorm stage-2 hidden dims must match."
    );
    if(ln_weight_stack.numel() > 0) {
       check_rank(ln_weight_stack, 2, "ln_weight_stack");
       TORCH_CHECK(
          ln_weight_stack.size(0) == groups && ln_weight_stack.size(1) == in_dim,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices ln_weight_stack must have shape [groups, arity * emb]."
+         "program_silu_postnorm ln_weight_stack must have shape [groups, arity * emb]."
       );
    }
    if(ln_bias_stack.numel() > 0) {
       check_rank(ln_bias_stack, 2, "ln_bias_stack");
       TORCH_CHECK(
          ln_bias_stack.size(0) == groups && ln_bias_stack.size(1) == in_dim,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices ln_bias_stack must have shape [groups, arity * emb]."
+         "program_silu_postnorm ln_bias_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -1051,7 +1051,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices row_sizes must be >= 0 at group ",
+         "program_silu_postnorm row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -1059,11 +1059,11 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices expects non-negative slot offsets."
+         "program_silu_postnorm expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices slice out of bounds at group ",
+         "program_silu_postnorm slice out of bounds at group ",
          i,
          "."
       );
@@ -1081,7 +1081,7 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_cuda(
+      return program_silu_postnorm_cuda(
          x,
          relation_args_i64,
          slot_offsets_t,
@@ -1106,12 +1106,12 @@ std::tuple< Tensor, Tensor > fused_program_two_layer_silu_then_postnorm_two_laye
 #endif
    TORCH_CHECK(
       false,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices currently supports only CUDA float32/float64 tensors."
+      "program_silu_postnorm currently supports only CUDA float32/float64 tensors."
    );
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
+program_silu_postnorm_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -1136,15 +1136,15 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       grad_rel.device() == x.device() && x.device() == relation_args.device(),
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+      "program_silu_postnorm_backward expects grad_rel, x, and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+      "program_silu_postnorm_backward expects slot_offsets and row_sizes with equal lengths."
    );
    TORCH_CHECK(
       arity > 0,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward expects arity > 0."
+      "program_silu_postnorm_backward expects arity > 0."
    );
 
    const int64_t groups = static_cast< int64_t >(slot_offsets.size());
@@ -1152,30 +1152,30 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       grad_rel.size(1) == emb,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward expects grad_rel.shape[1] == emb."
+      "program_silu_postnorm_backward expects grad_rel.shape[1] == emb."
    );
    TORCH_CHECK(
       w10_stack.size(0) == groups && b10_stack.size(0) == groups && w20_stack.size(0) == groups
          && b20_stack.size(0) == groups && w11_stack.size(0) == groups
          && b11_stack.size(0) == groups && w21_stack.size(0) == groups
          && b21_stack.size(0) == groups,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward parameter stacks must match group count."
+      "program_silu_postnorm_backward parameter stacks must match group count."
    );
    TORCH_CHECK(
       w10_stack.size(2) == in_dim && w20_stack.size(1) == in_dim && b20_stack.size(1) == in_dim
          && w11_stack.size(2) == in_dim && w21_stack.size(1) == in_dim && b21_stack.size(1) == in_dim,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward stack dims do not match arity * emb."
+      "program_silu_postnorm_backward stack dims do not match arity * emb."
    );
    if(ln_weight_stack.numel() > 0) {
       TORCH_CHECK(
          ln_weight_stack.size(0) == groups && ln_weight_stack.size(1) == in_dim,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward ln_weight_stack must have shape [groups, arity * emb]."
+         "program_silu_postnorm_backward ln_weight_stack must have shape [groups, arity * emb]."
       );
    }
    if(ln_bias_stack.numel() > 0) {
       TORCH_CHECK(
          ln_bias_stack.size(0) == groups && ln_bias_stack.size(1) == in_dim,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward ln_bias_stack must have shape [groups, arity * emb]."
+         "program_silu_postnorm_backward ln_bias_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -1192,7 +1192,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward row_sizes must be >= 0 at group ",
+         "program_silu_postnorm_backward row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -1200,11 +1200,11 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward expects non-negative slot offsets."
+         "program_silu_postnorm_backward expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward slice out of bounds at group ",
+         "program_silu_postnorm_backward slice out of bounds at group ",
          i,
          "."
       );
@@ -1213,7 +1213,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
    }
    TORCH_CHECK(
       grad_rel.size(0) == out_offsets.back(),
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward expects grad_rel rows to match packed slot count."
+      "program_silu_postnorm_backward expects grad_rel rows to match packed slot count."
    );
 
 #if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
@@ -1226,7 +1226,7 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward_cuda(
+      return program_silu_postnorm_backward_cuda(
          grad_rel,
          x,
          relation_args_i64,
@@ -1251,12 +1251,12 @@ fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(
 #endif
    TORCH_CHECK(
       false,
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward currently supports only CUDA float32/float64 tensors."
+      "program_silu_postnorm_backward currently supports only CUDA float32/float64 tensors."
    );
 }
 
 std::tuple< Tensor, Tensor >
-fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
+program_rmsnorm_silu(
    const Tensor& x,
    const Tensor& relation_args,
    const std::vector< int64_t >& slot_offsets,
@@ -1278,15 +1278,15 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device(),
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects x and relation_args on the same device."
+      "program_rmsnorm_silu expects x and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects slot_offsets and row_sizes with equal lengths."
+      "program_rmsnorm_silu expects slot_offsets and row_sizes with equal lengths."
    );
    TORCH_CHECK(
       arity > 0,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects arity > 0."
+      "program_rmsnorm_silu expects arity > 0."
    );
    check_rank(w10_stack, 3, "w10_stack");
    check_rank(b10_stack, 2, "b10_stack");
@@ -1303,32 +1303,32 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
          && b20_stack.size(0) == groups && w11_stack.size(0) == groups
          && b11_stack.size(0) == groups && w21_stack.size(0) == groups
          && b21_stack.size(0) == groups,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices parameter stacks must match group count."
+      "program_rmsnorm_silu parameter stacks must match group count."
    );
 
    const int64_t emb = x.size(1);
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       w10_stack.size(2) == in_dim && w20_stack.size(1) == in_dim && b20_stack.size(1) == in_dim,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-1 dims must match arity * emb."
+      "program_rmsnorm_silu stage-1 dims must match arity * emb."
    );
    TORCH_CHECK(
       w11_stack.size(2) == in_dim && w21_stack.size(1) == in_dim && b21_stack.size(1) == in_dim,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-2 dims must match arity * emb."
+      "program_rmsnorm_silu stage-2 dims must match arity * emb."
    );
    TORCH_CHECK(
       b10_stack.size(1) == w10_stack.size(1) && w20_stack.size(2) == w10_stack.size(1),
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-1 hidden dims must match."
+      "program_rmsnorm_silu stage-1 hidden dims must match."
    );
    TORCH_CHECK(
       b11_stack.size(1) == w11_stack.size(1) && w21_stack.size(2) == w11_stack.size(1),
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices stage-2 hidden dims must match."
+      "program_rmsnorm_silu stage-2 hidden dims must match."
    );
    if(rms_weight_stack.numel() > 0) {
       check_rank(rms_weight_stack, 2, "rms_weight_stack");
       TORCH_CHECK(
          rms_weight_stack.size(0) == groups && rms_weight_stack.size(1) == in_dim,
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices rms_weight_stack must have shape [groups, arity * emb]."
+         "program_rmsnorm_silu rms_weight_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -1345,7 +1345,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices row_sizes must be >= 0 at group ",
+         "program_rmsnorm_silu row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -1353,11 +1353,11 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices expects non-negative slot offsets."
+         "program_rmsnorm_silu expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices slice out of bounds at group ",
+         "program_rmsnorm_silu slice out of bounds at group ",
          i,
          "."
       );
@@ -1374,7 +1374,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_cuda(
+      return program_rmsnorm_silu_cuda(
          x,
          relation_args_i64,
          slot_offsets_t,
@@ -1398,12 +1398,12 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(
 #endif
    TORCH_CHECK(
       false,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices currently supports only CUDA float32/float64 tensors."
+      "program_rmsnorm_silu currently supports only CUDA float32/float64 tensors."
    );
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward(
+program_rmsnorm_silu_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -1427,15 +1427,15 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       grad_rel.device() == x.device() && x.device() == relation_args.device(),
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+      "program_rmsnorm_silu_backward expects grad_rel, x, and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+      "program_rmsnorm_silu_backward expects slot_offsets and row_sizes with equal lengths."
    );
    TORCH_CHECK(
       arity > 0,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward expects arity > 0."
+      "program_rmsnorm_silu_backward expects arity > 0."
    );
 
    const int64_t groups = static_cast< int64_t >(slot_offsets.size());
@@ -1443,24 +1443,24 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       grad_rel.size(1) == emb,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward expects grad_rel.shape[1] == emb."
+      "program_rmsnorm_silu_backward expects grad_rel.shape[1] == emb."
    );
    TORCH_CHECK(
       w10_stack.size(0) == groups && b10_stack.size(0) == groups && w20_stack.size(0) == groups
          && b20_stack.size(0) == groups && w11_stack.size(0) == groups
          && b11_stack.size(0) == groups && w21_stack.size(0) == groups
          && b21_stack.size(0) == groups,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward parameter stacks must match group count."
+      "program_rmsnorm_silu_backward parameter stacks must match group count."
    );
    TORCH_CHECK(
       w10_stack.size(2) == in_dim && w20_stack.size(1) == in_dim && b20_stack.size(1) == in_dim
          && w11_stack.size(2) == in_dim && w21_stack.size(1) == in_dim && b21_stack.size(1) == in_dim,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward stack dims do not match arity * emb."
+      "program_rmsnorm_silu_backward stack dims do not match arity * emb."
    );
    if(rms_weight_stack.numel() > 0) {
       TORCH_CHECK(
          rms_weight_stack.size(0) == groups && rms_weight_stack.size(1) == in_dim,
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward rms_weight_stack must have shape [groups, arity * emb]."
+         "program_rmsnorm_silu_backward rms_weight_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -1477,7 +1477,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward row_sizes must be >= 0 at group ",
+         "program_rmsnorm_silu_backward row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -1485,11 +1485,11 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward expects non-negative slot offsets."
+         "program_rmsnorm_silu_backward expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward slice out of bounds at group ",
+         "program_rmsnorm_silu_backward slice out of bounds at group ",
          i,
          "."
       );
@@ -1498,7 +1498,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
    }
    TORCH_CHECK(
       grad_rel.size(0) == out_offsets.back(),
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward expects grad_rel rows to match packed slot count."
+      "program_rmsnorm_silu_backward expects grad_rel rows to match packed slot count."
    );
 
 #if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
@@ -1510,7 +1510,7 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward_cuda(
+      return program_rmsnorm_silu_backward_cuda(
          grad_rel,
          x,
          relation_args_i64,
@@ -1534,12 +1534,12 @@ fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_ba
 #endif
    TORCH_CHECK(
       false,
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward currently supports only CUDA float32/float64 tensors."
+      "program_rmsnorm_silu_backward currently supports only CUDA float32/float64 tensors."
    );
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_two_layer_pointwise_from_indices_backward(
+block_pointwise_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -1558,13 +1558,13 @@ fused_two_layer_pointwise_from_indices_backward(
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device() && grad_rel.device() == x.device(),
-      "fused_two_layer_pointwise_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+      "block_pointwise_backward expects grad_rel, x, and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_two_layer_pointwise_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+      "block_pointwise_backward expects slot_offsets and row_sizes with equal lengths."
    );
-   TORCH_CHECK(arity > 0, "fused_two_layer_pointwise_from_indices_backward expects arity > 0.");
+   TORCH_CHECK(arity > 0, "block_pointwise_backward expects arity > 0.");
    check_rank(w1_stack, 3, "w1_stack");
    check_rank(w2_stack, 3, "w2_stack");
 
@@ -1573,15 +1573,15 @@ fused_two_layer_pointwise_from_indices_backward(
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       grad_rel.size(1) == emb,
-      "fused_two_layer_pointwise_from_indices_backward expects grad_rel.shape[1] == emb."
+      "block_pointwise_backward expects grad_rel.shape[1] == emb."
    );
    TORCH_CHECK(
       w1_stack.size(0) == groups && w2_stack.size(0) == groups,
-      "fused_two_layer_pointwise_from_indices_backward weight stacks must match group count."
+      "block_pointwise_backward weight stacks must match group count."
    );
    TORCH_CHECK(
       w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
-      "fused_two_layer_pointwise_from_indices_backward weight stack dims do not match arity * emb."
+      "block_pointwise_backward weight stack dims do not match arity * emb."
    );
 
    std::vector< int64_t > row_offsets;
@@ -1594,7 +1594,7 @@ fused_two_layer_pointwise_from_indices_backward(
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_two_layer_pointwise_from_indices_backward row_sizes must be >= 0 at group ",
+         "block_pointwise_backward row_sizes must be >= 0 at group ",
          i,
          "."
       );
@@ -1602,11 +1602,11 @@ fused_two_layer_pointwise_from_indices_backward(
       const int64_t len = n * arity;
       TORCH_CHECK(
          start >= 0,
-         "fused_two_layer_pointwise_from_indices_backward expects non-negative slot offsets."
+         "block_pointwise_backward expects non-negative slot offsets."
       );
       TORCH_CHECK(
          start + len <= relation_args.size(0),
-         "fused_two_layer_pointwise_from_indices_backward slice out of bounds at group ",
+         "block_pointwise_backward slice out of bounds at group ",
          i,
          "."
       );
@@ -1615,7 +1615,7 @@ fused_two_layer_pointwise_from_indices_backward(
    }
    TORCH_CHECK(
       grad_rel.size(0) == out_offsets.back(),
-      "fused_two_layer_pointwise_from_indices_backward expects grad_rel rows to match packed slot count."
+      "block_pointwise_backward expects grad_rel rows to match packed slot count."
    );
 
 #if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
@@ -1627,7 +1627,7 @@ fused_two_layer_pointwise_from_indices_backward(
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_two_layer_pointwise_from_indices_backward_cuda(
+      return block_pointwise_backward_cuda(
          grad_rel,
          x,
          relation_args_i64,
@@ -1647,11 +1647,11 @@ fused_two_layer_pointwise_from_indices_backward(
 
    TORCH_CHECK(
       false,
-      "fused_two_layer_pointwise_from_indices_backward currently supports only CUDA float32/float64 tensors."
+      "block_pointwise_backward currently supports only CUDA float32/float64 tensors."
    );
 }
 
-std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_indices(
+std::tuple< Tensor, Tensor > block_postnorm_ln(
    const Tensor& x,
    const Tensor& relation_args,
    const std::vector< int64_t >& slot_offsets,
@@ -1671,13 +1671,13 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device(),
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects x and relation_args on the same device."
+      "block_postnorm_ln expects x and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+      "block_postnorm_ln expects slot_offsets and row_sizes with equal lengths."
    );
-   TORCH_CHECK(arity > 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects arity > 0.");
+   TORCH_CHECK(arity > 0, "block_postnorm_ln expects arity > 0.");
    check_rank(w1_stack, 3, "w1_stack");
    check_rank(w2_stack, 3, "w2_stack");
 
@@ -1686,24 +1686,24 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       w1_stack.size(0) == groups && w2_stack.size(0) == groups,
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stacks must match group count."
+      "block_postnorm_ln weight stacks must match group count."
    );
    TORCH_CHECK(
       w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices weight stack dims do not match arity * emb."
+      "block_postnorm_ln weight stack dims do not match arity * emb."
    );
    if(ln_weight_stack.numel() > 0) {
       check_rank(ln_weight_stack, 2, "ln_weight_stack");
       TORCH_CHECK(
          ln_weight_stack.size(0) == groups && ln_weight_stack.size(1) == in_dim,
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_weight_stack must have shape [groups, arity * emb]."
+         "block_postnorm_ln ln_weight_stack must have shape [groups, arity * emb]."
       );
    }
    if(ln_bias_stack.numel() > 0) {
       check_rank(ln_bias_stack, 2, "ln_bias_stack");
       TORCH_CHECK(
          ln_bias_stack.size(0) == groups && ln_bias_stack.size(1) == in_dim,
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices ln_bias_stack must have shape [groups, arity * emb]."
+         "block_postnorm_ln ln_bias_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -1719,16 +1719,16 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices row_sizes must be >= 0 at group ",
+         "block_postnorm_ln row_sizes must be >= 0 at group ",
          i,
          "."
       );
       const int64_t start = slot_offsets[static_cast< size_t >(i)];
       const int64_t len = n * arity;
-      TORCH_CHECK(start >= 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices expects non-negative slot offsets.");
+      TORCH_CHECK(start >= 0, "block_postnorm_ln expects non-negative slot offsets.");
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices slice out of bounds at group ",
+         "block_postnorm_ln slice out of bounds at group ",
          i,
          "."
       );
@@ -1744,7 +1744,7 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_postnorm_two_layer_pointwise_layernorm_from_indices_cuda(
+      return block_postnorm_ln_cuda(
          x,
          relation_args_i64,
          slot_offsets_t,
@@ -1767,12 +1767,12 @@ std::tuple< Tensor, Tensor > fused_postnorm_two_layer_pointwise_layernorm_from_i
 
    TORCH_CHECK(
       false,
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices currently supports only CUDA float32/float64 tensors."
+      "block_postnorm_ln currently supports only CUDA float32/float64 tensors."
    );
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
+block_postnorm_ln_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -1794,13 +1794,13 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device() && grad_rel.device() == x.device(),
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+      "block_postnorm_ln_backward expects grad_rel, x, and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+      "block_postnorm_ln_backward expects slot_offsets and row_sizes with equal lengths."
    );
-   TORCH_CHECK(arity > 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects arity > 0.");
+   TORCH_CHECK(arity > 0, "block_postnorm_ln_backward expects arity > 0.");
    check_rank(w1_stack, 3, "w1_stack");
    check_rank(w2_stack, 3, "w2_stack");
 
@@ -1809,28 +1809,28 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       grad_rel.size(1) == emb,
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects grad_rel.shape[1] == emb."
+      "block_postnorm_ln_backward expects grad_rel.shape[1] == emb."
    );
    TORCH_CHECK(
       w1_stack.size(0) == groups && w2_stack.size(0) == groups,
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward weight stacks must match group count."
+      "block_postnorm_ln_backward weight stacks must match group count."
    );
    TORCH_CHECK(
       w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward weight stack dims do not match arity * emb."
+      "block_postnorm_ln_backward weight stack dims do not match arity * emb."
    );
    if(ln_weight_stack.numel() > 0) {
       check_rank(ln_weight_stack, 2, "ln_weight_stack");
       TORCH_CHECK(
          ln_weight_stack.size(0) == groups && ln_weight_stack.size(1) == in_dim,
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward ln_weight_stack must have shape [groups, arity * emb]."
+         "block_postnorm_ln_backward ln_weight_stack must have shape [groups, arity * emb]."
       );
    }
    if(ln_bias_stack.numel() > 0) {
       check_rank(ln_bias_stack, 2, "ln_bias_stack");
       TORCH_CHECK(
          ln_bias_stack.size(0) == groups && ln_bias_stack.size(1) == in_dim,
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward ln_bias_stack must have shape [groups, arity * emb]."
+         "block_postnorm_ln_backward ln_bias_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -1844,16 +1844,16 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward row_sizes must be >= 0 at group ",
+         "block_postnorm_ln_backward row_sizes must be >= 0 at group ",
          i,
          "."
       );
       const int64_t start = slot_offsets[static_cast< size_t >(i)];
       const int64_t len = n * arity;
-      TORCH_CHECK(start >= 0, "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects non-negative slot offsets.");
+      TORCH_CHECK(start >= 0, "block_postnorm_ln_backward expects non-negative slot offsets.");
       TORCH_CHECK(
          start + len <= relation_args.size(0),
-         "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward slice out of bounds at group ",
+         "block_postnorm_ln_backward slice out of bounds at group ",
          i,
          "."
       );
@@ -1862,7 +1862,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
    }
    TORCH_CHECK(
       grad_rel.size(0) == out_offsets.back(),
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward expects grad_rel rows to match packed slot count."
+      "block_postnorm_ln_backward expects grad_rel rows to match packed slot count."
    );
 
 #if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
@@ -1876,7 +1876,7 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward_cuda(
+      return block_postnorm_ln_backward_cuda(
          grad_rel,
          x,
          relation_args_i64,
@@ -1899,11 +1899,11 @@ fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(
 
    TORCH_CHECK(
       false,
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward currently supports only CUDA float32/float64 tensors."
+      "block_postnorm_ln_backward currently supports only CUDA float32/float64 tensors."
    );
 }
 
-std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(
+std::tuple< Tensor, Tensor > block_prenorm_rms(
    const Tensor& x,
    const Tensor& relation_args,
    const std::vector< int64_t >& slot_offsets,
@@ -1922,13 +1922,13 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device(),
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects x and relation_args on the same device."
+      "block_prenorm_rms expects x and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects slot_offsets and row_sizes with equal lengths."
+      "block_prenorm_rms expects slot_offsets and row_sizes with equal lengths."
    );
-   TORCH_CHECK(arity > 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects arity > 0.");
+   TORCH_CHECK(arity > 0, "block_prenorm_rms expects arity > 0.");
    check_rank(w1_stack, 3, "w1_stack");
    check_rank(w2_stack, 3, "w2_stack");
 
@@ -1937,17 +1937,17 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       w1_stack.size(0) == groups && w2_stack.size(0) == groups,
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stacks must match group count."
+      "block_prenorm_rms weight stacks must match group count."
    );
    TORCH_CHECK(
       w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices weight stack dims do not match arity * emb."
+      "block_prenorm_rms weight stack dims do not match arity * emb."
    );
    if(rms_weight_stack.numel() > 0) {
       check_rank(rms_weight_stack, 2, "rms_weight_stack");
       TORCH_CHECK(
          rms_weight_stack.size(0) == groups && rms_weight_stack.size(1) == in_dim,
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices rms_weight_stack must have shape [groups, arity * emb]."
+         "block_prenorm_rms rms_weight_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -1963,16 +1963,16 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices row_sizes must be >= 0 at group ",
+         "block_prenorm_rms row_sizes must be >= 0 at group ",
          i,
          "."
       );
       const int64_t start = slot_offsets[static_cast< size_t >(i)];
       const int64_t len = n * arity;
-      TORCH_CHECK(start >= 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices expects non-negative slot offsets.");
+      TORCH_CHECK(start >= 0, "block_prenorm_rms expects non-negative slot offsets.");
       TORCH_CHECK(
          start + len <= relation_args_i64.size(0),
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices slice out of bounds at group ",
+         "block_prenorm_rms slice out of bounds at group ",
          i,
          "."
       );
@@ -1987,7 +1987,7 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_cuda(
+      return block_prenorm_rms_cuda(
          x,
          relation_args_i64,
          slot_offsets_t,
@@ -2009,12 +2009,12 @@ std::tuple< Tensor, Tensor > fused_prenorm_two_layer_pointwise_rmsnorm_from_indi
 
    TORCH_CHECK(
       false,
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices currently supports only CUDA float32/float64 tensors."
+      "block_prenorm_rms currently supports only CUDA float32/float64 tensors."
    );
 }
 
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
+block_prenorm_rms_backward(
    const Tensor& grad_rel,
    const Tensor& x,
    const Tensor& relation_args,
@@ -2035,13 +2035,13 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
    check_int32_or_int64_index(relation_args, "relation_args");
    TORCH_CHECK(
       x.device() == relation_args.device() && grad_rel.device() == x.device(),
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects grad_rel, x, and relation_args on the same device."
+      "block_prenorm_rms_backward expects grad_rel, x, and relation_args on the same device."
    );
    TORCH_CHECK(
       slot_offsets.size() == row_sizes.size(),
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects slot_offsets and row_sizes with equal lengths."
+      "block_prenorm_rms_backward expects slot_offsets and row_sizes with equal lengths."
    );
-   TORCH_CHECK(arity > 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects arity > 0.");
+   TORCH_CHECK(arity > 0, "block_prenorm_rms_backward expects arity > 0.");
    check_rank(w1_stack, 3, "w1_stack");
    check_rank(w2_stack, 3, "w2_stack");
 
@@ -2050,21 +2050,21 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
    const int64_t in_dim = emb * arity;
    TORCH_CHECK(
       grad_rel.size(1) == emb,
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects grad_rel.shape[1] == emb."
+      "block_prenorm_rms_backward expects grad_rel.shape[1] == emb."
    );
    TORCH_CHECK(
       w1_stack.size(0) == groups && w2_stack.size(0) == groups,
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward weight stacks must match group count."
+      "block_prenorm_rms_backward weight stacks must match group count."
    );
    TORCH_CHECK(
       w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward weight stack dims do not match arity * emb."
+      "block_prenorm_rms_backward weight stack dims do not match arity * emb."
    );
    if(rms_weight_stack.numel() > 0) {
       check_rank(rms_weight_stack, 2, "rms_weight_stack");
       TORCH_CHECK(
          rms_weight_stack.size(0) == groups && rms_weight_stack.size(1) == in_dim,
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward rms_weight_stack must have shape [groups, arity * emb]."
+         "block_prenorm_rms_backward rms_weight_stack must have shape [groups, arity * emb]."
       );
    }
 
@@ -2078,16 +2078,16 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
       const int64_t n = row_sizes[static_cast< size_t >(i)];
       TORCH_CHECK(
          n >= 0,
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward row_sizes must be >= 0 at group ",
+         "block_prenorm_rms_backward row_sizes must be >= 0 at group ",
          i,
          "."
       );
       const int64_t start = slot_offsets[static_cast< size_t >(i)];
       const int64_t len = n * arity;
-      TORCH_CHECK(start >= 0, "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects non-negative slot offsets.");
+      TORCH_CHECK(start >= 0, "block_prenorm_rms_backward expects non-negative slot offsets.");
       TORCH_CHECK(
          start + len <= relation_args.size(0),
-         "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward slice out of bounds at group ",
+         "block_prenorm_rms_backward slice out of bounds at group ",
          i,
          "."
       );
@@ -2096,7 +2096,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
    }
    TORCH_CHECK(
       grad_rel.size(0) == out_offsets.back(),
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward expects grad_rel rows to match packed slot count."
+      "block_prenorm_rms_backward expects grad_rel rows to match packed slot count."
    );
 
 #if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
@@ -2109,7 +2109,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
       Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
       Tensor out_offsets_t = at::tensor(out_offsets, relation_args_i64.options().dtype(at::kLong));
-      return fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward_cuda(
+      return block_prenorm_rms_backward_cuda(
          grad_rel,
          x,
          relation_args_i64,
@@ -2131,53 +2131,7 @@ fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(
 
    TORCH_CHECK(
       false,
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward currently supports only CUDA float32/float64 tensors."
-   );
-}
-
-std::tuple< Tensor, Tensor > fused_two_layer_mish_from_indices(
-   const Tensor& x,
-   const Tensor& relation_args,
-   const std::vector< int64_t >& slot_offsets,
-   const std::vector< int64_t >& row_sizes,
-   int64_t arity,
-   const Tensor& w1_stack,
-   const Tensor& b1_stack,
-   const Tensor& w2_stack,
-   const Tensor& b2_stack
-)
-{
-   return fused_two_layer_pointwise_from_indices(
-      x, relation_args, slot_offsets, row_sizes, arity, w1_stack, b1_stack, w2_stack, b2_stack, kPwMish
-   );
-}
-
-std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_two_layer_mish_from_indices_backward(
-   const Tensor& grad_rel,
-   const Tensor& x,
-   const Tensor& relation_args,
-   const std::vector< int64_t >& slot_offsets,
-   const std::vector< int64_t >& row_sizes,
-   int64_t arity,
-   const Tensor& w1_stack,
-   const Tensor& b1_stack,
-   const Tensor& w2_stack,
-   const Tensor& b2_stack
-)
-{
-   return fused_two_layer_pointwise_from_indices_backward(
-      grad_rel,
-      x,
-      relation_args,
-      slot_offsets,
-      row_sizes,
-      arity,
-      w1_stack,
-      b1_stack,
-      w2_stack,
-      b2_stack,
-      kPwMish
+      "block_prenorm_rms_backward currently supports only CUDA float32/float64 tensors."
    );
 }
 
@@ -2482,35 +2436,6 @@ Tensor fanin_reduce_logsumexp_backward_cuda(
    const Tensor& dst_idx,
    const Tensor& out,
    int64_t rel_rows
-);
-std::tuple< Tensor, Tensor > fused_two_layer_mish_from_indices_cuda(
-   const Tensor& x,
-   const Tensor& relation_args,
-   const Tensor& slot_offsets,
-   const Tensor& row_offsets,
-   const Tensor& out_offsets,
-   int64_t total_rows,
-   int64_t total_slots,
-   int64_t arity,
-   const Tensor& w1_stack,
-   const Tensor& b1_stack,
-   const Tensor& w2_stack,
-   const Tensor& b2_stack
-);
-std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
-fused_two_layer_mish_from_indices_backward_cuda(
-   const Tensor& grad_rel,
-   const Tensor& x,
-   const Tensor& relation_args,
-   const Tensor& slot_offsets,
-   const Tensor& row_offsets,
-   const Tensor& out_offsets,
-   int64_t total_rows,
-   int64_t arity,
-   const Tensor& w1_stack,
-   const Tensor& b1_stack,
-   const Tensor& w2_stack,
-   const Tensor& b2_stack
 );
 #endif
 
@@ -3088,46 +3013,40 @@ TORCH_LIBRARY(relm_mp, m)
       "fanin_pack_from_edges(Tensor[] rel_parts, Tensor[] edge_src_parts, Tensor[] edge_dst_parts, int[] rel_part_ids, int[] arity_parts, int[] pos_parts, int mode) -> (Tensor, Tensor, Tensor)"
    );
    m.def(
-      "fused_two_layer_pointwise_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor)"
+      "block_pointwise(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor)"
    );
    m.def(
-      "fused_two_layer_pointwise_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+      "block_pointwise_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def(
-      "fused_two_layer_mish_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack) -> (Tensor, Tensor)"
+      "block_postnorm_ln(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps, int pointwise_code) -> (Tensor, Tensor)"
    );
    m.def(
-      "fused_two_layer_mish_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+      "block_postnorm_ln_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def(
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps, int pointwise_code) -> (Tensor, Tensor)"
+      "block_prenorm_rms(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor)"
    );
    m.def(
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+      "block_prenorm_rms_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def(
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor)"
+      "program_silu_pair(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor)"
    );
    m.def(
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+      "program_silu_pair_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def(
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor)"
+      "program_silu_postnorm(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps) -> (Tensor, Tensor)"
    );
    m.def(
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+      "program_silu_postnorm_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def(
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps) -> (Tensor, Tensor)"
+      "program_rmsnorm_silu(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor)"
    );
    m.def(
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
-   );
-   m.def(
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor)"
-   );
-   m.def(
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+      "program_rmsnorm_silu_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor rms_weight_stack, float rms_eps, Tensor w10_stack, Tensor b10_stack, Tensor w20_stack, Tensor b20_stack, Tensor w11_stack, Tensor b11_stack, Tensor w21_stack, Tensor b21_stack) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def("build_info() -> str");
 }
@@ -3144,56 +3063,51 @@ TORCH_LIBRARY_IMPL(relm_mp, CompositeImplicitAutograd, m)
    m.impl("fanin_pack_multi", relm::mp::fanin_pack_multi);
    m.impl("fanin_pack_from_edges", relm::mp::fanin_pack_from_edges);
    m.impl(
-      "fused_two_layer_pointwise_from_indices", relm::mp::fused_two_layer_pointwise_from_indices
+      "block_pointwise", relm::mp::block_pointwise
    );
    m.impl(
-      "fused_two_layer_pointwise_from_indices_backward",
-      relm::mp::fused_two_layer_pointwise_from_indices_backward
-   );
-   m.impl("fused_two_layer_mish_from_indices", relm::mp::fused_two_layer_mish_from_indices);
-   m.impl(
-      "fused_two_layer_mish_from_indices_backward",
-      relm::mp::fused_two_layer_mish_from_indices_backward
+      "block_pointwise_backward",
+      relm::mp::block_pointwise_backward
    );
    m.impl(
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices",
-      relm::mp::fused_postnorm_two_layer_pointwise_layernorm_from_indices
+      "block_postnorm_ln",
+      relm::mp::block_postnorm_ln
    );
    m.impl(
-      "fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward",
-      relm::mp::fused_postnorm_two_layer_pointwise_layernorm_from_indices_backward
+      "block_postnorm_ln_backward",
+      relm::mp::block_postnorm_ln_backward
    );
    m.impl(
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices",
-      relm::mp::fused_prenorm_two_layer_pointwise_rmsnorm_from_indices
+      "block_prenorm_rms",
+      relm::mp::block_prenorm_rms
    );
    m.impl(
-      "fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward",
-      relm::mp::fused_prenorm_two_layer_pointwise_rmsnorm_from_indices_backward
+      "block_prenorm_rms_backward",
+      relm::mp::block_prenorm_rms_backward
    );
    m.impl(
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices",
-      relm::mp::fused_program_two_layer_silu_then_two_layer_silu_from_indices
+      "program_silu_pair",
+      relm::mp::program_silu_pair
    );
    m.impl(
-      "fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward",
-      relm::mp::fused_program_two_layer_silu_then_two_layer_silu_from_indices_backward
+      "program_silu_pair_backward",
+      relm::mp::program_silu_pair_backward
    );
    m.impl(
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices",
-      relm::mp::fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices
+      "program_silu_postnorm",
+      relm::mp::program_silu_postnorm
    );
    m.impl(
-      "fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward",
-      relm::mp::fused_program_two_layer_silu_then_postnorm_two_layer_silu_from_indices_backward
+      "program_silu_postnorm_backward",
+      relm::mp::program_silu_postnorm_backward
    );
    m.impl(
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices",
-      relm::mp::fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices
+      "program_rmsnorm_silu",
+      relm::mp::program_rmsnorm_silu
    );
    m.impl(
-      "fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward",
-      relm::mp::fused_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_from_indices_backward
+      "program_rmsnorm_silu_backward",
+      relm::mp::program_rmsnorm_silu_backward
    );
    m.impl("build_info", relm::mp::build_info);
 }
