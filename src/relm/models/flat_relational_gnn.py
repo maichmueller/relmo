@@ -100,6 +100,7 @@ class FlatRelationalGNN(PyGFlatModule):
     ) -> None:
         super().__init__()
         self._compile_forward = bool(compile_forward)
+        self._compile_public_api = False
         self.embedding_size = int(embedding_size)
         self.num_layers = int(num_layers)
         self.relations = {str(key): int(value) for key, value in relations.items()}
@@ -590,21 +591,32 @@ class FlatRelationalGNN(PyGFlatModule):
             target_positions=prepared_batch.target_positions,
         )
 
-    @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
+    @optional_compile(enable_attr="_compile_public_api", backend="inductor", dynamic=True)
     def compute_entity_embeddings(
         self,
         data: FlatBatchInput,
         cache: dict | None = None,
     ) -> Tensor:
+        """Return entity embeddings for a public flat batch carrier.
+
+        Public inputs stay on the eager adapter path. Only the prepared flat
+        tensor core is eligible for ``torch.compile``, which avoids compiling
+        carrier normalization and batch/view reconstruction.
+        """
         prepared_batch = self._prepare_batch(data, cache=cache)
         return self._compute_entity_embeddings_prepared(prepared_batch, cache=cache)
 
-    @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
+    @optional_compile(enable_attr="_compile_public_api", backend="inductor", dynamic=True)
     def forward(
         self,
         data: FlatBatchInput,
         cache: dict | None = None,
     ) -> FlatRelationalOutput:
+        """Run the flat model on a public batch carrier and build structured output.
+
+        As with :meth:`compute_entity_embeddings`, carrier preparation remains eager
+        while the prepared recurrent core may be compiled separately.
+        """
         prepared_batch = self._prepare_batch(data, cache=cache)
         return self._forward_prepared_batch(prepared_batch, cache=cache)
 

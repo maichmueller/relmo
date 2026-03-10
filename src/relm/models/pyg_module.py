@@ -173,6 +173,19 @@ class PyGFlatModule(DeviceAwareMixin, Module, ABC):
             "target_sizes",
             "target_indices",
             "target_candidate_ids",
+            "relation_instance_sizes",
+            "lgan_tn_relation_indices",
+            "lgan_tn_entity_indices",
+            "lgan_tn_sizes",
+            "lgan_nn_relation_indices",
+            "lgan_nn_entity_indices",
+            "lgan_nn_sizes",
+            "lgan_rr_src_relation_indices",
+            "lgan_rr_dst_relation_indices",
+            "lgan_rr_sizes",
+            "lgan_tn_edge_pos",
+            "lgan_nn_edge_pos",
+            "lgan_rr_edge_pos",
         ):
             if not hasattr(data, key):
                 continue
@@ -201,6 +214,19 @@ class PyGFlatModule(DeviceAwareMixin, Module, ABC):
             "target_sizes",
             "target_indices",
             "target_candidate_ids",
+            "relation_instance_sizes",
+            "lgan_tn_relation_indices",
+            "lgan_tn_entity_indices",
+            "lgan_tn_sizes",
+            "lgan_nn_relation_indices",
+            "lgan_nn_entity_indices",
+            "lgan_nn_sizes",
+            "lgan_rr_src_relation_indices",
+            "lgan_rr_dst_relation_indices",
+            "lgan_rr_sizes",
+            "lgan_tn_edge_pos",
+            "lgan_nn_edge_pos",
+            "lgan_rr_edge_pos",
         ):
             if hasattr(data, key):
                 extras[key] = getattr(data, key)

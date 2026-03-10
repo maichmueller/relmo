@@ -9,6 +9,7 @@ from torch_geometric.data import Data
 from torch_geometric.nn.aggr import MeanAggregation
 
 from relm.models import (
+    CentralizedFlatRelationalGNN,
     FlatExecutionPolicy,
     FlatRelationalGNN,
     FlatRelationalOutput,
@@ -61,6 +62,17 @@ class _UnsupportedCustomBlock(torch.nn.Module):
         return torch.sin(self.lin(x))
 
 
+class _CountingCentralModule(torch.nn.Module):
+    def __init__(self, out_size: int) -> None:
+        super().__init__()
+        self.out_size = int(out_size)
+        self.calls = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return x[:, : self.out_size]
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -69,7 +81,12 @@ def _load_blocks_problem():
     pymimir = pytest.importorskip("pymimir")
     root = _repo_root() / "data" / "pddl_domains" / "blocks"
     domain = pymimir.Domain(root / "domain.pddl")
-    problem = pymimir.Problem(domain, root / "probBLOCKS-4-0.pddl", mode="lifted")
+    problem_files = sorted(
+        path for path in root.glob("*.pddl") if path.name != "domain.pddl"
+    )
+    if not problem_files:
+        pytest.skip("no Blocks problem files available in test fixture root")
+    problem = pymimir.Problem(domain, problem_files[0], mode="lifted")
     goals = list(problem.get_goal_condition().get_literals())
     state = problem.get_initial_state()
     return domain, state, goals
@@ -206,6 +223,16 @@ def test_flat_execution_policy_rejects_invalid_values() -> None:
         FlatExecutionPolicy(relation_gather="maybe")
 
 
+def test_compile_boundary_stays_on_prepared_core_only() -> None:
+    assert hasattr(FlatRelationalGNN.compute_entity_embeddings, "__wrapped__")
+    assert hasattr(FlatRelationalGNN.forward, "__wrapped__")
+    assert hasattr(FlatRelationalGNN._compute_entity_embeddings_prepared, "__wrapped__")
+    assert hasattr(FlatRelationalGNN._forward_prepared_batch, "__wrapped__")
+    model = _make_model({"rel_a": TwoLayerPointwiseRelationMLP(8, 8), "rel_b": TwoLayerPointwiseRelationMLP(4, 4)})
+    assert model._compile_forward is False
+    assert model._compile_public_api is False
+
+
 def test_relation_program_validates_widths() -> None:
     with pytest.raises(ValueError):
         RelationProgram(
@@ -223,6 +250,105 @@ def test_constructor_rejects_conflicting_relation_module_sources() -> None:
             relation_modules={"rel": TwoLayerPointwiseRelationMLP(8, 16)},
             relation_module_factory=lambda arity: TwoLayerPointwiseRelationMLP(arity * 4, 16),
         )
+
+
+def test_centralized_flat_rejects_conflicting_central_module_sources() -> None:
+    with pytest.raises(ValueError):
+        CentralizedFlatRelationalGNN(
+            embedding_size=4,
+            num_layers=1,
+            relations={"rel_a": 2},
+            central_module=torch.nn.Identity(),
+            central_module_factory=lambda max_arity: torch.nn.Identity(),
+        )
+
+
+def test_centralized_flat_forward_and_shared_central_params() -> None:
+    model = CentralizedFlatRelationalGNN(
+        embedding_size=4,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        aggregation="sum",
+        execution_policy=FlatExecutionPolicy(relation_kernels="off", program_kernels="off", relation_gather="off"),
+    )
+    data = _make_small_data()
+    out = model(data)
+    assert isinstance(out, FlatRelationalOutput)
+    assert out.entity.shape == (5, 4)
+    rel_a = model.relational_layer.update_modules[0]
+    rel_b = model.relational_layer.update_modules[1]
+    assert rel_a.central_module is rel_b.central_module
+    assert rel_a.condition_embedding is rel_b.condition_embedding
+
+    loss = out.entity.square().sum()
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    central_grads = [
+        param.grad for param in model.central_module.parameters() if param.requires_grad
+    ]
+    assert central_grads
+    assert all(grad is not None for grad in central_grads)
+    assert model.relation_condition_embedding.weight.grad is not None
+
+
+def test_centralized_flat_static_condition_embedding_stays_grad_free() -> None:
+    model = CentralizedFlatRelationalGNN(
+        embedding_size=4,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        relation_condition_learnable=False,
+        aggregation="sum",
+        execution_policy=FlatExecutionPolicy(relation_kernels="off", program_kernels="off", relation_gather="off"),
+    )
+    out = model(_make_small_data())
+    loss = out.entity.square().sum()
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    assert model.relation_condition_embedding.weight.requires_grad is False
+    assert model.relation_condition_embedding.weight.grad is None
+
+
+def test_centralized_flat_uses_central_module_factory() -> None:
+    calls: list[int] = []
+
+    def factory(max_arity: int) -> torch.nn.Module:
+        calls.append(int(max_arity))
+        return torch.nn.Identity()
+
+    model = CentralizedFlatRelationalGNN(
+        embedding_size=4,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        central_module_factory=factory,
+        central_residual=False,
+        central_slot_mask=False,
+        central_conditioning="concat",
+        execution_policy=FlatExecutionPolicy(relation_kernels="off", program_kernels="off", relation_gather="off"),
+    )
+    assert calls == [2]
+    out = model(_make_small_data())
+    assert out.entity.shape == (5, 4)
+
+
+def test_centralized_flat_batches_shared_central_module_once_per_layer() -> None:
+    central = _CountingCentralModule(out_size=8)
+    model = CentralizedFlatRelationalGNN(
+        embedding_size=4,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        central_module=central,
+        central_residual=False,
+        central_slot_mask=False,
+        central_conditioning="concat",
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="off",
+            program_kernels="off",
+            relation_gather="off",
+        ),
+    )
+    out = model(_make_small_data())
+    assert out.entity.shape == (5, 4)
+    assert central.calls == 1
 
 
 def test_constructor_validates_relation_module_mapping_keys() -> None:
@@ -458,8 +584,14 @@ def test_compute_entity_embeddings_accepts_native_mifrost_flat_batch() -> None:
         import mifrost  # type: ignore
     except Exception as exc:  # pragma: no cover - env-dependent editable rebuild path
         pytest.skip(f"mifrost unavailable in this test environment: {exc}")
+    try:
+        flat_relation_encoder = mifrost.FlatRelationEncoder
+    except Exception as exc:  # pragma: no cover - env-dependent optional wrapper path
+        pytest.skip(f"mifrost FlatRelationEncoder wrapper unavailable: {exc}")
+    if flat_relation_encoder is None:
+        pytest.skip("mifrost FlatRelationEncoder wrapper unavailable in this test environment")
     domain, state, goals = _load_blocks_problem()
-    encoder = mifrost.FlatRelationEncoder(
+    encoder = flat_relation_encoder(
         domain,
         target_sources=["goal"],
         goal_satisfaction_derivations={

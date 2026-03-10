@@ -21,7 +21,12 @@ def _load_blocks_problem():
     pymimir = pytest.importorskip("pymimir")
     root = Path(__file__).resolve().parents[2] / "data" / "pddl_domains" / "blocks"
     domain = pymimir.Domain(root / "domain.pddl")
-    problem = pymimir.Problem(domain, root / "probBLOCKS-4-0.pddl", mode="lifted")
+    problem_files = sorted(
+        path for path in root.glob("*.pddl") if path.name != "domain.pddl"
+    )
+    if not problem_files:
+        pytest.skip("no Blocks problem files available in test fixture root")
+    problem = pymimir.Problem(domain, problem_files[0], mode="lifted")
     return domain, problem
 
 
@@ -30,7 +35,11 @@ def _native_goal_sat_relm_encoder(domain):
         import mifrost  # type: ignore
     except Exception as exc:  # pragma: no cover - env-dependent editable rebuild path
         pytest.skip(f"mifrost unavailable in this test environment: {exc}")
-    return mifrost.FlatRelationEncoder(
+    try:
+        flat_relation_encoder = mifrost.FlatRelationEncoder
+    except Exception as exc:  # pragma: no cover - env-dependent optional wrapper path
+        pytest.skip(f"mifrost FlatRelationEncoder wrapper unavailable: {exc}")
+    return flat_relation_encoder(
         domain,
         goal_satisfaction_derivations={
             mifrost.GoalSatisfaction.satisfied,
@@ -147,10 +156,14 @@ def test_build_flat_relm_inputs_from_native_batchencoding_matches_pyg_batch() ->
         import mifrost  # type: ignore
     except Exception as exc:  # pragma: no cover - env-dependent editable rebuild path
         pytest.skip(f"mifrost unavailable in this test environment: {exc}")
+    try:
+        flat_relation_encoder = mifrost.FlatRelationEncoder
+    except Exception as exc:  # pragma: no cover - env-dependent optional wrapper path
+        pytest.skip(f"mifrost FlatRelationEncoder wrapper unavailable: {exc}")
     domain, problem = _load_blocks_problem()
     goals = list(problem.get_goal_condition().get_literals())
     state = problem.get_initial_state()
-    encoder = mifrost.FlatRelationEncoder(
+    encoder = flat_relation_encoder(
         domain,
         target_sources=["goal"],
         goal_satisfaction_derivations={

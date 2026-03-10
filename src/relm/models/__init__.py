@@ -1,6 +1,11 @@
 """Relational GNN models and flat relation building blocks."""
 
 from .flat_contract import FlatBatchInput, FlatExecutionPolicy, FlatRelationalOutput
+from .centralized_flat_relational_gnn import (
+    CentralizedFlatRelationModule,
+    CentralizedFlatRelationalGNN,
+)
+from .flat_lgan_relational_gnn import FlatLGANRelationalGNN
 from .flat_relational_gnn import FlatRelationalGNN
 from .flat_relational_layer import FlatRelationKernel
 from .mlp import ArityMLPFactory
@@ -23,7 +28,10 @@ __all__ = [
     "ArityMLPFactory",
     "FlatExecutionPolicy",
     "FlatBatchInput",
+    "CentralizedFlatRelationModule",
+    "CentralizedFlatRelationalGNN",
     "FlatRelationKernel",
+    "FlatLGANRelationalGNN",
     "FlatRelationalGNN",
     "FlatRelationalOutput",
     "RelationBlockCompatible",

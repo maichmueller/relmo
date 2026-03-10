@@ -88,6 +88,17 @@ class KernelMatch:
     program_spec: ProgramKernelSpec | None = None
 
 
+@dataclass(frozen=True)
+class CentralizedBatchSpec:
+    central_module: torch.nn.Module
+    condition_embedding: torch.nn.Embedding
+    condition_position: str
+    max_arity: int
+    embedding_size: int
+    include_slot_mask: bool
+    condition_indices: tuple[int, ...]
+
+
 class FlatRelationKernel(ABC):
     """Interface for exact flat-kernel families.
 
@@ -779,6 +790,127 @@ class FlatRelationalLayer(torch.nn.Module):
             dict[str, tuple[KernelBatchPlan, ...] | tuple[int, ...]],
         ] = {}
         self.kernels = tuple(kernels) if kernels is not None else self._build_default_kernels()
+        self._centralized_batch_spec_cache = self._build_centralized_batch_spec()
+
+    def _build_centralized_batch_spec(self) -> CentralizedBatchSpec | None:
+        if not self.update_modules:
+            return None
+        first = self.update_modules[0]
+        required_attrs = (
+            "central_module",
+            "condition_embedding",
+            "condition_index",
+            "max_arity",
+            "embedding_size",
+            "condition_position",
+            "include_slot_mask",
+        )
+        if any(not hasattr(first, attr) for attr in required_attrs):
+            return None
+        central_module = cast(torch.nn.Module, getattr(first, "central_module"))
+        condition_embedding = cast(
+            torch.nn.Embedding, getattr(first, "condition_embedding")
+        )
+        condition_position = str(getattr(first, "condition_position"))
+        max_arity = int(getattr(first, "max_arity"))
+        embedding_size = int(getattr(first, "embedding_size"))
+        include_slot_mask = bool(getattr(first, "include_slot_mask"))
+        condition_indices: list[int] = []
+        for relation_index, module in enumerate(self.update_modules):
+            if any(not hasattr(module, attr) for attr in required_attrs):
+                return None
+            if getattr(module, "central_module") is not central_module:
+                return None
+            if getattr(module, "condition_embedding") is not condition_embedding:
+                return None
+            if str(getattr(module, "condition_position")) != condition_position:
+                return None
+            if int(getattr(module, "max_arity")) != max_arity:
+                return None
+            if int(getattr(module, "embedding_size")) != embedding_size:
+                return None
+            if bool(getattr(module, "include_slot_mask")) != include_slot_mask:
+                return None
+            if int(getattr(module, "arity", self.relation_arities[relation_index])) != int(
+                self.relation_arities[relation_index]
+            ):
+                return None
+            condition_indices.append(int(getattr(module, "condition_index")))
+        if embedding_size != self.embedding_size:
+            return None
+        return CentralizedBatchSpec(
+            central_module=central_module,
+            condition_embedding=condition_embedding,
+            condition_position=condition_position,
+            max_arity=max_arity,
+            embedding_size=embedding_size,
+            include_slot_mask=include_slot_mask,
+            condition_indices=tuple(condition_indices),
+        )
+
+    def _centralized_batch_spec(self) -> CentralizedBatchSpec | None:
+        return self._centralized_batch_spec_cache
+
+    def _collect_centralized_relation_messages(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        *,
+        spec: CentralizedBatchSpec,
+        arg_emb_all: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor] | None:
+        if int(relation_args.numel()) == 0:
+            return None
+        arg_emb_all = x.index_select(0, relation_args) if arg_emb_all is None else arg_emb_all
+        target_width = int(spec.max_arity * self.embedding_size)
+        cond_dim = int(spec.condition_embedding.weight.size(-1))
+        input_rows: list[Tensor] = []
+        for relation_slice in topology.relation_slices:
+            if relation_slice.count <= 0 or relation_slice.arity <= 0:
+                continue
+            rel_in = arg_emb_all[
+                relation_slice.slot_start : relation_slice.slot_end
+            ].view(relation_slice.count, relation_slice.arity * self.embedding_size)
+            if int(rel_in.size(-1)) < target_width:
+                pad = rel_in.new_zeros((int(rel_in.size(0)), target_width - int(rel_in.size(-1))))
+                rel_in = torch.cat([rel_in, pad], dim=-1)
+            pieces = [rel_in]
+            if spec.include_slot_mask:
+                mask = rel_in.new_zeros((int(rel_in.size(0)), spec.max_arity))
+                mask[:, : relation_slice.arity] = 1.0
+                pieces.append(mask)
+            cond_idx = torch.tensor(
+                spec.condition_indices[relation_slice.relation_index],
+                device=x.device,
+            )
+            cond = spec.condition_embedding(cond_idx).view(1, cond_dim).expand(
+                int(rel_in.size(0)), cond_dim
+            )
+            if spec.condition_position == "pre":
+                input_rows.append(torch.cat([cond, *pieces], dim=-1))
+            else:
+                input_rows.append(torch.cat([*pieces, cond], dim=-1))
+        if not input_rows:
+            return None
+        central_in = torch.cat(input_rows, dim=0)
+        central_out = spec.central_module(central_in)
+        msg_chunks: list[Tensor] = []
+        row_cursor = 0
+        for relation_slice in topology.relation_slices:
+            if relation_slice.count <= 0 or relation_slice.arity <= 0:
+                continue
+            row_end = row_cursor + relation_slice.count
+            rel_out = central_out[row_cursor:row_end, : relation_slice.arity * self.embedding_size]
+            msg_chunks.append(
+                rel_out.contiguous().view(
+                    relation_slice.count * relation_slice.arity,
+                    self.embedding_size,
+                )
+            )
+            row_cursor = row_end
+        rel_out_flat = torch.cat(msg_chunks, dim=0)
+        return arg_emb_all + rel_out_flat, relation_args
 
     def _relation_block_info(
         self, module: torch.nn.Module
@@ -2232,8 +2364,49 @@ class FlatRelationalLayer(torch.nn.Module):
         *,
         cache: dict | None = None,
     ) -> tuple[Tensor, Tensor] | None:
-        msg_chunks: list[Tensor] = []
-        idx_chunks: list[Tensor] = []
+        slot_messages = self.collect_slot_messages(
+            x, relation_args, topology, cache=cache
+        )
+        if slot_messages is None:
+            return None
+        return slot_messages, relation_args
+
+    def collect_slot_messages(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        *,
+        cache: dict | None = None,
+    ) -> Tensor | None:
+        """Materialize packed relation-slot messages in canonical slot order.
+
+        The returned tensor has shape ``[num_slots, embedding_size]`` and aligns
+        exactly with the packed slot order implied by ``relation_args`` and
+        ``topology``. This is the reusable boundary for downstream models such as
+        flat LGAN, which need slot-local messages before any entity aggregation.
+        """
+        centralized_spec = self._centralized_batch_spec()
+        if centralized_spec is not None:
+            centralized_arg_emb_all = (
+                x.index_select(0, relation_args)
+                if int(relation_args.numel()) > 0
+                else None
+            )
+            centralized = self._collect_centralized_relation_messages(
+                x,
+                relation_args,
+                topology,
+                spec=centralized_spec,
+                arg_emb_all=centralized_arg_emb_all,
+            )
+            if centralized is None:
+                return None
+            msgs, _ = centralized
+            return msgs
+        if int(relation_args.numel()) == 0:
+            return None
+        slot_messages = x.new_zeros((int(relation_args.numel()), self.embedding_size))
         use_any_kernels = self._use_relation_kernels(
             x
         ) or self._use_program_kernels(x)
@@ -2275,9 +2448,19 @@ class FlatRelationalLayer(torch.nn.Module):
                 )
                 if grouped is None:
                     continue
-                msgs, idx = grouped
-                msg_chunks.append(msgs)
-                idx_chunks.append(idx)
+                msgs, _ = grouped
+                msg_cursor = 0
+                for relation_index, row_count in zip(
+                    grouped_batch.relation_indices,
+                    grouped_batch.row_sizes,
+                    strict=True,
+                ):
+                    relation_slice = topology.relation_slices[relation_index]
+                    width = int(row_count) * int(grouped_batch.arity)
+                    slot_messages[
+                        relation_slice.slot_start : relation_slice.slot_end
+                    ] = msgs[msg_cursor : msg_cursor + width]
+                    msg_cursor += width
                 consumed.update(
                     int(idx_i) for idx_i in grouped_batch.relation_indices
                 )
@@ -2291,9 +2474,10 @@ class FlatRelationalLayer(torch.nn.Module):
                 )
                 if direct is None:
                     continue
-                msgs, idx = direct
-                msg_chunks.append(msgs)
-                idx_chunks.append(idx)
+                msgs, _ = direct
+                slot_messages[
+                    relation_slice.slot_start : relation_slice.slot_end
+                ] = msgs
                 consumed.add(relation_index)
             for relation_slice in topology.relation_slices:
                 if relation_slice.relation_index in consumed:
@@ -2306,9 +2490,10 @@ class FlatRelationalLayer(torch.nn.Module):
                 )
                 if direct is None:
                     continue
-                msgs, idx = direct
-                msg_chunks.append(msgs)
-                idx_chunks.append(idx)
+                msgs, _ = direct
+                slot_messages[
+                    relation_slice.slot_start : relation_slice.slot_end
+                ] = msgs
         else:
             for relation_slice in topology.relation_slices:
                 direct = self._collect_eager_relation_messages(
@@ -2319,13 +2504,11 @@ class FlatRelationalLayer(torch.nn.Module):
                 )
                 if direct is None:
                     continue
-                msgs, idx = direct
-                msg_chunks.append(msgs)
-                idx_chunks.append(idx)
-
-        if not msg_chunks:
-            return None
-        return torch.cat(msg_chunks, dim=0), torch.cat(idx_chunks, dim=0)
+                msgs, _ = direct
+                slot_messages[
+                    relation_slice.slot_start : relation_slice.slot_end
+                ] = msgs
+        return slot_messages
 
     def get_topology(
         self,

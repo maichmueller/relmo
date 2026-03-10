@@ -132,6 +132,17 @@ class _FlatPreparedBatch:
 
     All optional index tensors are 1D and point into the final entity embedding
     table produced by the model.
+
+    LGAN-only optional tensors:
+        ``lgan_tn_relation_indices`` / ``lgan_tn_entity_indices``:
+            Flat target-neighbor edges from pooled relation-instance rows onto
+            entity rows.
+        ``lgan_nn_relation_indices`` / ``lgan_nn_entity_indices``:
+            Flat neighbor-neighbor edges from pooled relation-instance rows
+            onto entity rows.
+        ``lgan_rr_src_relation_indices`` / ``lgan_rr_dst_relation_indices``:
+            Flat relation-relation exchange edges over pooled relation-instance
+            rows.
     """
 
     x: Tensor
@@ -154,6 +165,13 @@ class _FlatPreparedBatch:
     target_indices: Tensor | None = None
     target_candidate_ids: Tensor | None = None
     topology: object | None = None
+    lgan_tn_relation_indices: Tensor | None = None
+    lgan_tn_entity_indices: Tensor | None = None
+    lgan_nn_relation_indices: Tensor | None = None
+    lgan_nn_entity_indices: Tensor | None = None
+    lgan_rr_src_relation_indices: Tensor | None = None
+    lgan_rr_dst_relation_indices: Tensor | None = None
+    lgan_topology: object | None = None
     _relm_flat_prepared_batch: bool = True
 
 
