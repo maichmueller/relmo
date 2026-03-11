@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict
 
@@ -26,6 +27,7 @@ _VERSION_RE = re.compile(r"^(\d+)\.(\d+)")
 
 _MODE_SUM = 0
 _MODE_LOGSUMEXP = 1
+_MODE_MEAN = 2
 
 _PW_IDENTITY = 0
 _PW_RELU = 1
@@ -118,13 +120,19 @@ def _parse_build_info(raw: str) -> Dict[str, str]:
 
 def _candidate_libraries() -> list[Path]:
     pkg_dir = Path(__file__).resolve().parent.parent
-    patterns = (
-        "relm_mp_ops*.so",
-        "relm_mp_ops*.dylib",
-        "relm_mp_ops*.pyd",
-        "librelm_mp_ops*.so",
-        "librelm_mp_ops*.dylib",
-    )
+    if sys.platform == "darwin":
+        patterns = (
+            "relm_mp_ops*.dylib",
+            "librelm_mp_ops*.dylib",
+            "relm_mp_ops*.so",
+        )
+    elif os.name == "nt":
+        patterns = ("relm_mp_ops*.pyd",)
+    else:
+        patterns = (
+            "relm_mp_ops*.so",
+            "librelm_mp_ops*.so",
+        )
     candidates: list[Path] = []
     for pattern in patterns:
         candidates.extend(sorted(pkg_dir.glob(pattern)))
@@ -305,6 +313,67 @@ def _fanin_reduce_python(
         return exps_sum.log() + amax
 
     raise ValueError(f"Unsupported fanin mode {mode!r}. Supported: 0=sum, 1=logsumexp.")
+
+
+def _lgan_pool_reduce_python(
+    slot_messages: torch.Tensor,
+    slot_to_relation_instance: torch.Tensor,
+    relation_instance_arities: torch.Tensor,
+    rr_src: torch.Tensor,
+    rr_dst: torch.Tensor,
+    tn_rel: torch.Tensor,
+    tn_ent: torch.Tensor,
+    nn_rel: torch.Tensor,
+    nn_ent: torch.Tensor,
+    entity_dim_size: int,
+    mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if slot_messages.dim() != 2:
+        raise ValueError("lgan_pool_reduce expects slot_messages to be rank-2.")
+    relation_count = int(relation_instance_arities.numel())
+    relation_pair_x = slot_messages.new_zeros(
+        (relation_count, int(slot_messages.size(-1)))
+    )
+    if int(slot_messages.numel()) > 0:
+        relation_pair_x.index_add_(0, slot_to_relation_instance, slot_messages)
+        counts = relation_instance_arities.to(
+            device=slot_messages.device,
+            dtype=slot_messages.dtype,
+        ).view(-1, 1).clamp_min_(1.0)
+        relation_pair_x = relation_pair_x / counts
+
+    def _indexed_reduce(
+        source_embeddings: torch.Tensor,
+        source_index: torch.Tensor,
+        target_index: torch.Tensor,
+        dim_size: int,
+    ) -> torch.Tensor:
+        out = source_embeddings.new_zeros((int(dim_size), int(source_embeddings.size(-1))))
+        if int(source_index.numel()) == 0 or int(dim_size) == 0:
+            return out
+        gathered = source_embeddings.index_select(0, source_index)
+        out.index_add_(0, target_index, gathered)
+        if mode == _MODE_MEAN:
+            counts = out.new_zeros((int(dim_size), 1))
+            counts.index_add_(
+                0,
+                target_index,
+                torch.ones(
+                    (int(target_index.numel()), 1),
+                    device=out.device,
+                    dtype=out.dtype,
+                ),
+            )
+            out = out / counts.clamp_min_(1.0)
+        return out
+
+    if mode not in (_MODE_SUM, _MODE_MEAN):
+        raise ValueError("lgan_pool_reduce supports only sum and mean modes.")
+    rr_msgs = _indexed_reduce(relation_pair_x, rr_src, rr_dst, relation_count)
+    relation_pair_x = relation_pair_x + rr_msgs
+    tn_msgs = _indexed_reduce(relation_pair_x, tn_rel, tn_ent, int(entity_dim_size))
+    nn_msgs = _indexed_reduce(relation_pair_x, nn_rel, nn_ent, int(entity_dim_size))
+    return relation_pair_x, tn_msgs, nn_msgs
 
 
 def _fanout_pack_multi_python(
@@ -2929,6 +2998,59 @@ def program_rmsnorm_silu(
         w21_stack,
         b21_stack,
     )
+
+
+def lgan_pool_reduce(
+    slot_messages: torch.Tensor,
+    slot_to_relation_instance: torch.Tensor,
+    relation_instance_arities: torch.Tensor,
+    rr_src: torch.Tensor,
+    rr_dst: torch.Tensor,
+    tn_rel: torch.Tensor,
+    tn_ent: torch.Tensor,
+    nn_rel: torch.Tensor,
+    nn_ent: torch.Tensor,
+    *,
+    entity_dim_size: int,
+    mode: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool slot messages to relation instances and run RR/TN/NN indexed reductions."""
+    if torch is None:
+        raise ModuleNotFoundError("lgan_pool_reduce requires torch.") from _TORCH_IMPORT_ERROR
+    mode_key = str(mode).strip().lower()
+    if mode_key == "sum":
+        reduce_mode = _MODE_SUM
+    elif mode_key == "mean":
+        reduce_mode = _MODE_MEAN
+    else:
+        raise ValueError("lgan_pool_reduce supports only mode='sum' or mode='mean'.")
+    if _should_use_custom("lgan_pool_reduce") and _namespace_has_op("lgan_pool_reduce"):
+        return _ops_namespace().lgan_pool_reduce(
+            slot_messages,
+            slot_to_relation_instance,
+            relation_instance_arities,
+            rr_src,
+            rr_dst,
+            tn_rel,
+            tn_ent,
+            nn_rel,
+            nn_ent,
+            int(entity_dim_size),
+            int(reduce_mode),
+        )
+    return _lgan_pool_reduce_python(
+        slot_messages,
+        slot_to_relation_instance,
+        relation_instance_arities,
+        rr_src,
+        rr_dst,
+        tn_rel,
+        tn_ent,
+        nn_rel,
+        nn_ent,
+        int(entity_dim_size),
+        int(reduce_mode),
+    )
 __all__ = [
     "fanout_scatter",
     "fanin_reduce",
@@ -2942,6 +3064,7 @@ __all__ = [
     "program_silu_pair",
     "program_silu_postnorm",
     "program_rmsnorm_silu",
+    "lgan_pool_reduce",
     "activation_code",
     "available",
     "assert_runtime_compat",

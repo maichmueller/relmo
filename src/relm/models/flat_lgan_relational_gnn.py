@@ -25,10 +25,12 @@ from typing import Callable, Mapping, Sequence
 import torch
 import torch_geometric as pyg
 from torch import Tensor
+from torch_geometric.nn.aggr import MeanAggregation, SumAggregation
 
 import mifrost
 
 from ._compile import optional_compile
+from ..ops import mp as relm_mp_ops
 from .flat_contract import (
     FlatExecutionPolicy,
     _FlatPreparedBatch,
@@ -105,6 +107,13 @@ class FlatLGANRelationalGNN(FlatRelationalGNN):
             out_size=self.embedding_size,
             activation=self.activation,
         )
+        aggr = self.relational_layer.aggr
+        if isinstance(aggr, SumAggregation):
+            self._indexed_reduce_kind = "sum"
+        elif isinstance(aggr, MeanAggregation):
+            self._indexed_reduce_kind = "mean"
+        else:
+            self._indexed_reduce_kind = None
         self._persistent_lgan_topology_cache: dict[
             tuple[tuple[int, ...], tuple[int, ...], torch.dtype, str],
             FlatLGANTopology,
@@ -452,12 +461,27 @@ class FlatLGANRelationalGNN(FlatRelationalGNN):
         if source_index is None or target_index is None or int(source_index.numel()) == 0:
             return out
         gathered = source_embeddings.index_select(0, source_index)
+        if self._indexed_reduce_kind == "sum":
+            out.index_add_(0, target_index, gathered)
+            return out
+        if self._indexed_reduce_kind == "mean":
+            out.index_add_(0, target_index, gathered)
+            counts = out.new_zeros((int(dim_size), 1))
+            counts.index_add_(
+                0,
+                target_index,
+                torch.ones((int(target_index.numel()), 1), device=out.device, dtype=out.dtype),
+            )
+            return out / counts.clamp_min_(1.0)
         return self.relational_layer.aggr(
             x=gathered,
             index=target_index,
             dim=0,
             dim_size=int(dim_size),
         )
+
+    def _use_lgan_pool_reduce_op(self) -> bool:
+        return self._indexed_reduce_kind in {"sum", "mean"} and relm_mp_ops.available()
 
     @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
     def _compute_entity_embeddings_prepared(
@@ -476,26 +500,41 @@ class FlatLGANRelationalGNN(FlatRelationalGNN):
             slot_messages = self._build_relation_slot_messages(
                 entity_embeddings, prepared_batch, cache=cache
             )
-            relation_pair_x = self._pool_relation_instances(slot_messages, lgan_topology)
-            rr_msgs = self._aggregate_indexed(
-                relation_pair_x,
-                prepared_batch.lgan_rr_src_relation_indices,
-                prepared_batch.lgan_rr_dst_relation_indices,
-                dim_size=int(lgan_topology.relation_instance_count),
-            )
-            relation_pair_x = relation_pair_x + rr_msgs
-            tn_msgs = self._aggregate_indexed(
-                relation_pair_x,
-                prepared_batch.lgan_tn_relation_indices,
-                prepared_batch.lgan_tn_entity_indices,
-                dim_size=int(entity_embeddings.size(0)),
-            )
-            nn_msgs = self._aggregate_indexed(
-                relation_pair_x,
-                prepared_batch.lgan_nn_relation_indices,
-                prepared_batch.lgan_nn_entity_indices,
-                dim_size=int(entity_embeddings.size(0)),
-            )
+            if self._use_lgan_pool_reduce_op():
+                relation_pair_x, tn_msgs, nn_msgs = relm_mp_ops.lgan_pool_reduce(
+                    slot_messages,
+                    lgan_topology.slot_to_relation_instance,
+                    lgan_topology.relation_instance_arities,
+                    prepared_batch.lgan_rr_src_relation_indices,
+                    prepared_batch.lgan_rr_dst_relation_indices,
+                    prepared_batch.lgan_tn_relation_indices,
+                    prepared_batch.lgan_tn_entity_indices,
+                    prepared_batch.lgan_nn_relation_indices,
+                    prepared_batch.lgan_nn_entity_indices,
+                    entity_dim_size=int(entity_embeddings.size(0)),
+                    mode=str(self._indexed_reduce_kind),
+                )
+            else:
+                relation_pair_x = self._pool_relation_instances(slot_messages, lgan_topology)
+                rr_msgs = self._aggregate_indexed(
+                    relation_pair_x,
+                    prepared_batch.lgan_rr_src_relation_indices,
+                    prepared_batch.lgan_rr_dst_relation_indices,
+                    dim_size=int(lgan_topology.relation_instance_count),
+                )
+                relation_pair_x = relation_pair_x + rr_msgs
+                tn_msgs = self._aggregate_indexed(
+                    relation_pair_x,
+                    prepared_batch.lgan_tn_relation_indices,
+                    prepared_batch.lgan_tn_entity_indices,
+                    dim_size=int(entity_embeddings.size(0)),
+                )
+                nn_msgs = self._aggregate_indexed(
+                    relation_pair_x,
+                    prepared_batch.lgan_nn_relation_indices,
+                    prepared_batch.lgan_nn_entity_indices,
+                    dim_size=int(entity_embeddings.size(0)),
+                )
             updated = self.fusion_updater(
                 torch.cat([entity_embeddings, tn_msgs, nn_msgs], dim=1)
             )

@@ -15,6 +15,7 @@ using at::Tensor;
 
 constexpr int64_t kModeSum = 0;
 constexpr int64_t kModeLogSumExp = 1;
+constexpr int64_t kModeMean = 2;
 
 constexpr int64_t kPwIdentity = 0;
 constexpr int64_t kPwReLU = 1;
@@ -2974,6 +2975,109 @@ Tensor fanin_reduce(
    throw std::invalid_argument("Unsupported fanin_reduce mode. Supported: 0=sum, 1=logsumexp.");
 }
 
+std::tuple< Tensor, Tensor, Tensor > lgan_pool_reduce(
+   const Tensor& slot_messages,
+   const Tensor& slot_to_relation_instance,
+   const Tensor& relation_instance_arities,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t entity_dim_size,
+   int64_t mode
+)
+{
+   check_rank(slot_messages, 2, "slot_messages");
+   check_int32_or_int64_index(slot_to_relation_instance, "slot_to_relation_instance");
+   check_int64_index(relation_instance_arities, "relation_instance_arities");
+   check_int32_or_int64_index(rr_src, "rr_src");
+   check_int32_or_int64_index(rr_dst, "rr_dst");
+   check_int32_or_int64_index(tn_rel, "tn_rel");
+   check_int32_or_int64_index(tn_ent, "tn_ent");
+   check_int32_or_int64_index(nn_rel, "nn_rel");
+   check_int32_or_int64_index(nn_ent, "nn_ent");
+   TORCH_CHECK(
+      slot_messages.device() == slot_to_relation_instance.device()
+         && slot_messages.device() == relation_instance_arities.device()
+         && slot_messages.device() == rr_src.device()
+         && slot_messages.device() == rr_dst.device()
+         && slot_messages.device() == tn_rel.device()
+         && slot_messages.device() == tn_ent.device()
+         && slot_messages.device() == nn_rel.device()
+         && slot_messages.device() == nn_ent.device(),
+      "lgan_pool_reduce expects all tensors on the same device."
+   );
+   TORCH_CHECK(entity_dim_size >= 0, "entity_dim_size must be >= 0.");
+   TORCH_CHECK(
+      relation_instance_arities.size(0) >= 0,
+      "relation_instance_arities must have non-negative length."
+   );
+   TORCH_CHECK(
+      slot_to_relation_instance.size(0) == slot_messages.size(0),
+      "slot_to_relation_instance length must match slot_messages rows."
+   );
+   TORCH_CHECK(
+      tn_rel.size(0) == tn_ent.size(0),
+      "tn_rel and tn_ent must have equal length."
+   );
+   TORCH_CHECK(
+      nn_rel.size(0) == nn_ent.size(0),
+      "nn_rel and nn_ent must have equal length."
+   );
+   TORCH_CHECK(
+      rr_src.size(0) == rr_dst.size(0),
+      "rr_src and rr_dst must have equal length."
+   );
+   TORCH_CHECK(
+      mode == kModeSum || mode == kModeMean,
+      "lgan_pool_reduce supports only mode 0=sum or 2=mean."
+   );
+
+   const auto relation_count = relation_instance_arities.size(0);
+   auto relation_pair_x =
+      slot_messages.new_zeros({relation_count, slot_messages.size(1)});
+   if(slot_messages.numel() > 0) {
+      relation_pair_x.index_add_(0, slot_to_relation_instance, slot_messages);
+      auto counts = relation_instance_arities.to(slot_messages.scalar_type())
+                       .view({relation_count, 1})
+                       .clamp_min_(1.0);
+      relation_pair_x = relation_pair_x / counts;
+   }
+
+   auto aggregate_indexed =
+      [&](const Tensor& source_embeddings,
+          const Tensor& source_index,
+          const Tensor& target_index,
+          int64_t dim_size) -> Tensor {
+      auto out =
+         source_embeddings.new_zeros({dim_size, source_embeddings.size(1)});
+      if(source_index.numel() == 0 || target_index.numel() == 0 || dim_size == 0) {
+         return out;
+      }
+      auto gathered = source_embeddings.index_select(0, source_index);
+      out.index_add_(0, target_index, gathered);
+      if(mode == kModeMean) {
+         auto count =
+            source_embeddings.new_zeros({dim_size, 1});
+         count.index_add_(
+            0,
+            target_index,
+            at::ones({target_index.size(0), 1}, source_embeddings.options())
+         );
+         out = out / count.clamp_min_(1.0);
+      }
+      return out;
+   };
+
+   auto rr_msgs = aggregate_indexed(relation_pair_x, rr_src, rr_dst, relation_count);
+   relation_pair_x = relation_pair_x + rr_msgs;
+   auto tn_msgs = aggregate_indexed(relation_pair_x, tn_rel, tn_ent, entity_dim_size);
+   auto nn_msgs = aggregate_indexed(relation_pair_x, nn_rel, nn_ent, entity_dim_size);
+   return std::make_tuple(relation_pair_x, tn_msgs, nn_msgs);
+}
+
 std::string build_info()
 {
    return std::string("build_torch=") + RELM_MP_BUILD_TORCH_VERSION + ";build_cuda_tag="
@@ -3005,6 +3109,9 @@ TORCH_LIBRARY(relm_mp, m)
    );
    m.def(
       "fanin_reduce_logsumexp_backward(Tensor grad_out, Tensor rel_flat, Tensor flat_src, Tensor dst_idx, Tensor out, int rel_rows) -> Tensor"
+   );
+   m.def(
+      "lgan_pool_reduce(Tensor slot_messages, Tensor slot_to_relation_instance, Tensor relation_instance_arities, Tensor rr_src, Tensor rr_dst, Tensor tn_rel, Tensor tn_ent, Tensor nn_rel, Tensor nn_ent, int entity_dim_size, int mode) -> (Tensor, Tensor, Tensor)"
    );
    m.def(
       "fanin_pack_multi(Tensor[] rel_parts, Tensor[] flat_src_parts, Tensor[] dst_idx_parts) -> (Tensor, Tensor, Tensor)"
@@ -3060,6 +3167,7 @@ TORCH_LIBRARY_IMPL(relm_mp, CompositeImplicitAutograd, m)
    m.impl("fanin_reduce", relm::mp::fanin_reduce);
    m.impl("fanin_reduce_sum_backward", relm::mp::fanin_reduce_sum_backward);
    m.impl("fanin_reduce_logsumexp_backward", relm::mp::fanin_reduce_logsumexp_backward);
+   m.impl("lgan_pool_reduce", relm::mp::lgan_pool_reduce);
    m.impl("fanin_pack_multi", relm::mp::fanin_pack_multi);
    m.impl("fanin_pack_from_edges", relm::mp::fanin_pack_from_edges);
    m.impl(

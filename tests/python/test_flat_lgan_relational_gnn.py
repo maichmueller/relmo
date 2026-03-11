@@ -198,6 +198,77 @@ def test_flat_lgan_rejects_out_of_range_relation_indices() -> None:
         model(data)
 
 
+def test_flat_lgan_mean_indexed_reduce_matches_resolved_aggregation() -> None:
+    model = _InputInitializedFlatLGAN(
+        embedding_size=2,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        aggregation="mean",
+        relation_modules={
+            "rel_a": _ZeroBlock(4),
+            "rel_b": _ZeroBlock(2),
+        },
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="off",
+            program_kernels="off",
+            relation_gather="off",
+        ),
+    )
+    source = torch.tensor(
+        [[1.0, 0.0], [3.0, 2.0], [5.0, 4.0], [7.0, 6.0]],
+        dtype=torch.float,
+    )
+    source_index = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    target_index = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    out = model._aggregate_indexed(source, source_index, target_index, dim_size=2)
+    ref = model.relational_layer.aggr(x=source.index_select(0, source_index), index=target_index, dim=0, dim_size=2)
+    assert torch.allclose(out, ref, atol=1e-6, rtol=0.0)
+
+
+def test_lgan_pool_reduce_op_matches_reference_math() -> None:
+    slot_messages = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 0.0], [0.0, 2.0]],
+        dtype=torch.float,
+    )
+    slot_to_relation_instance = torch.tensor([0, 0, 1, 1, 2], dtype=torch.long)
+    relation_instance_arities = torch.tensor([2, 2, 1], dtype=torch.long)
+    rr_src = torch.tensor([0, 1], dtype=torch.long)
+    rr_dst = torch.tensor([1, 2], dtype=torch.long)
+    tn_rel = torch.tensor([0, 1, 2], dtype=torch.long)
+    tn_ent = torch.tensor([0, 1, 2], dtype=torch.long)
+    nn_rel = torch.tensor([1, 2], dtype=torch.long)
+    nn_ent = torch.tensor([2, 4], dtype=torch.long)
+
+    relation_pair_x, tn_msgs, nn_msgs = mp_ops.lgan_pool_reduce(
+        slot_messages,
+        slot_to_relation_instance,
+        relation_instance_arities,
+        rr_src,
+        rr_dst,
+        tn_rel,
+        tn_ent,
+        nn_rel,
+        nn_ent,
+        entity_dim_size=5,
+        mode="sum",
+    )
+    expected_entity = _manual_lgan_reference(_make_lgan_data())
+    expected_relation_pair = torch.tensor(
+        [[0.5, 0.5], [2.0, 1.0], [1.5, 2.5]],
+        dtype=torch.float,
+    )
+    expected_tn = torch.zeros_like(_make_lgan_data().x)
+    expected_tn[0] = torch.tensor([0.5, 0.5])
+    expected_tn[1] = torch.tensor([2.0, 1.0])
+    expected_tn[2] = torch.tensor([1.5, 2.5])
+    expected_nn = torch.zeros_like(_make_lgan_data().x)
+    expected_nn[2] = torch.tensor([2.0, 1.0])
+    expected_nn[4] = torch.tensor([1.5, 2.5])
+    assert torch.allclose(relation_pair_x, expected_relation_pair, atol=1e-6, rtol=0.0)
+    assert torch.allclose(tn_msgs, expected_tn, atol=1e-6, rtol=0.0)
+    assert torch.allclose(nn_msgs, expected_nn, atol=1e-6, rtol=0.0)
+
+
 def test_flat_lgan_accepts_native_mifrost_batch_and_matches_pyg() -> None:
     native_batch, pyg_batch = _load_native_lgan_batch()
     relations = {
