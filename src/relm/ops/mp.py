@@ -376,6 +376,64 @@ def _lgan_pool_reduce_python(
     return relation_pair_x, tn_msgs, nn_msgs
 
 
+def _lgan_relation_graph_step_python(
+    relation_pair_x: torch.Tensor,
+    rr_src: torch.Tensor,
+    rr_dst: torch.Tensor,
+    tn_rel: torch.Tensor,
+    tn_ent: torch.Tensor,
+    nn_rel: torch.Tensor,
+    nn_ent: torch.Tensor,
+    entity_dim_size: int,
+    mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if relation_pair_x.dim() != 2:
+        raise ValueError("lgan_relation_graph_step expects relation_pair_x to be rank-2.")
+
+    def _indexed_reduce(
+        source_embeddings: torch.Tensor,
+        source_index: torch.Tensor,
+        target_index: torch.Tensor,
+        dim_size: int,
+    ) -> torch.Tensor:
+        out = source_embeddings.new_zeros((int(dim_size), int(source_embeddings.size(-1))))
+        if int(source_index.numel()) == 0 or int(dim_size) == 0:
+            return out
+        gathered = source_embeddings.index_select(0, source_index)
+        out.index_add_(0, target_index, gathered)
+        if mode == _MODE_MEAN:
+            counts = out.new_zeros((int(dim_size), 1))
+            counts.index_add_(
+                0,
+                target_index,
+                torch.ones(
+                    (int(target_index.numel()), 1),
+                    device=out.device,
+                    dtype=out.dtype,
+                ),
+            )
+            out = out / counts.clamp_min_(1.0)
+        return out
+
+    if mode not in (_MODE_SUM, _MODE_MEAN):
+        raise ValueError("lgan_relation_graph_step supports only sum and mean modes.")
+    rr_msgs = _indexed_reduce(relation_pair_x, rr_src, rr_dst, int(relation_pair_x.size(0)))
+    relation_pair_x = relation_pair_x + rr_msgs
+    tn_msgs = _indexed_reduce(relation_pair_x, tn_rel, tn_ent, int(entity_dim_size))
+    nn_msgs = _indexed_reduce(relation_pair_x, nn_rel, nn_ent, int(entity_dim_size))
+    return relation_pair_x, tn_msgs, nn_msgs
+
+
+def _pool_block_messages_to_rows(
+    rel_cat: torch.Tensor,
+    row_count: int,
+    arity: int,
+) -> torch.Tensor:
+    if int(rel_cat.numel()) == 0 or int(row_count) <= 0:
+        return rel_cat.new_zeros((0, int(rel_cat.size(-1))))
+    return rel_cat.view(int(row_count), int(arity), int(rel_cat.size(-1))).mean(dim=1)
+
+
 def _fanout_pack_multi_python(
     x_parts: list[torch.Tensor],
     src_idx_parts: list[torch.Tensor],
@@ -1385,6 +1443,675 @@ if torch is not None:
             )
             return grad_rel, None, None, None
 
+    class _LGANPoolReduceFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: torch.autograd.function.FunctionCtx,
+            slot_messages: torch.Tensor,
+            slot_to_relation_instance: torch.Tensor,
+            relation_instance_arities: torch.Tensor,
+            rr_src: torch.Tensor,
+            rr_dst: torch.Tensor,
+            tn_rel: torch.Tensor,
+            tn_ent: torch.Tensor,
+            nn_rel: torch.Tensor,
+            nn_ent: torch.Tensor,
+            entity_dim_size: int,
+            mode: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            ctx.entity_dim_size = int(entity_dim_size)
+            ctx.mode = int(mode)
+            ctx.save_for_backward(
+                slot_messages,
+                slot_to_relation_instance,
+                relation_instance_arities,
+                rr_src,
+                rr_dst,
+                tn_rel,
+                tn_ent,
+                nn_rel,
+                nn_ent,
+            )
+            used_custom = (
+                slot_messages.is_cuda
+                and _should_use_custom("lgan_pool_reduce")
+                and _namespace_has_op("lgan_pool_reduce")
+            )
+            ctx.used_custom = bool(used_custom)
+            if used_custom:
+                return _ops_namespace().lgan_pool_reduce(
+                    slot_messages,
+                    slot_to_relation_instance,
+                    relation_instance_arities,
+                    rr_src,
+                    rr_dst,
+                    tn_rel,
+                    tn_ent,
+                    nn_rel,
+                    nn_ent,
+                    int(ctx.entity_dim_size),
+                    int(ctx.mode),
+                )
+            return _lgan_pool_reduce_python(
+                slot_messages,
+                slot_to_relation_instance,
+                relation_instance_arities,
+                rr_src,
+                rr_dst,
+                tn_rel,
+                tn_ent,
+                nn_rel,
+                nn_ent,
+                int(ctx.entity_dim_size),
+                int(ctx.mode),
+            )
+
+        @staticmethod
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            grad_relation_pair_x: torch.Tensor | None,
+            grad_tn_msgs: torch.Tensor | None,
+            grad_nn_msgs: torch.Tensor | None,
+        ) -> tuple[torch.Tensor | None, ...]:
+            (
+                slot_messages,
+                slot_to_relation_instance,
+                relation_instance_arities,
+                rr_src,
+                rr_dst,
+                tn_rel,
+                tn_ent,
+                nn_rel,
+                nn_ent,
+            ) = ctx.saved_tensors
+            if grad_relation_pair_x is None and grad_tn_msgs is None and grad_nn_msgs is None:
+                return (None,) * 11
+            needs = ctx.needs_input_grad
+            grad_slot_messages: torch.Tensor | None = None
+            if needs[0]:
+                use_custom_backward = (
+                    bool(getattr(ctx, "used_custom", False))
+                    and slot_messages.is_cuda
+                    and _should_use_custom("lgan_pool_reduce_backward")
+                    and _namespace_has_op("lgan_pool_reduce_backward")
+                )
+                grad_relation_pair_x_req = (
+                    grad_relation_pair_x
+                    if grad_relation_pair_x is not None
+                    else torch.zeros(
+                        (
+                            int(relation_instance_arities.numel()),
+                            int(slot_messages.size(-1)),
+                        ),
+                        device=slot_messages.device,
+                        dtype=slot_messages.dtype,
+                    )
+                )
+                grad_tn_msgs_req = (
+                    grad_tn_msgs
+                    if grad_tn_msgs is not None
+                    else torch.zeros(
+                        (
+                            int(ctx.entity_dim_size),
+                            int(slot_messages.size(-1)),
+                        ),
+                        device=slot_messages.device,
+                        dtype=slot_messages.dtype,
+                    )
+                )
+                grad_nn_msgs_req = (
+                    grad_nn_msgs
+                    if grad_nn_msgs is not None
+                    else torch.zeros(
+                        (
+                            int(ctx.entity_dim_size),
+                            int(slot_messages.size(-1)),
+                        ),
+                        device=slot_messages.device,
+                        dtype=slot_messages.dtype,
+                    )
+                )
+                if use_custom_backward:
+                    return (
+                        _ops_namespace().lgan_pool_reduce_backward(
+                            grad_relation_pair_x_req,
+                            grad_tn_msgs_req,
+                            grad_nn_msgs_req,
+                            slot_to_relation_instance,
+                            relation_instance_arities,
+                            rr_src,
+                            rr_dst,
+                            tn_rel,
+                            tn_ent,
+                            nn_rel,
+                            nn_ent,
+                            int(relation_instance_arities.numel()),
+                            int(ctx.mode),
+                        ),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                with torch.enable_grad():
+                    slot_messages_req = slot_messages.detach().requires_grad_(True)
+                    relation_pair_x, tn_msgs, nn_msgs = _lgan_pool_reduce_python(
+                        slot_messages_req,
+                        slot_to_relation_instance,
+                        relation_instance_arities,
+                        rr_src,
+                        rr_dst,
+                        tn_rel,
+                        tn_ent,
+                        nn_rel,
+                        nn_ent,
+                        int(ctx.entity_dim_size),
+                        int(ctx.mode),
+                    )
+                    outputs = (relation_pair_x, tn_msgs, nn_msgs)
+                    grad_outputs = tuple(
+                        g if g is not None else torch.zeros_like(o)
+                        for g, o in zip(
+                            (grad_relation_pair_x, grad_tn_msgs, grad_nn_msgs),
+                            outputs,
+                        )
+                    )
+                    (grad_slot_messages,) = torch.autograd.grad(
+                        outputs,
+                        (slot_messages_req,),
+                        grad_outputs=grad_outputs,
+                        allow_unused=True,
+                    )
+            return (
+                grad_slot_messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+    class _LGANRelationGraphStepFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: torch.autograd.function.FunctionCtx,
+            relation_pair_x: torch.Tensor,
+            rr_src: torch.Tensor,
+            rr_dst: torch.Tensor,
+            tn_rel: torch.Tensor,
+            tn_ent: torch.Tensor,
+            nn_rel: torch.Tensor,
+            nn_ent: torch.Tensor,
+            entity_dim_size: int,
+            mode: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            ctx.entity_dim_size = int(entity_dim_size)
+            ctx.mode = int(mode)
+            ctx.save_for_backward(
+                relation_pair_x,
+                rr_src,
+                rr_dst,
+                tn_rel,
+                tn_ent,
+                nn_rel,
+                nn_ent,
+            )
+            used_custom = (
+                relation_pair_x.is_cuda
+                and _should_use_custom("lgan_relation_graph_step")
+                and _namespace_has_op("lgan_relation_graph_step")
+            )
+            ctx.used_custom = bool(used_custom)
+            if used_custom:
+                return _ops_namespace().lgan_relation_graph_step(
+                    relation_pair_x,
+                    rr_src,
+                    rr_dst,
+                    tn_rel,
+                    tn_ent,
+                    nn_rel,
+                    nn_ent,
+                    int(ctx.entity_dim_size),
+                    int(ctx.mode),
+                )
+            return _lgan_relation_graph_step_python(
+                relation_pair_x,
+                rr_src,
+                rr_dst,
+                tn_rel,
+                tn_ent,
+                nn_rel,
+                nn_ent,
+                int(ctx.entity_dim_size),
+                int(ctx.mode),
+            )
+
+        @staticmethod
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            grad_relation_pair_x: torch.Tensor | None,
+            grad_tn_msgs: torch.Tensor | None,
+            grad_nn_msgs: torch.Tensor | None,
+        ) -> tuple[torch.Tensor | None, ...]:
+            relation_pair_x, rr_src, rr_dst, tn_rel, tn_ent, nn_rel, nn_ent = ctx.saved_tensors
+            if grad_relation_pair_x is None and grad_tn_msgs is None and grad_nn_msgs is None:
+                return (None,) * 9
+            needs = ctx.needs_input_grad
+            grad_relation_pair_x_req = (
+                grad_relation_pair_x
+                if grad_relation_pair_x is not None
+                else torch.zeros_like(relation_pair_x)
+            )
+            grad_tn_msgs_req = (
+                grad_tn_msgs
+                if grad_tn_msgs is not None
+                else torch.zeros(
+                    (int(ctx.entity_dim_size), int(relation_pair_x.size(-1))),
+                    device=relation_pair_x.device,
+                    dtype=relation_pair_x.dtype,
+                )
+            )
+            grad_nn_msgs_req = (
+                grad_nn_msgs
+                if grad_nn_msgs is not None
+                else torch.zeros(
+                    (int(ctx.entity_dim_size), int(relation_pair_x.size(-1))),
+                    device=relation_pair_x.device,
+                    dtype=relation_pair_x.dtype,
+                )
+            )
+            if (
+                needs[0]
+                and bool(getattr(ctx, "used_custom", False))
+                and relation_pair_x.is_cuda
+                and _should_use_custom("lgan_relation_graph_step_backward")
+                and _namespace_has_op("lgan_relation_graph_step_backward")
+            ):
+                return (
+                    _ops_namespace().lgan_relation_graph_step_backward(
+                        grad_relation_pair_x_req,
+                        grad_tn_msgs_req,
+                        grad_nn_msgs_req,
+                        rr_src,
+                        rr_dst,
+                        tn_rel,
+                        tn_ent,
+                        nn_rel,
+                        nn_ent,
+                        int(relation_pair_x.size(0)),
+                        int(ctx.mode),
+                    ),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            grad_relation_pair_x_out: torch.Tensor | None = None
+            if needs[0]:
+                with torch.enable_grad():
+                    relation_pair_x_req_in = relation_pair_x.detach().requires_grad_(True)
+                    relation_pair_x_out_ref, tn_msgs_ref, nn_msgs_ref = _lgan_relation_graph_step_python(
+                        relation_pair_x_req_in,
+                        rr_src,
+                        rr_dst,
+                        tn_rel,
+                        tn_ent,
+                        nn_rel,
+                        nn_ent,
+                        int(ctx.entity_dim_size),
+                        int(ctx.mode),
+                    )
+                    (grad_relation_pair_x_out,) = torch.autograd.grad(
+                        (relation_pair_x_out_ref, tn_msgs_ref, nn_msgs_ref),
+                        (relation_pair_x_req_in,),
+                        grad_outputs=(grad_relation_pair_x_req, grad_tn_msgs_req, grad_nn_msgs_req),
+                        allow_unused=True,
+                    )
+            return (
+                grad_relation_pair_x_out,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+    class _LGANPointwiseBuildStepFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: torch.autograd.function.FunctionCtx,
+            x: torch.Tensor,
+            relation_args: torch.Tensor,
+            seed_relation_pair_x: torch.Tensor,
+            rr_src: torch.Tensor,
+            rr_dst: torch.Tensor,
+            tn_rel: torch.Tensor,
+            tn_ent: torch.Tensor,
+            nn_rel: torch.Tensor,
+            nn_ent: torch.Tensor,
+            entity_dim_size: int,
+            mode: int,
+            arities: tuple[int, ...],
+            pointwise_codes: tuple[int, ...],
+            slot_offsets_groups: tuple[tuple[int, ...], ...],
+            row_sizes_groups: tuple[tuple[int, ...], ...],
+            num_groups: int,
+            *tensor_args: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            group_count = int(num_groups)
+            if group_count < 0:
+                raise ValueError("lgan_build_pointwise_step expects non-negative num_groups.")
+            if len(arities) != group_count or len(pointwise_codes) != group_count:
+                raise ValueError("lgan_build_pointwise_step metadata does not match group count.")
+            if len(slot_offsets_groups) != group_count or len(row_sizes_groups) != group_count:
+                raise ValueError("lgan_build_pointwise_step offset metadata does not match group count.")
+            if len(tensor_args) != 5 * group_count:
+                raise ValueError("lgan_build_pointwise_step expects row-index and parameter tensors per group.")
+
+            row_index_groups = tuple(tensor_args[:group_count])
+            param_tensors = tuple(tensor_args[group_count:])
+            if len(param_tensors) != 4 * group_count:
+                raise ValueError("lgan_build_pointwise_step expects four parameter tensors per group.")
+            w1_groups = tuple(param_tensors[0:group_count])
+            b1_groups = tuple(param_tensors[group_count : 2 * group_count])
+            w2_groups = tuple(param_tensors[2 * group_count : 3 * group_count])
+            b2_groups = tuple(param_tensors[3 * group_count : 4 * group_count])
+
+            relation_pair_x = seed_relation_pair_x.clone()
+            use_custom_block = (
+                x.is_cuda
+                and _should_use_custom("block_pointwise")
+                and _namespace_has_op("block_pointwise")
+            )
+            for group_index in range(group_count):
+                row_indices = row_index_groups[group_index]
+                if int(row_indices.numel()) == 0:
+                    continue
+                w1_stack = w1_groups[group_index]
+                b1_stack = b1_groups[group_index]
+                w2_stack = w2_groups[group_index]
+                b2_stack = b2_groups[group_index]
+                if use_custom_block:
+                    rel_cat, _ = _ops_namespace().block_pointwise(
+                        x,
+                        relation_args,
+                        list(slot_offsets_groups[group_index]),
+                        list(row_sizes_groups[group_index]),
+                        int(arities[group_index]),
+                        w1_stack,
+                        b1_stack,
+                        w2_stack,
+                        b2_stack,
+                        int(pointwise_codes[group_index]),
+                    )
+                else:
+                    rel_cat, _ = _block_pointwise_python(
+                        x,
+                        relation_args,
+                        list(slot_offsets_groups[group_index]),
+                        list(row_sizes_groups[group_index]),
+                        int(arities[group_index]),
+                        w1_stack,
+                        b1_stack,
+                        w2_stack,
+                        b2_stack,
+                        int(pointwise_codes[group_index]),
+                    )
+                pooled = _pool_block_messages_to_rows(
+                    rel_cat,
+                    row_count=int(row_indices.numel()),
+                    arity=int(arities[group_index]),
+                )
+                relation_pair_x.index_copy_(0, row_indices, pooled)
+
+            use_custom_graph = (
+                relation_pair_x.is_cuda
+                and _should_use_custom("lgan_relation_graph_step")
+                and _namespace_has_op("lgan_relation_graph_step")
+            )
+            if use_custom_graph:
+                relation_pair_x_out, tn_msgs, nn_msgs = _ops_namespace().lgan_relation_graph_step(
+                    relation_pair_x,
+                    rr_src,
+                    rr_dst,
+                    tn_rel,
+                    tn_ent,
+                    nn_rel,
+                    nn_ent,
+                    int(entity_dim_size),
+                    int(mode),
+                )
+            else:
+                relation_pair_x_out, tn_msgs, nn_msgs = _lgan_relation_graph_step_python(
+                    relation_pair_x,
+                    rr_src,
+                    rr_dst,
+                    tn_rel,
+                    tn_ent,
+                    nn_rel,
+                    nn_ent,
+                    int(entity_dim_size),
+                    int(mode),
+                )
+
+            ctx.group_count = group_count
+            ctx.relation_pair_rows = int(seed_relation_pair_x.size(0))
+            ctx.entity_dim_size = int(entity_dim_size)
+            ctx.mode = int(mode)
+            ctx.arities = tuple(int(v) for v in arities)
+            ctx.pointwise_codes = tuple(int(v) for v in pointwise_codes)
+            ctx.slot_offsets_groups = tuple(tuple(int(v) for v in values) for values in slot_offsets_groups)
+            ctx.row_sizes_groups = tuple(tuple(int(v) for v in values) for values in row_sizes_groups)
+            ctx.save_for_backward(
+                x,
+                relation_args,
+                rr_src,
+                rr_dst,
+                tn_rel,
+                tn_ent,
+                nn_rel,
+                nn_ent,
+                *row_index_groups,
+                *param_tensors,
+            )
+            return relation_pair_x_out, tn_msgs, nn_msgs
+
+        @staticmethod
+        def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            grad_relation_pair_x: torch.Tensor | None,
+            grad_tn_msgs: torch.Tensor | None,
+            grad_nn_msgs: torch.Tensor | None,
+        ) -> tuple[torch.Tensor | None, ...]:
+            group_count = int(ctx.group_count)
+            saved = ctx.saved_tensors
+            x = saved[0]
+            relation_args = saved[1]
+            rr_src, rr_dst, tn_rel, tn_ent, nn_rel, nn_ent = saved[2:8]
+            row_index_groups = saved[8 : 8 + group_count]
+            param_tensors = saved[8 + group_count :]
+            w1_groups = tuple(param_tensors[0:group_count])
+            b1_groups = tuple(param_tensors[group_count : 2 * group_count])
+            w2_groups = tuple(param_tensors[2 * group_count : 3 * group_count])
+            b2_groups = tuple(param_tensors[3 * group_count : 4 * group_count])
+
+            if grad_relation_pair_x is None and grad_tn_msgs is None and grad_nn_msgs is None:
+                return (None,) * (16 + 5 * group_count)
+
+            needs = ctx.needs_input_grad
+            grad_relation_pair_x_req = (
+                grad_relation_pair_x
+                if grad_relation_pair_x is not None
+                else torch.zeros(
+                    (int(ctx.relation_pair_rows), int(x.size(-1))),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+            )
+            grad_tn_msgs_req = (
+                grad_tn_msgs
+                if grad_tn_msgs is not None
+                else torch.zeros(
+                    (int(ctx.entity_dim_size), int(x.size(-1))),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+            )
+            grad_nn_msgs_req = (
+                grad_nn_msgs
+                if grad_nn_msgs is not None
+                else torch.zeros(
+                    (int(ctx.entity_dim_size), int(x.size(-1))),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+            )
+
+            if (
+                x.is_cuda
+                and _should_use_custom("lgan_relation_graph_step_backward")
+                and _namespace_has_op("lgan_relation_graph_step_backward")
+            ):
+                grad_relation_pair_x_in = _ops_namespace().lgan_relation_graph_step_backward(
+                    grad_relation_pair_x_req,
+                    grad_tn_msgs_req,
+                    grad_nn_msgs_req,
+                    rr_src,
+                    rr_dst,
+                    tn_rel,
+                    tn_ent,
+                    nn_rel,
+                    nn_ent,
+                    int(grad_relation_pair_x_req.size(0)),
+                    int(ctx.mode),
+                )
+            else:
+                with torch.enable_grad():
+                    relation_pair_x_req_in = grad_relation_pair_x_req.detach().new_zeros(
+                        grad_relation_pair_x_req.shape
+                    ).requires_grad_(True)
+                    relation_pair_x_out_ref, tn_msgs_ref, nn_msgs_ref = _lgan_relation_graph_step_python(
+                        relation_pair_x_req_in,
+                        rr_src,
+                        rr_dst,
+                        tn_rel,
+                        tn_ent,
+                        nn_rel,
+                        nn_ent,
+                        int(ctx.entity_dim_size),
+                        int(ctx.mode),
+                    )
+                    (grad_relation_pair_x_in,) = torch.autograd.grad(
+                        (relation_pair_x_out_ref, tn_msgs_ref, nn_msgs_ref),
+                        (relation_pair_x_req_in,),
+                        grad_outputs=(grad_relation_pair_x_req, grad_tn_msgs_req, grad_nn_msgs_req),
+                        allow_unused=False,
+                    )
+
+            grad_x_total = (
+                torch.zeros_like(x) if needs[0] else None
+            )
+            grad_seed = grad_relation_pair_x_in if needs[2] else None
+            grads: list[torch.Tensor | None] = [None] * (16 + 5 * group_count)
+            if needs[0]:
+                grads[0] = grad_x_total
+            if needs[2]:
+                grads[2] = grad_seed
+
+            use_custom_block_backward = (
+                x.is_cuda
+                and _should_use_custom("block_pointwise_backward")
+                and _namespace_has_op("block_pointwise_backward")
+            )
+            w1_base = 16 + group_count
+            b1_base = w1_base + group_count
+            w2_base = b1_base + group_count
+            b2_base = w2_base + group_count
+            for group_index in range(group_count):
+                row_indices = row_index_groups[group_index]
+                if int(row_indices.numel()) == 0:
+                    continue
+                arity = int(ctx.arities[group_index])
+                grad_pooled = grad_relation_pair_x_in.index_select(0, row_indices)
+                grad_rel = grad_pooled.repeat_interleave(arity, dim=0) / float(arity)
+                w1_stack = w1_groups[group_index]
+                b1_stack = b1_groups[group_index]
+                w2_stack = w2_groups[group_index]
+                b2_stack = b2_groups[group_index]
+                if use_custom_block_backward:
+                    grad_x_i, grad_w1, grad_b1, grad_w2, grad_b2 = _ops_namespace().block_pointwise_backward(
+                        grad_rel,
+                        x,
+                        relation_args,
+                        list(ctx.slot_offsets_groups[group_index]),
+                        list(ctx.row_sizes_groups[group_index]),
+                        arity,
+                        w1_stack,
+                        b1_stack,
+                        w2_stack,
+                        b2_stack,
+                        int(ctx.pointwise_codes[group_index]),
+                    )
+                else:
+                    with torch.enable_grad():
+                        x_req = x.detach().requires_grad_(bool(needs[0]))
+                        w1_req = w1_stack.detach().requires_grad_(bool(needs[w1_base + group_index]))
+                        b1_req = b1_stack.detach().requires_grad_(bool(needs[b1_base + group_index] and b1_stack.numel() > 0))
+                        w2_req = w2_stack.detach().requires_grad_(bool(needs[w2_base + group_index]))
+                        b2_req = b2_stack.detach().requires_grad_(bool(needs[b2_base + group_index] and b2_stack.numel() > 0))
+                        rel_cat, _ = _block_pointwise_python(
+                            x_req,
+                            relation_args,
+                            list(ctx.slot_offsets_groups[group_index]),
+                            list(ctx.row_sizes_groups[group_index]),
+                            arity,
+                            w1_req,
+                            b1_req,
+                            w2_req,
+                            b2_req,
+                            int(ctx.pointwise_codes[group_index]),
+                        )
+                        grads_tuple = torch.autograd.grad(
+                            (rel_cat,),
+                            (x_req, w1_req, b1_req, w2_req, b2_req),
+                            grad_outputs=(grad_rel,),
+                            allow_unused=True,
+                        )
+                        grad_x_i, grad_w1, grad_b1, grad_w2, grad_b2 = grads_tuple
+
+                if needs[0] and grad_x_total is not None and grad_x_i is not None:
+                    grad_x_total.add_(grad_x_i)
+                if needs[w1_base + group_index]:
+                    grads[w1_base + group_index] = grad_w1
+                if needs[b1_base + group_index] and b1_stack.numel() > 0:
+                    grads[b1_base + group_index] = grad_b1
+                if needs[w2_base + group_index]:
+                    grads[w2_base + group_index] = grad_w2
+                if needs[b2_base + group_index] and b2_stack.numel() > 0:
+                    grads[b2_base + group_index] = grad_b2
+
+            if needs[0]:
+                grads[0] = grad_x_total
+            return tuple(grads)
+
     class _FusedTwoLayerPointwiseFromIndicesFunction(torch.autograd.Function):
         @staticmethod
         def forward(
@@ -1735,6 +2462,8 @@ if torch is not None:
             for idx, grad in zip(grad_targets, grads):
                 grad_map[idx] = grad
             return tuple(grad_map)
+
+
 
     class _FusedProgramTwoLayerSiLUThenPostNormTwoLayerSiLUFromIndicesFunction(
         torch.autograd.Function
@@ -3000,7 +3729,83 @@ def program_rmsnorm_silu(
     )
 
 
-def lgan_pool_reduce(
+def _lgan_build_pointwise_step(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    seed_relation_pair_x: torch.Tensor,
+    rr_src: torch.Tensor,
+    rr_dst: torch.Tensor,
+    tn_rel: torch.Tensor,
+    tn_ent: torch.Tensor,
+    nn_rel: torch.Tensor,
+    nn_ent: torch.Tensor,
+    *,
+    entity_dim_size: int,
+    mode: str,
+    arities: tuple[int, ...] | list[int],
+    pointwise_codes: tuple[int, ...] | list[int],
+    slot_offsets_groups: tuple[tuple[int, ...], ...] | list[list[int]],
+    row_sizes_groups: tuple[tuple[int, ...], ...] | list[list[int]],
+    row_indices_groups: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    w1_stacks: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    b1_stacks: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    w2_stacks: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    b2_stacks: tuple[torch.Tensor, ...] | list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build exact pointwise relation-instance rows and run the LGAN graph step.
+
+    This is the integrated exact-family LGAN path for grouped two-layer pointwise
+    relation kernels. It accepts a seeded relation-instance table for fallback
+    rows and overwrites the exact-group rows before running RR/TN/NN propagation.
+    """
+    if torch is None:
+        raise ModuleNotFoundError("_lgan_build_pointwise_step requires torch.") from _TORCH_IMPORT_ERROR
+    mode_key = str(mode).strip().lower()
+    if mode_key == "sum":
+        reduce_mode = _MODE_SUM
+    elif mode_key == "mean":
+        reduce_mode = _MODE_MEAN
+    else:
+        raise ValueError("_lgan_build_pointwise_step supports only mode='sum' or mode='mean'.")
+    group_count = len(tuple(arities))
+    if not (
+        len(tuple(pointwise_codes))
+        == len(tuple(slot_offsets_groups))
+        == len(tuple(row_sizes_groups))
+        == len(tuple(row_indices_groups))
+        == len(tuple(w1_stacks))
+        == len(tuple(b1_stacks))
+        == len(tuple(w2_stacks))
+        == len(tuple(b2_stacks))
+        == group_count
+    ):
+        raise ValueError("_lgan_build_pointwise_step expects one metadata/parameter entry per group.")
+    return _LGANPointwiseBuildStepFunction.apply(
+        x,
+        relation_args,
+        seed_relation_pair_x,
+        rr_src,
+        rr_dst,
+        tn_rel,
+        tn_ent,
+        nn_rel,
+        nn_ent,
+        int(entity_dim_size),
+        int(reduce_mode),
+        tuple(int(v) for v in arities),
+        tuple(int(v) for v in pointwise_codes),
+        tuple(tuple(int(x) for x in values) for values in slot_offsets_groups),
+        tuple(tuple(int(x) for x in values) for values in row_sizes_groups),
+        int(group_count),
+        *tuple(row_indices_groups),
+        *tuple(w1_stacks),
+        *tuple(b1_stacks),
+        *tuple(w2_stacks),
+        *tuple(b2_stacks),
+    )
+
+
+def _lgan_pool_reduce(
     slot_messages: torch.Tensor,
     slot_to_relation_instance: torch.Tensor,
     relation_instance_arities: torch.Tensor,
@@ -3016,32 +3821,53 @@ def lgan_pool_reduce(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pool slot messages to relation instances and run RR/TN/NN indexed reductions."""
     if torch is None:
-        raise ModuleNotFoundError("lgan_pool_reduce requires torch.") from _TORCH_IMPORT_ERROR
+        raise ModuleNotFoundError("_lgan_pool_reduce requires torch.") from _TORCH_IMPORT_ERROR
     mode_key = str(mode).strip().lower()
     if mode_key == "sum":
         reduce_mode = _MODE_SUM
     elif mode_key == "mean":
         reduce_mode = _MODE_MEAN
     else:
-        raise ValueError("lgan_pool_reduce supports only mode='sum' or mode='mean'.")
-    if _should_use_custom("lgan_pool_reduce") and _namespace_has_op("lgan_pool_reduce"):
-        return _ops_namespace().lgan_pool_reduce(
-            slot_messages,
-            slot_to_relation_instance,
-            relation_instance_arities,
-            rr_src,
-            rr_dst,
-            tn_rel,
-            tn_ent,
-            nn_rel,
-            nn_ent,
-            int(entity_dim_size),
-            int(reduce_mode),
-        )
-    return _lgan_pool_reduce_python(
+        raise ValueError("_lgan_pool_reduce supports only mode='sum' or mode='mean'.")
+    return _LGANPoolReduceFunction.apply(
         slot_messages,
         slot_to_relation_instance,
         relation_instance_arities,
+        rr_src,
+        rr_dst,
+        tn_rel,
+        tn_ent,
+        nn_rel,
+        nn_ent,
+        int(entity_dim_size),
+        int(reduce_mode),
+    )
+
+
+def _lgan_relation_graph_step(
+    relation_pair_x: torch.Tensor,
+    rr_src: torch.Tensor,
+    rr_dst: torch.Tensor,
+    tn_rel: torch.Tensor,
+    tn_ent: torch.Tensor,
+    nn_rel: torch.Tensor,
+    nn_ent: torch.Tensor,
+    *,
+    entity_dim_size: int,
+    mode: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run RR/TN/NN propagation on pooled relation-instance embeddings."""
+    if torch is None:
+        raise ModuleNotFoundError("_lgan_relation_graph_step requires torch.") from _TORCH_IMPORT_ERROR
+    mode_key = str(mode).strip().lower()
+    if mode_key == "sum":
+        reduce_mode = _MODE_SUM
+    elif mode_key == "mean":
+        reduce_mode = _MODE_MEAN
+    else:
+        raise ValueError("_lgan_relation_graph_step supports only mode='sum' or mode='mean'.")
+    return _LGANRelationGraphStepFunction.apply(
+        relation_pair_x,
         rr_src,
         rr_dst,
         tn_rel,
@@ -3064,7 +3890,6 @@ __all__ = [
     "program_silu_pair",
     "program_silu_postnorm",
     "program_rmsnorm_silu",
-    "lgan_pool_reduce",
     "activation_code",
     "available",
     "assert_runtime_compat",

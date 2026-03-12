@@ -102,9 +102,10 @@ class CentralizedBatchSpec:
 class FlatRelationKernel(ABC):
     """Interface for exact flat-kernel families.
 
-    A kernel object owns both parts of the exact-kernel contract:
+    A kernel object owns:
     1. matching a relation slice to a supported family/spec
-    2. collecting packed messages for a grouped execution batch
+    2. collecting packed slot messages for a grouped execution batch
+    3. optionally collecting pooled relation-instance rows for grouped LGAN use
     """
 
     @abstractmethod
@@ -126,6 +127,39 @@ class FlatRelationKernel(ABC):
         grouped_param_stacks: dict[tuple[Any, ...], Tensor],
         allow_persistent_stacks: bool,
     ) -> tuple[Tensor, Tensor] | None: ...
+
+    def collect_relation_instances(
+        self,
+        layer: "FlatRelationalLayer",
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        grouped_batch: KernelBatchPlan,
+        *,
+        relation_row_starts: dict[int, int],
+        grouped_param_stacks: dict[tuple[Any, ...], Tensor],
+        allow_persistent_stacks: bool,
+    ) -> tuple[Tensor, Tensor] | None:
+        grouped = self.collect(
+            layer,
+            x,
+            relation_args,
+            topology,
+            grouped_batch,
+            grouped_param_stacks=grouped_param_stacks,
+            allow_persistent_stacks=allow_persistent_stacks,
+        )
+        if grouped is None:
+            return None
+        msgs, _ = grouped
+        return layer._pool_grouped_kernel_messages(
+            topology,
+            grouped_batch,
+            relation_row_starts,
+            msgs,
+            device=x.device,
+            index_dtype=relation_args.dtype,
+        )
 
 class MishBlockKernel(FlatRelationKernel):
     def _bind(self, match: KernelMatch | None) -> KernelMatch | None:
@@ -160,6 +194,8 @@ class MishBlockKernel(FlatRelationKernel):
             allow_persistent_stacks=allow_persistent_stacks,
             expected_kernel_types=(MishBlockKernel, SiLUBlockKernel, GELUBlockKernel),
         )
+
+
 
 
 class SiLUBlockKernel(FlatRelationKernel):
@@ -197,6 +233,8 @@ class SiLUBlockKernel(FlatRelationKernel):
         )
 
 
+
+
 class GELUBlockKernel(FlatRelationKernel):
     def _bind(self, match: KernelMatch | None) -> KernelMatch | None:
         if match is None:
@@ -230,6 +268,8 @@ class GELUBlockKernel(FlatRelationKernel):
             allow_persistent_stacks=allow_persistent_stacks,
             expected_kernel_types=(MishBlockKernel, SiLUBlockKernel, GELUBlockKernel),
         )
+
+
 
 
 class PostNormMishLayerNormKernel(FlatRelationKernel):
@@ -2509,6 +2549,474 @@ class FlatRelationalLayer(torch.nn.Module):
                     relation_slice.slot_start : relation_slice.slot_end
                 ] = msgs
         return slot_messages
+
+    def _pool_grouped_kernel_messages(
+        self,
+        topology: FlatTopology,
+        grouped_batch: KernelBatchPlan,
+        relation_row_starts: dict[int, int],
+        messages: Tensor,
+        *,
+        device: torch.device,
+        index_dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        """Pool one grouped exact-kernel batch to relation-instance rows.
+
+        Returns ``(pooled_rows, row_indices)`` where ``pooled_rows`` has one row per
+        grounded relation instance in the grouped batch and ``row_indices`` maps those
+        rows back into the global relation-instance table.
+        """
+        if int(messages.numel()) == 0:
+            return (
+                messages.new_zeros((0, self.embedding_size)),
+                torch.empty((0,), device=device, dtype=index_dtype),
+            )
+        pooled_parts: list[Tensor] = []
+        row_indices_parts: list[Tensor] = []
+        msg_cursor = 0
+        arity = int(grouped_batch.arity)
+        for relation_index, row_count in zip(
+            grouped_batch.relation_indices,
+            grouped_batch.row_sizes,
+            strict=True,
+        ):
+            row_count_i = int(row_count)
+            if row_count_i <= 0:
+                continue
+            width = row_count_i * arity
+            relation_msgs = messages[msg_cursor : msg_cursor + width]
+            pooled_parts.append(
+                relation_msgs.view(row_count_i, arity, self.embedding_size).mean(dim=1)
+            )
+            row_indices_parts.append(
+                torch.arange(
+                    relation_row_starts[int(relation_index)],
+                    relation_row_starts[int(relation_index)] + row_count_i,
+                    device=device,
+                    dtype=index_dtype,
+                )
+            )
+            msg_cursor += width
+        if not pooled_parts:
+            return (
+                messages.new_zeros((0, self.embedding_size)),
+                torch.empty((0,), device=device, dtype=index_dtype),
+            )
+        return torch.cat(pooled_parts, dim=0), torch.cat(row_indices_parts, dim=0)
+
+    def _collect_relation_instance_messages(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        *,
+        cache: dict | None = None,
+    ) -> Tensor | None:
+        """Collect one pooled embedding per grounded relation instance.
+
+        The returned tensor has shape ``[num_relation_instances, embedding_size]`` in
+        the canonical relation-instance order implied by ``topology``. This is the
+        phase boundary needed by flat LGAN and similar relation-graph models.
+        """
+        relation_instance_count = int(sum(int(s.count) for s in topology.relation_slices))
+        if relation_instance_count == 0:
+            return None
+        relation_row_starts: dict[int, int] = {}
+        row_cursor = 0
+        for relation_slice in topology.relation_slices:
+            relation_row_starts[int(relation_slice.relation_index)] = row_cursor
+            row_cursor += int(relation_slice.count)
+
+        centralized_spec = self._centralized_batch_spec()
+        use_any_kernels = self._use_relation_kernels(x) or self._use_program_kernels(x)
+        if centralized_spec is None and not use_any_kernels:
+            arg_emb_all = (
+                x.index_select(0, relation_args)
+                if self._use_relation_gather(x) and int(relation_args.numel()) > 0
+                else None
+            )
+            relation_pair_x = x.new_zeros((relation_instance_count, self.embedding_size))
+            for relation_slice in topology.relation_slices:
+                if relation_slice.count <= 0:
+                    continue
+                direct = self._collect_eager_relation_messages(
+                    x,
+                    relation_args,
+                    relation_slice,
+                    arg_emb_all=arg_emb_all,
+                )
+                if direct is None:
+                    continue
+                msgs, _ = direct
+                pooled = msgs.view(
+                    relation_slice.count,
+                    relation_slice.arity,
+                    self.embedding_size,
+                ).mean(dim=1)
+                row_start = relation_row_starts[int(relation_slice.relation_index)]
+                relation_pair_x[row_start : row_start + relation_slice.count] = pooled
+            return relation_pair_x
+
+        if centralized_spec is None and use_any_kernels:
+            relation_pair_x = x.new_zeros((relation_instance_count, self.embedding_size))
+            layout = self._get_kernel_layout(topology)
+            grouped_param_stacks = (
+                cache.setdefault("kernel_param_stacks", {})
+                if cache is not None
+                else {}
+            )
+            allow_persistent_stacks = (not self.training) and (
+                not torch.is_grad_enabled()
+            )
+            consumed: set[int] = set()
+            fallback_arg_emb_all = (
+                x.index_select(0, relation_args)
+                if layout["fallback_indices"]
+                and self._use_relation_gather(x)
+                and int(relation_args.numel()) > 0
+                else None
+            )
+
+            def _pool_eager_messages(relation_slice: RelationSlice, messages: Tensor) -> None:
+                if relation_slice.count <= 0:
+                    return
+                pooled = messages.view(
+                    relation_slice.count,
+                    relation_slice.arity,
+                    self.embedding_size,
+                ).mean(dim=1)
+                row_start = relation_row_starts[int(relation_slice.relation_index)]
+                relation_pair_x[row_start : row_start + relation_slice.count] = pooled
+
+            for grouped_batch in layout["groups"]:
+                pooled = grouped_batch.kernel.collect_relation_instances(
+                    self,
+                    x,
+                    relation_args,
+                    topology,
+                    grouped_batch,
+                    relation_row_starts=relation_row_starts,
+                    grouped_param_stacks=grouped_param_stacks,
+                    allow_persistent_stacks=allow_persistent_stacks,
+                )
+                if pooled is None:
+                    continue
+                pooled_rows, row_indices = pooled
+                if int(row_indices.numel()) > 0:
+                    relation_pair_x.index_copy_(0, row_indices, pooled_rows)
+                consumed.update(int(idx_i) for idx_i in grouped_batch.relation_indices)
+
+            for relation_index in layout["fallback_indices"]:
+                relation_slice = topology.relation_slices[relation_index]
+                direct = self._collect_eager_relation_messages(
+                    x,
+                    relation_args,
+                    relation_slice,
+                    arg_emb_all=fallback_arg_emb_all,
+                )
+                if direct is None:
+                    continue
+                msgs, _ = direct
+                _pool_eager_messages(relation_slice, msgs)
+                consumed.add(relation_index)
+
+            for relation_slice in topology.relation_slices:
+                if relation_slice.relation_index in consumed:
+                    continue
+                direct = self._collect_eager_relation_messages(
+                    x,
+                    relation_args,
+                    relation_slice,
+                    arg_emb_all=fallback_arg_emb_all,
+                )
+                if direct is None:
+                    continue
+                msgs, _ = direct
+                _pool_eager_messages(relation_slice, msgs)
+            return relation_pair_x
+
+        slot_messages = self.collect_slot_messages(
+            x, relation_args, topology, cache=cache
+        )
+        if slot_messages is None:
+            return None
+        relation_pair_x = x.new_zeros((relation_instance_count, self.embedding_size))
+        for relation_slice in topology.relation_slices:
+            if relation_slice.count <= 0:
+                continue
+            rel_slots = slot_messages[
+                relation_slice.slot_start : relation_slice.slot_end
+            ].view(relation_slice.count, relation_slice.arity, self.embedding_size)
+            row_start = relation_row_starts[int(relation_slice.relation_index)]
+            relation_pair_x[row_start : row_start + relation_slice.count] = rel_slots.mean(dim=1)
+        return relation_pair_x
+
+    def _run_lgan_pointwise_step(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        *,
+        rr_src: Tensor,
+        rr_dst: Tensor,
+        tn_rel: Tensor,
+        tn_ent: Tensor,
+        nn_rel: Tensor,
+        nn_ent: Tensor,
+        entity_dim_size: int,
+        mode: str,
+        cache: dict | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor] | None:
+        """Run the integrated exact pointwise LGAN path when supported.
+
+        This path currently targets grouped exact two-layer pointwise block kernels.
+        Unsupported grouped kernels and all fallback relations are materialized
+        eagerly into the seeded relation-instance table before the integrated LGAN
+        graph propagation step runs.
+        """
+        if not self._use_relation_kernels(x):
+            return None
+        relation_instance_count = int(sum(int(s.count) for s in topology.relation_slices))
+        if relation_instance_count == 0:
+            return x.new_zeros((0, self.embedding_size)), x.new_zeros((int(entity_dim_size), self.embedding_size)), x.new_zeros((int(entity_dim_size), self.embedding_size))
+
+        relation_row_starts: dict[int, int] = {}
+        row_cursor = 0
+        for relation_slice in topology.relation_slices:
+            relation_row_starts[int(relation_slice.relation_index)] = row_cursor
+            row_cursor += int(relation_slice.count)
+
+        relation_pair_seed = x.new_zeros((relation_instance_count, self.embedding_size))
+        layout = self._get_kernel_layout(topology)
+        grouped_param_stacks = (
+            cache.setdefault("kernel_param_stacks", {})
+            if cache is not None
+            else {}
+        )
+        allow_persistent_stacks = (not self.training) and (not torch.is_grad_enabled())
+        fallback_arg_emb_all = (
+            x.index_select(0, relation_args)
+            if (layout["fallback_indices"] or layout["groups"])
+            and self._use_relation_gather(x)
+            and int(relation_args.numel()) > 0
+            else None
+        )
+
+        pointwise_groups: list[KernelBatchPlan] = []
+        pointwise_codes: list[int] = []
+        pointwise_row_indices: list[Tensor] = []
+        w1_stacks: list[Tensor] = []
+        b1_stacks: list[Tensor] = []
+        w2_stacks: list[Tensor] = []
+        b2_stacks: list[Tensor] = []
+        slot_offsets_groups: list[list[int]] = []
+        row_sizes_groups: list[list[int]] = []
+        consumed: set[int] = set()
+
+        def _pool_eager_messages(relation_slice: RelationSlice, messages: Tensor) -> None:
+            if relation_slice.count <= 0:
+                return
+            pooled = messages.view(
+                relation_slice.count,
+                relation_slice.arity,
+                self.embedding_size,
+            ).mean(dim=1)
+            row_start = relation_row_starts[int(relation_slice.relation_index)]
+            relation_pair_seed[row_start : row_start + relation_slice.count] = pooled
+
+        exact_kernel_types = (MishBlockKernel, SiLUBlockKernel, GELUBlockKernel)
+        for grouped_batch in layout["groups"]:
+            if not isinstance(grouped_batch.kernel, exact_kernel_types):
+                for relation_index in grouped_batch.relation_indices:
+                    relation_slice = topology.relation_slices[relation_index]
+                    direct = self._collect_eager_relation_messages(
+                        x,
+                        relation_args,
+                        relation_slice,
+                        arg_emb_all=fallback_arg_emb_all,
+                    )
+                    if direct is None:
+                        continue
+                    msgs, _ = direct
+                    _pool_eager_messages(relation_slice, msgs)
+                    consumed.add(relation_index)
+                continue
+
+            batch_items: list[tuple[RelationSlice, KernelMatch]] = []
+            valid_group = True
+            for relation_index in grouped_batch.relation_indices:
+                relation_slice = topology.relation_slices[relation_index]
+                match = self._match_kernel(relation_slice)
+                if match is None or not isinstance(match.kernel, exact_kernel_types):
+                    valid_group = False
+                    break
+                batch_items.append((relation_slice, match))
+            if not valid_group or not batch_items:
+                for relation_index in grouped_batch.relation_indices:
+                    relation_slice = topology.relation_slices[relation_index]
+                    direct = self._collect_eager_relation_messages(
+                        x,
+                        relation_args,
+                        relation_slice,
+                        arg_emb_all=fallback_arg_emb_all,
+                    )
+                    if direct is None:
+                        continue
+                    msgs, _ = direct
+                    _pool_eager_messages(relation_slice, msgs)
+                    consumed.add(relation_index)
+                continue
+
+            pointwise_signature = batch_items[0][1].spec.pointwise_signature
+            pointwise_code = relm_mp_ops.activation_code(pointwise_signature)
+            if pointwise_code is None or any(
+                item[1].spec.pointwise_signature != pointwise_signature
+                for item in batch_items[1:]
+            ):
+                for relation_slice, _ in batch_items:
+                    direct = self._collect_eager_relation_messages(
+                        x,
+                        relation_args,
+                        relation_slice,
+                        arg_emb_all=fallback_arg_emb_all,
+                    )
+                    if direct is None:
+                        continue
+                    msgs, _ = direct
+                    _pool_eager_messages(relation_slice, msgs)
+                    consumed.add(relation_slice.relation_index)
+                continue
+
+            group_key = (
+                "lgan_pointwise_step",
+                type(grouped_batch.kernel),
+                grouped_batch.arity,
+                grouped_batch.signature,
+            )
+            w1_stacks.append(
+                self._get_grouped_param_stack(
+                    cache_key=("w1", group_key),
+                    tensors=[item[1].linears[0].weight for item in batch_items],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+            )
+            w2_stacks.append(
+                self._get_grouped_param_stack(
+                    cache_key=("w2", group_key),
+                    tensors=[item[1].linears[1].weight for item in batch_items],
+                    forward_cache=grouped_param_stacks,
+                    allow_persistent=allow_persistent_stacks,
+                )
+            )
+            lin0_has_bias = batch_items[0][1].linears[0].bias is not None
+            lin1_has_bias = batch_items[0][1].linears[1].bias is not None
+            if lin0_has_bias:
+                b1_stacks.append(
+                    self._get_grouped_param_stack(
+                        cache_key=("b1", group_key),
+                        tensors=[
+                            item[1].linears[0].bias
+                            for item in batch_items
+                            if item[1].linears[0].bias is not None
+                        ],
+                        forward_cache=grouped_param_stacks,
+                        allow_persistent=allow_persistent_stacks,
+                    )
+                )
+            else:
+                b1_stacks.append(w1_stacks[-1].new_empty((0,)))
+            if lin1_has_bias:
+                b2_stacks.append(
+                    self._get_grouped_param_stack(
+                        cache_key=("b2", group_key),
+                        tensors=[
+                            item[1].linears[1].bias
+                            for item in batch_items
+                            if item[1].linears[1].bias is not None
+                        ],
+                        forward_cache=grouped_param_stacks,
+                        allow_persistent=allow_persistent_stacks,
+                    )
+                )
+            else:
+                b2_stacks.append(w2_stacks[-1].new_empty((0,)))
+
+            pointwise_groups.append(grouped_batch)
+            pointwise_codes.append(int(pointwise_code))
+            slot_offsets_groups.append([int(item[0].slot_start) for item in batch_items])
+            row_sizes_groups.append([int(item[0].count) for item in batch_items])
+            row_indices_parts: list[Tensor] = []
+            for relation_slice, _ in batch_items:
+                row_start = relation_row_starts[int(relation_slice.relation_index)]
+                row_indices_parts.append(
+                    torch.arange(
+                        row_start,
+                        row_start + int(relation_slice.count),
+                        device=x.device,
+                        dtype=relation_args.dtype,
+                    )
+                )
+            pointwise_row_indices.append(
+                row_indices_parts[0]
+                if len(row_indices_parts) == 1
+                else torch.cat(row_indices_parts, dim=0)
+            )
+            consumed.update(int(idx_i) for idx_i in grouped_batch.relation_indices)
+
+        for relation_index in layout["fallback_indices"]:
+            relation_slice = topology.relation_slices[relation_index]
+            direct = self._collect_eager_relation_messages(
+                x,
+                relation_args,
+                relation_slice,
+                arg_emb_all=fallback_arg_emb_all,
+            )
+            if direct is None:
+                continue
+            msgs, _ = direct
+            _pool_eager_messages(relation_slice, msgs)
+            consumed.add(relation_index)
+
+        for relation_slice in topology.relation_slices:
+            if relation_slice.relation_index in consumed:
+                continue
+            direct = self._collect_eager_relation_messages(
+                x,
+                relation_args,
+                relation_slice,
+                arg_emb_all=fallback_arg_emb_all,
+            )
+            if direct is None:
+                continue
+            msgs, _ = direct
+            _pool_eager_messages(relation_slice, msgs)
+
+        if not pointwise_groups:
+            return None
+
+        return relm_mp_ops._lgan_build_pointwise_step(
+            x,
+            relation_args,
+            relation_pair_seed,
+            rr_src,
+            rr_dst,
+            tn_rel,
+            tn_ent,
+            nn_rel,
+            nn_ent,
+            entity_dim_size=int(entity_dim_size),
+            mode=str(mode),
+            arities=tuple(int(group.arity) for group in pointwise_groups),
+            pointwise_codes=tuple(pointwise_codes),
+            slot_offsets_groups=tuple(tuple(values) for values in slot_offsets_groups),
+            row_sizes_groups=tuple(tuple(values) for values in row_sizes_groups),
+            row_indices_groups=tuple(pointwise_row_indices),
+            w1_stacks=tuple(w1_stacks),
+            b1_stacks=tuple(b1_stacks),
+            w2_stacks=tuple(w2_stacks),
+            b2_stacks=tuple(b2_stacks),
+        )
 
     def get_topology(
         self,

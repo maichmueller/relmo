@@ -19,6 +19,8 @@ using at::Tensor;
 namespace {
 
 constexpr int64_t kThreads = 256;
+constexpr int64_t kModeSum = 0;
+constexpr int64_t kModeMean = 2;
 
 at::ScalarType dtype_of(const Tensor& t)
 {
@@ -892,6 +894,381 @@ void dispatch_float_or_double(
 }
 
 template < typename scalar_t, typename index_t >
+__global__ void lgan_pool_relation_instances_cuda_kernel(
+   const scalar_t* slot_messages_ptr,
+   const index_t* slot_to_relation_instance_ptr,
+   int64_t num_slots,
+   int64_t emb,
+   scalar_t* relation_pair_x_ptr
+)
+{
+   const int64_t linear = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   const int64_t total = num_slots * emb;
+   if(linear >= total) {
+      return;
+   }
+   const int64_t slot = linear / emb;
+   const int64_t dim = linear - slot * emb;
+   const int64_t rel = static_cast< int64_t >(slot_to_relation_instance_ptr[slot]);
+   atomic_add_compat(
+      relation_pair_x_ptr + rel * emb + dim,
+      slot_messages_ptr[slot * emb + dim]
+   );
+}
+
+template < typename scalar_t >
+__global__ void lgan_divide_rows_cuda_kernel(
+   scalar_t* values_ptr,
+   const int64_t* counts_ptr,
+   int64_t rows,
+   int64_t emb
+)
+{
+   const int64_t linear = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   const int64_t total = rows * emb;
+   if(linear >= total) {
+      return;
+   }
+   const int64_t row = linear / emb;
+   const int64_t raw = counts_ptr[row];
+   const scalar_t denom = static_cast< scalar_t >(raw > 1 ? raw : 1);
+   values_ptr[linear] /= denom;
+}
+
+template < typename scalar_t, typename index_t >
+__global__ void lgan_indexed_reduce_sum_cuda_kernel(
+   const scalar_t* source_embeddings_ptr,
+   const index_t* source_index_ptr,
+   const index_t* target_index_ptr,
+   int64_t num_edges,
+   int64_t emb,
+   scalar_t* out_ptr
+)
+{
+   const int64_t linear = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   const int64_t total = num_edges * emb;
+   if(linear >= total) {
+      return;
+   }
+   const int64_t edge = linear / emb;
+   const int64_t dim = linear - edge * emb;
+   const int64_t src = static_cast< int64_t >(source_index_ptr[edge]);
+   const int64_t dst = static_cast< int64_t >(target_index_ptr[edge]);
+   atomic_add_compat(
+      out_ptr + dst * emb + dim,
+      source_embeddings_ptr[src * emb + dim]
+   );
+}
+
+template < typename scalar_t, typename index_t >
+__global__ void lgan_indexed_reduce_backward_cuda_kernel(
+   const scalar_t* grad_target_ptr,
+   const index_t* source_index_ptr,
+   const index_t* target_index_ptr,
+   const float* target_counts_ptr,
+   bool divide_mean,
+   int64_t num_edges,
+   int64_t emb,
+   scalar_t* grad_source_ptr
+)
+{
+   const int64_t linear = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   const int64_t total = num_edges * emb;
+   if(linear >= total) {
+      return;
+   }
+   const int64_t edge = linear / emb;
+   const int64_t dim = linear - edge * emb;
+   const int64_t src = static_cast< int64_t >(source_index_ptr[edge]);
+   const int64_t dst = static_cast< int64_t >(target_index_ptr[edge]);
+   scalar_t value = grad_target_ptr[dst * emb + dim];
+   if(divide_mean) {
+      const scalar_t raw = static_cast< scalar_t >(target_counts_ptr[dst]);
+      const scalar_t denom =
+         raw > static_cast< scalar_t >(1) ? raw : static_cast< scalar_t >(1);
+      value /= denom;
+   }
+   atomic_add_compat(grad_source_ptr + src * emb + dim, value);
+}
+
+template < typename index_t >
+__global__ void lgan_indexed_reduce_count_cuda_kernel(
+   const index_t* target_index_ptr,
+   int64_t num_edges,
+   float* counts_ptr
+)
+{
+   const int64_t edge = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   if(edge >= num_edges) {
+      return;
+   }
+   const int64_t dst = static_cast< int64_t >(target_index_ptr[edge]);
+   atomicAdd(counts_ptr + dst, 1.0f);
+}
+
+template < typename scalar_t >
+__global__ void lgan_divide_rows_float_count_cuda_kernel(
+   scalar_t* values_ptr,
+   const float* counts_ptr,
+   int64_t rows,
+   int64_t emb
+)
+{
+   const int64_t linear = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   const int64_t total = rows * emb;
+   if(linear >= total) {
+      return;
+   }
+   const int64_t row = linear / emb;
+   const scalar_t raw = static_cast< scalar_t >(counts_ptr[row]);
+   const scalar_t denom = raw > static_cast< scalar_t >(1) ? raw : static_cast< scalar_t >(1);
+   values_ptr[linear] /= denom;
+}
+
+template < typename scalar_t >
+__global__ void lgan_add_inplace_cuda_kernel(
+   scalar_t* dst_ptr,
+   const scalar_t* src_ptr,
+   int64_t total
+)
+{
+   const int64_t linear = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   if(linear >= total) {
+      return;
+   }
+   dst_ptr[linear] += src_ptr[linear];
+}
+
+template < typename scalar_t, typename index_t >
+__global__ void lgan_pool_backward_cuda_kernel(
+   const scalar_t* grad_relation_ptr,
+   const index_t* slot_to_relation_instance_ptr,
+   const int64_t* relation_instance_arities_ptr,
+   int64_t num_slots,
+   int64_t emb,
+   scalar_t* grad_slot_ptr
+)
+{
+   const int64_t linear = static_cast< int64_t >(blockIdx.x) * blockDim.x + threadIdx.x;
+   const int64_t total = num_slots * emb;
+   if(linear >= total) {
+      return;
+   }
+   const int64_t slot = linear / emb;
+   const int64_t dim = linear - slot * emb;
+   const int64_t rel = static_cast< int64_t >(slot_to_relation_instance_ptr[slot]);
+   const int64_t raw = relation_instance_arities_ptr[rel];
+   const scalar_t denom = static_cast< scalar_t >(raw > 1 ? raw : 1);
+   grad_slot_ptr[linear] = grad_relation_ptr[rel * emb + dim] / denom;
+}
+
+template < typename scalar_t, typename index_t >
+void launch_lgan_pool_relation_instances(
+   const Tensor& slot_messages,
+   const Tensor& slot_to_relation_instance,
+   Tensor& relation_pair_x,
+   cudaStream_t stream
+)
+{
+   const int64_t num_slots = slot_messages.size(0);
+   const int64_t emb = slot_messages.size(1);
+   const int64_t total = num_slots * emb;
+   if(total <= 0) {
+      return;
+   }
+   const int blocks = grid_for(total);
+   lgan_pool_relation_instances_cuda_kernel< scalar_t, index_t >
+      <<<blocks, static_cast< int >(kThreads), 0, stream>>>(
+         slot_messages.data_ptr< scalar_t >(),
+         slot_to_relation_instance.data_ptr< index_t >(),
+         num_slots,
+         emb,
+         relation_pair_x.data_ptr< scalar_t >()
+      );
+   check_kernel_launch("lgan_pool_relation_instances_cuda_kernel");
+}
+
+template < typename scalar_t >
+void launch_lgan_divide_rows(
+   Tensor& values,
+   const Tensor& counts,
+   cudaStream_t stream
+)
+{
+   const int64_t rows = values.size(0);
+   const int64_t emb = values.size(1);
+   const int64_t total = rows * emb;
+   if(total <= 0) {
+      return;
+   }
+   const int blocks = grid_for(total);
+   lgan_divide_rows_cuda_kernel< scalar_t >
+      <<<blocks, static_cast< int >(kThreads), 0, stream>>>(
+         values.data_ptr< scalar_t >(),
+         counts.data_ptr< int64_t >(),
+         rows,
+         emb
+      );
+   check_kernel_launch("lgan_divide_rows_cuda_kernel");
+}
+
+template < typename scalar_t, typename index_t >
+void launch_lgan_indexed_reduce_sum(
+   const Tensor& source_embeddings,
+   const Tensor& source_index,
+   const Tensor& target_index,
+   Tensor& out,
+   cudaStream_t stream
+)
+{
+   const int64_t num_edges = source_index.size(0);
+   const int64_t emb = source_embeddings.size(1);
+   const int64_t total = num_edges * emb;
+   if(total <= 0) {
+      return;
+   }
+   const int blocks = grid_for(total);
+   lgan_indexed_reduce_sum_cuda_kernel< scalar_t, index_t >
+      <<<blocks, static_cast< int >(kThreads), 0, stream>>>(
+         source_embeddings.data_ptr< scalar_t >(),
+         source_index.data_ptr< index_t >(),
+         target_index.data_ptr< index_t >(),
+         num_edges,
+         emb,
+         out.data_ptr< scalar_t >()
+      );
+   check_kernel_launch("lgan_indexed_reduce_sum_cuda_kernel");
+}
+
+template < typename scalar_t, typename index_t >
+void launch_lgan_divide_mean_counts(
+   Tensor& values,
+   const Tensor& target_index,
+   cudaStream_t stream
+)
+{
+   const int64_t rows = values.size(0);
+   const int64_t num_edges = target_index.size(0);
+   const int64_t emb = values.size(1);
+   if(rows <= 0 || num_edges <= 0 || emb <= 0) {
+      return;
+   }
+   Tensor counts = at::zeros({rows}, values.options().dtype(at::kFloat));
+   const int edge_blocks = grid_for(num_edges);
+   lgan_indexed_reduce_count_cuda_kernel< index_t >
+      <<<edge_blocks, static_cast< int >(kThreads), 0, stream>>>(
+         target_index.data_ptr< index_t >(),
+         num_edges,
+         counts.data_ptr< float >()
+      );
+   check_kernel_launch("lgan_indexed_reduce_count_cuda_kernel");
+   const int64_t total = rows * emb;
+   const int blocks = grid_for(total);
+   lgan_divide_rows_float_count_cuda_kernel< scalar_t >
+      <<<blocks, static_cast< int >(kThreads), 0, stream>>>(
+         values.data_ptr< scalar_t >(),
+         counts.data_ptr< float >(),
+         rows,
+         emb
+   );
+   check_kernel_launch("lgan_divide_rows_float_count_cuda_kernel");
+}
+
+template < typename scalar_t, typename index_t >
+void launch_lgan_indexed_reduce_backward(
+   const Tensor& grad_target,
+   const Tensor& source_index,
+   const Tensor& target_index,
+   bool divide_mean,
+   Tensor& grad_source,
+   cudaStream_t stream
+)
+{
+   const int64_t num_edges = source_index.size(0);
+   const int64_t emb = grad_target.size(1);
+   const int64_t total = num_edges * emb;
+   if(total <= 0) {
+      return;
+   }
+   Tensor counts;
+   const float* counts_ptr = nullptr;
+   if(divide_mean) {
+      counts = at::zeros({grad_target.size(0)}, grad_target.options().dtype(at::kFloat));
+      const int edge_blocks = grid_for(num_edges);
+      lgan_indexed_reduce_count_cuda_kernel< index_t >
+         <<<edge_blocks, static_cast< int >(kThreads), 0, stream>>>(
+            target_index.data_ptr< index_t >(),
+            num_edges,
+            counts.data_ptr< float >()
+         );
+      check_kernel_launch("lgan_indexed_reduce_count_cuda_kernel");
+      counts_ptr = counts.data_ptr< float >();
+   }
+   const int blocks = grid_for(total);
+   lgan_indexed_reduce_backward_cuda_kernel< scalar_t, index_t >
+      <<<blocks, static_cast< int >(kThreads), 0, stream>>>(
+         grad_target.data_ptr< scalar_t >(),
+         source_index.data_ptr< index_t >(),
+         target_index.data_ptr< index_t >(),
+         counts_ptr,
+         divide_mean,
+         num_edges,
+         emb,
+         grad_source.data_ptr< scalar_t >()
+      );
+   check_kernel_launch("lgan_indexed_reduce_backward_cuda_kernel");
+}
+
+template < typename scalar_t >
+void launch_lgan_add_inplace(
+   Tensor& dst,
+   const Tensor& src,
+   cudaStream_t stream
+)
+{
+   const int64_t total = dst.numel();
+   if(total <= 0) {
+      return;
+   }
+   const int blocks = grid_for(total);
+   lgan_add_inplace_cuda_kernel< scalar_t >
+      <<<blocks, static_cast< int >(kThreads), 0, stream>>>(
+         dst.data_ptr< scalar_t >(),
+         src.data_ptr< scalar_t >(),
+         total
+   );
+   check_kernel_launch("lgan_add_inplace_cuda_kernel");
+}
+
+template < typename scalar_t, typename index_t >
+void launch_lgan_pool_backward(
+   const Tensor& grad_relation,
+   const Tensor& slot_to_relation_instance,
+   const Tensor& relation_instance_arities,
+   Tensor& grad_slot,
+   cudaStream_t stream
+)
+{
+   const int64_t num_slots = slot_to_relation_instance.size(0);
+   const int64_t emb = grad_relation.size(1);
+   const int64_t total = num_slots * emb;
+   if(total <= 0) {
+      return;
+   }
+   const int blocks = grid_for(total);
+   lgan_pool_backward_cuda_kernel< scalar_t, index_t >
+      <<<blocks, static_cast< int >(kThreads), 0, stream>>>(
+         grad_relation.data_ptr< scalar_t >(),
+         slot_to_relation_instance.data_ptr< index_t >(),
+         relation_instance_arities.data_ptr< int64_t >(),
+         num_slots,
+         emb,
+         grad_slot.data_ptr< scalar_t >()
+      );
+   check_kernel_launch("lgan_pool_backward_cuda_kernel");
+}
+
+template < typename scalar_t, typename index_t >
 __global__ void block_pointwise_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -1122,7 +1499,7 @@ void launch_block_pointwise(
          pointwise_code,
          rel_cat.data_ptr< scalar_t >(),
          node_idx.data_ptr< int64_t >()
-      );
+   );
    check_kernel_launch("block_pointwise_cuda_kernel");
 }
 
@@ -2924,6 +3301,465 @@ Tensor fanin_reduce_logsumexp_backward_cuda(
       "fanin_reduce_logsumexp_backward_cuda"
    );
    return grad_rel;
+}
+
+std::tuple< Tensor, Tensor, Tensor > lgan_pool_reduce_cuda(
+   const Tensor& slot_messages,
+   const Tensor& slot_to_relation_instance,
+   const Tensor& relation_instance_arities,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t entity_dim_size,
+   int64_t mode
+)
+{
+   c10::cuda::CUDAGuard device_guard(slot_messages.device());
+   check_same_cuda_device(slot_messages, slot_to_relation_instance, "slot_messages", "slot_to_relation_instance");
+   check_same_cuda_device(slot_messages, relation_instance_arities, "slot_messages", "relation_instance_arities");
+   check_same_cuda_device(slot_messages, rr_src, "slot_messages", "rr_src");
+   check_same_cuda_device(slot_messages, rr_dst, "slot_messages", "rr_dst");
+   check_same_cuda_device(slot_messages, tn_rel, "slot_messages", "tn_rel");
+   check_same_cuda_device(slot_messages, tn_ent, "slot_messages", "tn_ent");
+   check_same_cuda_device(slot_messages, nn_rel, "slot_messages", "nn_rel");
+   check_same_cuda_device(slot_messages, nn_ent, "slot_messages", "nn_ent");
+
+   TORCH_CHECK(
+      mode == kModeSum || mode == kModeMean,
+      "lgan_pool_reduce_cuda supports only sum and mean modes."
+   );
+
+   const int64_t relation_count = relation_instance_arities.size(0);
+   Tensor relation_pair_x =
+      at::zeros({relation_count, slot_messages.size(1)}, slot_messages.options());
+   Tensor tn_msgs =
+      at::zeros({entity_dim_size, slot_messages.size(1)}, slot_messages.options());
+   Tensor nn_msgs =
+      at::zeros({entity_dim_size, slot_messages.size(1)}, slot_messages.options());
+
+   if(slot_messages.numel() == 0 || relation_count == 0) {
+      return std::make_tuple(relation_pair_x, tn_msgs, nn_msgs);
+   }
+
+   const bool use_int32_indices =
+      dtype_of(slot_to_relation_instance) == at::kInt && dtype_of(rr_src) == at::kInt
+      && dtype_of(rr_dst) == at::kInt && dtype_of(tn_rel) == at::kInt
+      && dtype_of(tn_ent) == at::kInt && dtype_of(nn_rel) == at::kInt
+      && dtype_of(nn_ent) == at::kInt;
+
+   Tensor slot_messages_work = ensure_contiguous(slot_messages);
+   Tensor slot_to_relation_instance_work = ensure_contiguous(
+      use_int32_indices ? slot_to_relation_instance : slot_to_relation_instance.to(at::kLong)
+   );
+   Tensor relation_instance_arities_work = ensure_contiguous(relation_instance_arities);
+   Tensor rr_src_work = ensure_contiguous(use_int32_indices ? rr_src : rr_src.to(at::kLong));
+   Tensor rr_dst_work = ensure_contiguous(use_int32_indices ? rr_dst : rr_dst.to(at::kLong));
+   Tensor tn_rel_work = ensure_contiguous(use_int32_indices ? tn_rel : tn_rel.to(at::kLong));
+   Tensor tn_ent_work = ensure_contiguous(use_int32_indices ? tn_ent : tn_ent.to(at::kLong));
+   Tensor nn_rel_work = ensure_contiguous(use_int32_indices ? nn_rel : nn_rel.to(at::kLong));
+   Tensor nn_ent_work = ensure_contiguous(use_int32_indices ? nn_ent : nn_ent.to(at::kLong));
+   cudaStream_t stream = current_cuda_stream(slot_messages_work);
+
+   auto run_index_type = [&](auto dummy_index) {
+      using index_t = decltype(dummy_index);
+      dispatch_float_or_double(
+         slot_messages_work,
+         [&]() {
+            launch_lgan_pool_relation_instances< float, index_t >(
+               slot_messages_work,
+               slot_to_relation_instance_work,
+               relation_pair_x,
+               stream
+            );
+            launch_lgan_divide_rows< float >(relation_pair_x, relation_instance_arities_work, stream);
+            Tensor rr_msgs = at::zeros_like(relation_pair_x);
+            launch_lgan_indexed_reduce_sum< float, index_t >(
+               relation_pair_x,
+               rr_src_work,
+               rr_dst_work,
+               rr_msgs,
+               stream
+            );
+            if(mode == kModeMean) {
+               launch_lgan_divide_mean_counts< float, index_t >(rr_msgs, rr_dst_work, stream);
+            }
+            launch_lgan_add_inplace< float >(relation_pair_x, rr_msgs, stream);
+            launch_lgan_indexed_reduce_sum< float, index_t >(
+               relation_pair_x,
+               tn_rel_work,
+               tn_ent_work,
+               tn_msgs,
+               stream
+            );
+            if(mode == kModeMean) {
+               launch_lgan_divide_mean_counts< float, index_t >(tn_msgs, tn_ent_work, stream);
+            }
+            launch_lgan_indexed_reduce_sum< float, index_t >(
+               relation_pair_x,
+               nn_rel_work,
+               nn_ent_work,
+               nn_msgs,
+               stream
+            );
+            if(mode == kModeMean) {
+               launch_lgan_divide_mean_counts< float, index_t >(nn_msgs, nn_ent_work, stream);
+            }
+         },
+         [&]() {
+            launch_lgan_pool_relation_instances< double, index_t >(
+               slot_messages_work,
+               slot_to_relation_instance_work,
+               relation_pair_x,
+               stream
+            );
+            launch_lgan_divide_rows< double >(relation_pair_x, relation_instance_arities_work, stream);
+            Tensor rr_msgs = at::zeros_like(relation_pair_x);
+            launch_lgan_indexed_reduce_sum< double, index_t >(
+               relation_pair_x,
+               rr_src_work,
+               rr_dst_work,
+               rr_msgs,
+               stream
+            );
+            if(mode == kModeMean) {
+               launch_lgan_divide_mean_counts< double, index_t >(rr_msgs, rr_dst_work, stream);
+            }
+            launch_lgan_add_inplace< double >(relation_pair_x, rr_msgs, stream);
+            launch_lgan_indexed_reduce_sum< double, index_t >(
+               relation_pair_x,
+               tn_rel_work,
+               tn_ent_work,
+               tn_msgs,
+               stream
+            );
+            if(mode == kModeMean) {
+               launch_lgan_divide_mean_counts< double, index_t >(tn_msgs, tn_ent_work, stream);
+            }
+            launch_lgan_indexed_reduce_sum< double, index_t >(
+               relation_pair_x,
+               nn_rel_work,
+               nn_ent_work,
+               nn_msgs,
+               stream
+            );
+            if(mode == kModeMean) {
+               launch_lgan_divide_mean_counts< double, index_t >(nn_msgs, nn_ent_work, stream);
+            }
+         },
+         "lgan_pool_reduce_cuda"
+      );
+   };
+
+   if(use_int32_indices) {
+      run_index_type(int{});
+   } else {
+      run_index_type(int64_t{});
+   }
+   return std::make_tuple(relation_pair_x, tn_msgs, nn_msgs);
+}
+
+Tensor lgan_pool_reduce_backward_cuda(
+   const Tensor& grad_relation_pair_x,
+   const Tensor& grad_tn_msgs,
+   const Tensor& grad_nn_msgs,
+   const Tensor& slot_to_relation_instance,
+   const Tensor& relation_instance_arities,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t relation_count,
+   int64_t mode
+)
+{
+   c10::cuda::CUDAGuard device_guard(grad_relation_pair_x.device());
+   check_same_cuda_device(grad_relation_pair_x, grad_tn_msgs, "grad_relation_pair_x", "grad_tn_msgs");
+   check_same_cuda_device(grad_relation_pair_x, grad_nn_msgs, "grad_relation_pair_x", "grad_nn_msgs");
+   check_same_cuda_device(grad_relation_pair_x, slot_to_relation_instance, "grad_relation_pair_x", "slot_to_relation_instance");
+   check_same_cuda_device(grad_relation_pair_x, relation_instance_arities, "grad_relation_pair_x", "relation_instance_arities");
+   check_same_cuda_device(grad_relation_pair_x, rr_src, "grad_relation_pair_x", "rr_src");
+   check_same_cuda_device(grad_relation_pair_x, rr_dst, "grad_relation_pair_x", "rr_dst");
+   check_same_cuda_device(grad_relation_pair_x, tn_rel, "grad_relation_pair_x", "tn_rel");
+   check_same_cuda_device(grad_relation_pair_x, tn_ent, "grad_relation_pair_x", "tn_ent");
+   check_same_cuda_device(grad_relation_pair_x, nn_rel, "grad_relation_pair_x", "nn_rel");
+   check_same_cuda_device(grad_relation_pair_x, nn_ent, "grad_relation_pair_x", "nn_ent");
+
+   TORCH_CHECK(
+      mode == kModeSum || mode == kModeMean,
+      "lgan_pool_reduce_backward_cuda supports only sum and mean modes."
+   );
+   const bool use_int32_indices =
+      dtype_of(slot_to_relation_instance) == at::kInt && dtype_of(rr_src) == at::kInt
+      && dtype_of(rr_dst) == at::kInt && dtype_of(tn_rel) == at::kInt
+      && dtype_of(tn_ent) == at::kInt && dtype_of(nn_rel) == at::kInt
+      && dtype_of(nn_ent) == at::kInt;
+
+   Tensor grad_relation_pair_x_work = ensure_contiguous(grad_relation_pair_x);
+   Tensor grad_tn_msgs_work = ensure_contiguous(grad_tn_msgs);
+   Tensor grad_nn_msgs_work = ensure_contiguous(grad_nn_msgs);
+   Tensor slot_to_relation_instance_work = ensure_contiguous(
+      use_int32_indices ? slot_to_relation_instance : slot_to_relation_instance.to(at::kLong)
+   );
+   Tensor relation_instance_arities_work = ensure_contiguous(relation_instance_arities);
+   Tensor rr_src_work = ensure_contiguous(use_int32_indices ? rr_src : rr_src.to(at::kLong));
+   Tensor rr_dst_work = ensure_contiguous(use_int32_indices ? rr_dst : rr_dst.to(at::kLong));
+   Tensor tn_rel_work = ensure_contiguous(use_int32_indices ? tn_rel : tn_rel.to(at::kLong));
+   Tensor tn_ent_work = ensure_contiguous(use_int32_indices ? tn_ent : tn_ent.to(at::kLong));
+   Tensor nn_rel_work = ensure_contiguous(use_int32_indices ? nn_rel : nn_rel.to(at::kLong));
+   Tensor nn_ent_work = ensure_contiguous(use_int32_indices ? nn_ent : nn_ent.to(at::kLong));
+
+   Tensor grad_relation_pre =
+      at::zeros({relation_count, grad_relation_pair_x.size(1)}, grad_relation_pair_x.options());
+   Tensor grad_slot =
+      at::zeros({slot_to_relation_instance.size(0), grad_relation_pair_x.size(1)}, grad_relation_pair_x.options());
+   cudaStream_t stream = current_cuda_stream(grad_relation_pair_x_work);
+   const bool mean_mode = mode == kModeMean;
+
+   auto run_index_type = [&](auto dummy_index) {
+      using index_t = decltype(dummy_index);
+      dispatch_float_or_double(
+         grad_relation_pair_x_work,
+         [&]() {
+            launch_lgan_add_inplace< float >(grad_relation_pre, grad_relation_pair_x_work, stream);
+            launch_lgan_indexed_reduce_backward< float, index_t >(
+               grad_tn_msgs_work,
+               tn_rel_work,
+               tn_ent_work,
+               mean_mode,
+               grad_relation_pre,
+               stream
+            );
+            launch_lgan_indexed_reduce_backward< float, index_t >(
+               grad_nn_msgs_work,
+               nn_rel_work,
+               nn_ent_work,
+               mean_mode,
+               grad_relation_pre,
+               stream
+            );
+            Tensor grad_relation_final = grad_relation_pre.clone();
+            launch_lgan_indexed_reduce_backward< float, index_t >(
+               grad_relation_final,
+               rr_src_work,
+               rr_dst_work,
+               mean_mode,
+               grad_relation_pre,
+               stream
+            );
+            launch_lgan_pool_backward< float, index_t >(
+               grad_relation_pre,
+               slot_to_relation_instance_work,
+               relation_instance_arities_work,
+               grad_slot,
+               stream
+            );
+         },
+         [&]() {
+            launch_lgan_add_inplace< double >(grad_relation_pre, grad_relation_pair_x_work, stream);
+            launch_lgan_indexed_reduce_backward< double, index_t >(
+               grad_tn_msgs_work,
+               tn_rel_work,
+               tn_ent_work,
+               mean_mode,
+               grad_relation_pre,
+               stream
+            );
+            launch_lgan_indexed_reduce_backward< double, index_t >(
+               grad_nn_msgs_work,
+               nn_rel_work,
+               nn_ent_work,
+               mean_mode,
+               grad_relation_pre,
+               stream
+            );
+            Tensor grad_relation_final = grad_relation_pre.clone();
+            launch_lgan_indexed_reduce_backward< double, index_t >(
+               grad_relation_final,
+               rr_src_work,
+               rr_dst_work,
+               mean_mode,
+               grad_relation_pre,
+               stream
+            );
+            launch_lgan_pool_backward< double, index_t >(
+               grad_relation_pre,
+               slot_to_relation_instance_work,
+               relation_instance_arities_work,
+               grad_slot,
+               stream
+            );
+         },
+         "lgan_pool_reduce_backward_cuda"
+      );
+   };
+
+   if(use_int32_indices) {
+      run_index_type(int{});
+   } else {
+      run_index_type(int64_t{});
+   }
+   return grad_slot;
+}
+
+std::tuple< Tensor, Tensor, Tensor > lgan_relation_graph_step_cuda(
+   const Tensor& relation_pair_x,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t entity_dim_size,
+   int64_t mode
+)
+{
+   c10::cuda::CUDAGuard device_guard(relation_pair_x.device());
+   check_same_cuda_device(relation_pair_x, rr_src, "relation_pair_x", "rr_src");
+   check_same_cuda_device(relation_pair_x, rr_dst, "relation_pair_x", "rr_dst");
+   check_same_cuda_device(relation_pair_x, tn_rel, "relation_pair_x", "tn_rel");
+   check_same_cuda_device(relation_pair_x, tn_ent, "relation_pair_x", "tn_ent");
+   check_same_cuda_device(relation_pair_x, nn_rel, "relation_pair_x", "nn_rel");
+   check_same_cuda_device(relation_pair_x, nn_ent, "relation_pair_x", "nn_ent");
+   TORCH_CHECK(mode == kModeSum || mode == kModeMean, "lgan_relation_graph_step_cuda supports only sum and mean modes.");
+
+   const bool use_int32_indices =
+      dtype_of(rr_src) == at::kInt && dtype_of(rr_dst) == at::kInt
+      && dtype_of(tn_rel) == at::kInt && dtype_of(tn_ent) == at::kInt
+      && dtype_of(nn_rel) == at::kInt && dtype_of(nn_ent) == at::kInt;
+   Tensor relation_pair_x_work = ensure_contiguous(relation_pair_x);
+   Tensor rr_src_work = ensure_contiguous(use_int32_indices ? rr_src : rr_src.to(at::kLong));
+   Tensor rr_dst_work = ensure_contiguous(use_int32_indices ? rr_dst : rr_dst.to(at::kLong));
+   Tensor tn_rel_work = ensure_contiguous(use_int32_indices ? tn_rel : tn_rel.to(at::kLong));
+   Tensor tn_ent_work = ensure_contiguous(use_int32_indices ? tn_ent : tn_ent.to(at::kLong));
+   Tensor nn_rel_work = ensure_contiguous(use_int32_indices ? nn_rel : nn_rel.to(at::kLong));
+   Tensor nn_ent_work = ensure_contiguous(use_int32_indices ? nn_ent : nn_ent.to(at::kLong));
+   Tensor updated_relation_pair_x = relation_pair_x.clone();
+   Tensor tn_msgs = at::zeros({entity_dim_size, relation_pair_x.size(1)}, relation_pair_x.options());
+   Tensor nn_msgs = at::zeros({entity_dim_size, relation_pair_x.size(1)}, relation_pair_x.options());
+   cudaStream_t stream = current_cuda_stream(relation_pair_x_work);
+   const bool mean_mode = mode == kModeMean;
+
+   auto run_index_type = [&](auto dummy_index) {
+      using index_t = decltype(dummy_index);
+      dispatch_float_or_double(
+         relation_pair_x_work,
+         [&]() {
+            Tensor rr_msgs = at::zeros_like(relation_pair_x_work);
+            launch_lgan_indexed_reduce_sum< float, index_t >(relation_pair_x_work, rr_src_work, rr_dst_work, rr_msgs, stream);
+            if(mean_mode) {
+               launch_lgan_divide_mean_counts< float, index_t >(rr_msgs, rr_dst_work, stream);
+            }
+            launch_lgan_add_inplace< float >(updated_relation_pair_x, rr_msgs, stream);
+            launch_lgan_indexed_reduce_sum< float, index_t >(updated_relation_pair_x, tn_rel_work, tn_ent_work, tn_msgs, stream);
+            if(mean_mode) {
+               launch_lgan_divide_mean_counts< float, index_t >(tn_msgs, tn_ent_work, stream);
+            }
+            launch_lgan_indexed_reduce_sum< float, index_t >(updated_relation_pair_x, nn_rel_work, nn_ent_work, nn_msgs, stream);
+            if(mean_mode) {
+               launch_lgan_divide_mean_counts< float, index_t >(nn_msgs, nn_ent_work, stream);
+            }
+         },
+         [&]() {
+            Tensor rr_msgs = at::zeros_like(relation_pair_x_work);
+            launch_lgan_indexed_reduce_sum< double, index_t >(relation_pair_x_work, rr_src_work, rr_dst_work, rr_msgs, stream);
+            if(mean_mode) {
+               launch_lgan_divide_mean_counts< double, index_t >(rr_msgs, rr_dst_work, stream);
+            }
+            launch_lgan_add_inplace< double >(updated_relation_pair_x, rr_msgs, stream);
+            launch_lgan_indexed_reduce_sum< double, index_t >(updated_relation_pair_x, tn_rel_work, tn_ent_work, tn_msgs, stream);
+            if(mean_mode) {
+               launch_lgan_divide_mean_counts< double, index_t >(tn_msgs, tn_ent_work, stream);
+            }
+            launch_lgan_indexed_reduce_sum< double, index_t >(updated_relation_pair_x, nn_rel_work, nn_ent_work, nn_msgs, stream);
+            if(mean_mode) {
+               launch_lgan_divide_mean_counts< double, index_t >(nn_msgs, nn_ent_work, stream);
+            }
+         },
+         "lgan_relation_graph_step_cuda"
+      );
+   };
+   if(use_int32_indices) {
+      run_index_type(int{});
+   } else {
+      run_index_type(int64_t{});
+   }
+   return std::make_tuple(updated_relation_pair_x, tn_msgs, nn_msgs);
+}
+
+Tensor lgan_relation_graph_step_backward_cuda(
+   const Tensor& grad_relation_pair_x,
+   const Tensor& grad_tn_msgs,
+   const Tensor& grad_nn_msgs,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t relation_count,
+   int64_t mode
+)
+{
+   c10::cuda::CUDAGuard device_guard(grad_relation_pair_x.device());
+   check_same_cuda_device(grad_relation_pair_x, grad_tn_msgs, "grad_relation_pair_x", "grad_tn_msgs");
+   check_same_cuda_device(grad_relation_pair_x, grad_nn_msgs, "grad_relation_pair_x", "grad_nn_msgs");
+   check_same_cuda_device(grad_relation_pair_x, rr_src, "grad_relation_pair_x", "rr_src");
+   check_same_cuda_device(grad_relation_pair_x, rr_dst, "grad_relation_pair_x", "rr_dst");
+   check_same_cuda_device(grad_relation_pair_x, tn_rel, "grad_relation_pair_x", "tn_rel");
+   check_same_cuda_device(grad_relation_pair_x, tn_ent, "grad_relation_pair_x", "tn_ent");
+   check_same_cuda_device(grad_relation_pair_x, nn_rel, "grad_relation_pair_x", "nn_rel");
+   check_same_cuda_device(grad_relation_pair_x, nn_ent, "grad_relation_pair_x", "nn_ent");
+   TORCH_CHECK(mode == kModeSum || mode == kModeMean, "lgan_relation_graph_step_backward_cuda supports only sum and mean modes.");
+
+   const bool use_int32_indices =
+      dtype_of(rr_src) == at::kInt && dtype_of(rr_dst) == at::kInt
+      && dtype_of(tn_rel) == at::kInt && dtype_of(tn_ent) == at::kInt
+      && dtype_of(nn_rel) == at::kInt && dtype_of(nn_ent) == at::kInt;
+   Tensor grad_relation_pair_x_work = ensure_contiguous(grad_relation_pair_x);
+   Tensor grad_tn_msgs_work = ensure_contiguous(grad_tn_msgs);
+   Tensor grad_nn_msgs_work = ensure_contiguous(grad_nn_msgs);
+   Tensor rr_src_work = ensure_contiguous(use_int32_indices ? rr_src : rr_src.to(at::kLong));
+   Tensor rr_dst_work = ensure_contiguous(use_int32_indices ? rr_dst : rr_dst.to(at::kLong));
+   Tensor tn_rel_work = ensure_contiguous(use_int32_indices ? tn_rel : tn_rel.to(at::kLong));
+   Tensor tn_ent_work = ensure_contiguous(use_int32_indices ? tn_ent : tn_ent.to(at::kLong));
+   Tensor nn_rel_work = ensure_contiguous(use_int32_indices ? nn_rel : nn_rel.to(at::kLong));
+   Tensor nn_ent_work = ensure_contiguous(use_int32_indices ? nn_ent : nn_ent.to(at::kLong));
+   Tensor grad_relation_pre = at::zeros({relation_count, grad_relation_pair_x.size(1)}, grad_relation_pair_x.options());
+   cudaStream_t stream = current_cuda_stream(grad_relation_pair_x_work);
+   const bool mean_mode = mode == kModeMean;
+
+   auto run_index_type = [&](auto dummy_index) {
+      using index_t = decltype(dummy_index);
+      dispatch_float_or_double(
+         grad_relation_pair_x_work,
+         [&]() {
+            launch_lgan_add_inplace< float >(grad_relation_pre, grad_relation_pair_x_work, stream);
+            launch_lgan_indexed_reduce_backward< float, index_t >(grad_tn_msgs_work, tn_rel_work, tn_ent_work, mean_mode, grad_relation_pre, stream);
+            launch_lgan_indexed_reduce_backward< float, index_t >(grad_nn_msgs_work, nn_rel_work, nn_ent_work, mean_mode, grad_relation_pre, stream);
+            Tensor grad_relation_final = grad_relation_pre.clone();
+            launch_lgan_indexed_reduce_backward< float, index_t >(grad_relation_final, rr_src_work, rr_dst_work, mean_mode, grad_relation_pre, stream);
+         },
+         [&]() {
+            launch_lgan_add_inplace< double >(grad_relation_pre, grad_relation_pair_x_work, stream);
+            launch_lgan_indexed_reduce_backward< double, index_t >(grad_tn_msgs_work, tn_rel_work, tn_ent_work, mean_mode, grad_relation_pre, stream);
+            launch_lgan_indexed_reduce_backward< double, index_t >(grad_nn_msgs_work, nn_rel_work, nn_ent_work, mean_mode, grad_relation_pre, stream);
+            Tensor grad_relation_final = grad_relation_pre.clone();
+            launch_lgan_indexed_reduce_backward< double, index_t >(grad_relation_final, rr_src_work, rr_dst_work, mean_mode, grad_relation_pre, stream);
+         },
+         "lgan_relation_graph_step_backward_cuda"
+      );
+   };
+   if(use_int32_indices) {
+      run_index_type(int{});
+   } else {
+      run_index_type(int64_t{});
+   }
+   return grad_relation_pre;
 }
 
 std::tuple< Tensor, Tensor > block_pointwise_cuda(

@@ -11,7 +11,12 @@ import torch
 
 import mifrost  # type: ignore
 
-from relm.models import FlatExecutionPolicy, FlatLGANRelationalGNN, TwoLayerPointwiseRelationMLP
+from relm.models import (
+    FlatExecutionPolicy,
+    FlatLGANRelationalGNN,
+    PostNormTwoLayerPointwiseRelationMLP,
+    TwoLayerPointwiseRelationMLP,
+)
 from scripts.benchmark_fast_vs_pymimir import _build_states
 
 
@@ -92,18 +97,32 @@ def _build_model_with_policy(
     num_layers: int,
     device: torch.device,
     execution_policy: FlatExecutionPolicy,
+    relation_family: str = "pointwise",
+    activation: str = "silu",
 ):
     relation_names = tuple(str(name) for name in batch.relation_names)
     relation_arities = tuple(int(arity) for arity in batch.relation_arities)
     relations = dict(zip(relation_names, relation_arities))
-    relation_modules = {
-        name: TwoLayerPointwiseRelationMLP(
-            int(arity) * embedding_size,
-            max(int(arity) * embedding_size, 2 * embedding_size),
-            activation="silu",
-        )
-        for name, arity in relations.items()
-    }
+    relation_modules = {}
+    for name, arity in relations.items():
+        width = int(arity) * embedding_size
+        hidden = max(width, 2 * embedding_size)
+        if relation_family == "pointwise":
+            module = TwoLayerPointwiseRelationMLP(
+                width,
+                hidden,
+                activation=activation,
+            )
+        elif relation_family == "postnorm_ln":
+            module = PostNormTwoLayerPointwiseRelationMLP(
+                width,
+                hidden,
+                activation=activation,
+                norm="layernorm",
+            )
+        else:
+            raise ValueError(f"Unsupported relation_family: {relation_family!r}")
+        relation_modules[name] = module
     model = FlatLGANRelationalGNN(
         embedding_size=embedding_size,
         num_layers=num_layers,
@@ -156,6 +175,8 @@ def main() -> None:
     parser.add_argument("--relation-kernels", choices=("auto", "off"), default="off")
     parser.add_argument("--program-kernels", choices=("auto", "off"), default="off")
     parser.add_argument("--relation-gather", choices=("auto", "on", "off"), default="off")
+    parser.add_argument("--relation-family", choices=("pointwise", "postnorm_ln"), default="pointwise")
+    parser.add_argument("--activation", choices=("silu", "mish", "gelu"), default="silu")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--json-out", type=str, default=None)
@@ -192,6 +213,8 @@ def main() -> None:
         num_layers=int(args.num_layers),
         device=device,
         execution_policy=execution_policy,
+        relation_family=args.relation_family,
+        activation=args.activation,
     )
 
     results = {
@@ -242,6 +265,8 @@ def main() -> None:
             "relation_kernels": args.relation_kernels,
             "program_kernels": args.program_kernels,
             "relation_gather": args.relation_gather,
+            "relation_family": args.relation_family,
+            "activation": args.activation,
         },
         "carrier_meta": {
             "num_graphs": int(getattr(native_batch, "num_graphs", 1)),

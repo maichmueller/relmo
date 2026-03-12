@@ -296,6 +296,58 @@ program_rmsnorm_silu_backward_cuda(
    const Tensor& w21_stack,
    const Tensor& b21_stack
 );
+std::tuple< Tensor, Tensor, Tensor > lgan_pool_reduce_cuda(
+   const Tensor& slot_messages,
+   const Tensor& slot_to_relation_instance,
+   const Tensor& relation_instance_arities,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t entity_dim_size,
+   int64_t mode
+);
+Tensor lgan_pool_reduce_backward_cuda(
+   const Tensor& grad_relation_pair_x,
+   const Tensor& grad_tn_msgs,
+   const Tensor& grad_nn_msgs,
+   const Tensor& slot_to_relation_instance,
+   const Tensor& relation_instance_arities,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t relation_count,
+   int64_t mode
+);
+std::tuple< Tensor, Tensor, Tensor > lgan_relation_graph_step_cuda(
+   const Tensor& relation_pair_x,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t entity_dim_size,
+   int64_t mode
+);
+Tensor lgan_relation_graph_step_backward_cuda(
+   const Tensor& grad_relation_pair_x,
+   const Tensor& grad_tn_msgs,
+   const Tensor& grad_nn_msgs,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t relation_count,
+   int64_t mode
+);
 #endif
 
 Tensor make_scatter_index(const Tensor& idx, int64_t emb)
@@ -3035,6 +3087,24 @@ std::tuple< Tensor, Tensor, Tensor > lgan_pool_reduce(
       "lgan_pool_reduce supports only mode 0=sum or 2=mean."
    );
 
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(slot_messages.is_cuda() && is_fastpath_dtype(dtype_of(slot_messages))) {
+      return lgan_pool_reduce_cuda(
+         slot_messages,
+         slot_to_relation_instance,
+         relation_instance_arities,
+         rr_src,
+         rr_dst,
+         tn_rel,
+         tn_ent,
+         nn_rel,
+         nn_ent,
+         entity_dim_size,
+         mode
+      );
+   }
+#endif
+
    const auto relation_count = relation_instance_arities.size(0);
    auto relation_pair_x =
       slot_messages.new_zeros({relation_count, slot_messages.size(1)});
@@ -3078,6 +3148,280 @@ std::tuple< Tensor, Tensor, Tensor > lgan_pool_reduce(
    return std::make_tuple(relation_pair_x, tn_msgs, nn_msgs);
 }
 
+Tensor lgan_pool_reduce_backward(
+   const Tensor& grad_relation_pair_x,
+   const Tensor& grad_tn_msgs,
+   const Tensor& grad_nn_msgs,
+   const Tensor& slot_to_relation_instance,
+   const Tensor& relation_instance_arities,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t relation_count,
+   int64_t mode
+)
+{
+   check_rank(grad_relation_pair_x, 2, "grad_relation_pair_x");
+   check_rank(grad_tn_msgs, 2, "grad_tn_msgs");
+   check_rank(grad_nn_msgs, 2, "grad_nn_msgs");
+   check_int32_or_int64_index(slot_to_relation_instance, "slot_to_relation_instance");
+   check_int64_index(relation_instance_arities, "relation_instance_arities");
+   check_int32_or_int64_index(rr_src, "rr_src");
+   check_int32_or_int64_index(rr_dst, "rr_dst");
+   check_int32_or_int64_index(tn_rel, "tn_rel");
+   check_int32_or_int64_index(tn_ent, "tn_ent");
+   check_int32_or_int64_index(nn_rel, "nn_rel");
+   check_int32_or_int64_index(nn_ent, "nn_ent");
+   TORCH_CHECK(
+      grad_relation_pair_x.device() == grad_tn_msgs.device()
+         && grad_relation_pair_x.device() == grad_nn_msgs.device()
+         && grad_relation_pair_x.device() == slot_to_relation_instance.device()
+         && grad_relation_pair_x.device() == relation_instance_arities.device()
+         && grad_relation_pair_x.device() == rr_src.device()
+         && grad_relation_pair_x.device() == rr_dst.device()
+         && grad_relation_pair_x.device() == tn_rel.device()
+         && grad_relation_pair_x.device() == tn_ent.device()
+         && grad_relation_pair_x.device() == nn_rel.device()
+         && grad_relation_pair_x.device() == nn_ent.device(),
+      "lgan_pool_reduce_backward expects all tensors on the same device."
+   );
+   TORCH_CHECK(
+      mode == kModeSum || mode == kModeMean,
+      "lgan_pool_reduce_backward supports only mode 0=sum or 2=mean."
+   );
+   TORCH_CHECK(relation_count >= 0, "relation_count must be >= 0.");
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(grad_relation_pair_x.is_cuda() && is_fastpath_dtype(dtype_of(grad_relation_pair_x))) {
+      return lgan_pool_reduce_backward_cuda(
+         grad_relation_pair_x,
+         grad_tn_msgs,
+         grad_nn_msgs,
+         slot_to_relation_instance,
+         relation_instance_arities,
+         rr_src,
+         rr_dst,
+         tn_rel,
+         tn_ent,
+         nn_rel,
+         nn_ent,
+         relation_count,
+         mode
+      );
+   }
+#endif
+
+   auto grad_relation_pre = grad_relation_pair_x.clone();
+   auto aggregate_reverse =
+      [&](const Tensor& grad_target,
+          const Tensor& source_index,
+          const Tensor& target_index,
+          int64_t source_dim_size) -> Tensor {
+      auto grad_source =
+         grad_target.new_zeros({source_dim_size, grad_target.size(1)});
+      if(source_index.numel() == 0 || target_index.numel() == 0 || source_dim_size == 0) {
+         return grad_source;
+      }
+      auto gathered = grad_target.index_select(0, target_index);
+      if(mode == kModeMean) {
+         auto counts = grad_target.new_zeros({grad_target.size(0), 1});
+         counts.index_add_(
+            0,
+            target_index,
+            at::ones({target_index.size(0), 1}, grad_target.options())
+         );
+         gathered = gathered / counts.index_select(0, target_index).clamp_min_(1.0);
+      }
+      grad_source.index_add_(0, source_index, gathered);
+      return grad_source;
+   };
+
+   grad_relation_pre =
+      grad_relation_pre + aggregate_reverse(grad_tn_msgs, tn_rel, tn_ent, relation_count)
+      + aggregate_reverse(grad_nn_msgs, nn_rel, nn_ent, relation_count);
+   grad_relation_pre =
+      grad_relation_pre + aggregate_reverse(grad_relation_pre, rr_src, rr_dst, relation_count);
+   auto grad_slot = grad_relation_pre.index_select(0, slot_to_relation_instance);
+   auto counts = relation_instance_arities.to(grad_slot.scalar_type()).index_select(
+      0, slot_to_relation_instance.to(at::kLong)
+   ).view({slot_to_relation_instance.size(0), 1}).clamp_min_(1.0);
+   return grad_slot / counts;
+}
+
+std::tuple< Tensor, Tensor, Tensor > lgan_relation_graph_step(
+   const Tensor& relation_pair_x,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t entity_dim_size,
+   int64_t mode
+)
+{
+   check_rank(relation_pair_x, 2, "relation_pair_x");
+   check_int32_or_int64_index(rr_src, "rr_src");
+   check_int32_or_int64_index(rr_dst, "rr_dst");
+   check_int32_or_int64_index(tn_rel, "tn_rel");
+   check_int32_or_int64_index(tn_ent, "tn_ent");
+   check_int32_or_int64_index(nn_rel, "nn_rel");
+   check_int32_or_int64_index(nn_ent, "nn_ent");
+   TORCH_CHECK(
+      relation_pair_x.device() == rr_src.device()
+         && relation_pair_x.device() == rr_dst.device()
+         && relation_pair_x.device() == tn_rel.device()
+         && relation_pair_x.device() == tn_ent.device()
+         && relation_pair_x.device() == nn_rel.device()
+         && relation_pair_x.device() == nn_ent.device(),
+      "lgan_relation_graph_step expects all tensors on the same device."
+   );
+   TORCH_CHECK(entity_dim_size >= 0, "entity_dim_size must be >= 0.");
+   TORCH_CHECK(rr_src.size(0) == rr_dst.size(0), "rr_src and rr_dst must have equal length.");
+   TORCH_CHECK(tn_rel.size(0) == tn_ent.size(0), "tn_rel and tn_ent must have equal length.");
+   TORCH_CHECK(nn_rel.size(0) == nn_ent.size(0), "nn_rel and nn_ent must have equal length.");
+   TORCH_CHECK(
+      mode == kModeSum || mode == kModeMean,
+      "lgan_relation_graph_step supports only mode 0=sum or 2=mean."
+   );
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(relation_pair_x.is_cuda() && is_fastpath_dtype(dtype_of(relation_pair_x))) {
+      return lgan_relation_graph_step_cuda(
+         relation_pair_x,
+         rr_src,
+         rr_dst,
+         tn_rel,
+         tn_ent,
+         nn_rel,
+         nn_ent,
+         entity_dim_size,
+         mode
+      );
+   }
+#endif
+
+   auto aggregate_indexed =
+      [&](const Tensor& source_embeddings,
+          const Tensor& source_index,
+          const Tensor& target_index,
+          int64_t dim_size) -> Tensor {
+      auto out = source_embeddings.new_zeros({dim_size, source_embeddings.size(1)});
+      if(source_index.numel() == 0 || target_index.numel() == 0 || dim_size == 0) {
+         return out;
+      }
+      auto gathered = source_embeddings.index_select(0, source_index);
+      out.index_add_(0, target_index, gathered);
+      if(mode == kModeMean) {
+         auto count = source_embeddings.new_zeros({dim_size, 1});
+         count.index_add_(
+            0,
+            target_index,
+            at::ones({target_index.size(0), 1}, source_embeddings.options())
+         );
+         out = out / count.clamp_min_(1.0);
+      }
+      return out;
+   };
+
+   auto updated_relation_pair_x = relation_pair_x + aggregate_indexed(
+      relation_pair_x, rr_src, rr_dst, relation_pair_x.size(0)
+   );
+   auto tn_msgs = aggregate_indexed(updated_relation_pair_x, tn_rel, tn_ent, entity_dim_size);
+   auto nn_msgs = aggregate_indexed(updated_relation_pair_x, nn_rel, nn_ent, entity_dim_size);
+   return std::make_tuple(updated_relation_pair_x, tn_msgs, nn_msgs);
+}
+
+Tensor lgan_relation_graph_step_backward(
+   const Tensor& grad_relation_pair_x,
+   const Tensor& grad_tn_msgs,
+   const Tensor& grad_nn_msgs,
+   const Tensor& rr_src,
+   const Tensor& rr_dst,
+   const Tensor& tn_rel,
+   const Tensor& tn_ent,
+   const Tensor& nn_rel,
+   const Tensor& nn_ent,
+   int64_t relation_count,
+   int64_t mode
+)
+{
+   check_rank(grad_relation_pair_x, 2, "grad_relation_pair_x");
+   check_rank(grad_tn_msgs, 2, "grad_tn_msgs");
+   check_rank(grad_nn_msgs, 2, "grad_nn_msgs");
+   check_int32_or_int64_index(rr_src, "rr_src");
+   check_int32_or_int64_index(rr_dst, "rr_dst");
+   check_int32_or_int64_index(tn_rel, "tn_rel");
+   check_int32_or_int64_index(tn_ent, "tn_ent");
+   check_int32_or_int64_index(nn_rel, "nn_rel");
+   check_int32_or_int64_index(nn_ent, "nn_ent");
+   TORCH_CHECK(
+      grad_relation_pair_x.device() == grad_tn_msgs.device()
+         && grad_relation_pair_x.device() == grad_nn_msgs.device()
+         && grad_relation_pair_x.device() == rr_src.device()
+         && grad_relation_pair_x.device() == rr_dst.device()
+         && grad_relation_pair_x.device() == tn_rel.device()
+         && grad_relation_pair_x.device() == tn_ent.device()
+         && grad_relation_pair_x.device() == nn_rel.device()
+         && grad_relation_pair_x.device() == nn_ent.device(),
+      "lgan_relation_graph_step_backward expects all tensors on the same device."
+   );
+   TORCH_CHECK(relation_count >= 0, "relation_count must be >= 0.");
+   TORCH_CHECK(
+      mode == kModeSum || mode == kModeMean,
+      "lgan_relation_graph_step_backward supports only mode 0=sum or 2=mean."
+   );
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(grad_relation_pair_x.is_cuda() && is_fastpath_dtype(dtype_of(grad_relation_pair_x))) {
+      return lgan_relation_graph_step_backward_cuda(
+         grad_relation_pair_x,
+         grad_tn_msgs,
+         grad_nn_msgs,
+         rr_src,
+         rr_dst,
+         tn_rel,
+         tn_ent,
+         nn_rel,
+         nn_ent,
+         relation_count,
+         mode
+      );
+   }
+#endif
+
+   auto aggregate_reverse =
+      [&](const Tensor& grad_target,
+          const Tensor& source_index,
+          const Tensor& target_index,
+          int64_t source_dim_size) -> Tensor {
+      auto grad_source = grad_target.new_zeros({source_dim_size, grad_target.size(1)});
+      if(source_index.numel() == 0 || target_index.numel() == 0 || source_dim_size == 0) {
+         return grad_source;
+      }
+      auto gathered = grad_target.index_select(0, target_index);
+      if(mode == kModeMean) {
+         auto counts = grad_target.new_zeros({grad_target.size(0), 1});
+         counts.index_add_(
+            0,
+            target_index,
+            at::ones({target_index.size(0), 1}, grad_target.options())
+         );
+         gathered = gathered / counts.index_select(0, target_index).clamp_min_(1.0);
+      }
+      grad_source.index_add_(0, source_index, gathered);
+      return grad_source;
+   };
+
+   auto grad_relation_pre = grad_relation_pair_x
+      + aggregate_reverse(grad_tn_msgs, tn_rel, tn_ent, relation_count)
+      + aggregate_reverse(grad_nn_msgs, nn_rel, nn_ent, relation_count);
+   return grad_relation_pre + aggregate_reverse(grad_relation_pre, rr_src, rr_dst, relation_count);
+}
+
 std::string build_info()
 {
    return std::string("build_torch=") + RELM_MP_BUILD_TORCH_VERSION + ";build_cuda_tag="
@@ -3112,6 +3456,15 @@ TORCH_LIBRARY(relm_mp, m)
    );
    m.def(
       "lgan_pool_reduce(Tensor slot_messages, Tensor slot_to_relation_instance, Tensor relation_instance_arities, Tensor rr_src, Tensor rr_dst, Tensor tn_rel, Tensor tn_ent, Tensor nn_rel, Tensor nn_ent, int entity_dim_size, int mode) -> (Tensor, Tensor, Tensor)"
+   );
+   m.def(
+      "lgan_pool_reduce_backward(Tensor grad_relation_pair_x, Tensor grad_tn_msgs, Tensor grad_nn_msgs, Tensor slot_to_relation_instance, Tensor relation_instance_arities, Tensor rr_src, Tensor rr_dst, Tensor tn_rel, Tensor tn_ent, Tensor nn_rel, Tensor nn_ent, int relation_count, int mode) -> Tensor"
+   );
+   m.def(
+      "lgan_relation_graph_step(Tensor relation_pair_x, Tensor rr_src, Tensor rr_dst, Tensor tn_rel, Tensor tn_ent, Tensor nn_rel, Tensor nn_ent, int entity_dim_size, int mode) -> (Tensor, Tensor, Tensor)"
+   );
+   m.def(
+      "lgan_relation_graph_step_backward(Tensor grad_relation_pair_x, Tensor grad_tn_msgs, Tensor grad_nn_msgs, Tensor rr_src, Tensor rr_dst, Tensor tn_rel, Tensor tn_ent, Tensor nn_rel, Tensor nn_ent, int relation_count, int mode) -> Tensor"
    );
    m.def(
       "fanin_pack_multi(Tensor[] rel_parts, Tensor[] flat_src_parts, Tensor[] dst_idx_parts) -> (Tensor, Tensor, Tensor)"
@@ -3168,6 +3521,9 @@ TORCH_LIBRARY_IMPL(relm_mp, CompositeImplicitAutograd, m)
    m.impl("fanin_reduce_sum_backward", relm::mp::fanin_reduce_sum_backward);
    m.impl("fanin_reduce_logsumexp_backward", relm::mp::fanin_reduce_logsumexp_backward);
    m.impl("lgan_pool_reduce", relm::mp::lgan_pool_reduce);
+   m.impl("lgan_pool_reduce_backward", relm::mp::lgan_pool_reduce_backward);
+   m.impl("lgan_relation_graph_step", relm::mp::lgan_relation_graph_step);
+   m.impl("lgan_relation_graph_step_backward", relm::mp::lgan_relation_graph_step_backward);
    m.impl("fanin_pack_multi", relm::mp::fanin_pack_multi);
    m.impl("fanin_pack_from_edges", relm::mp::fanin_pack_from_edges);
    m.impl(

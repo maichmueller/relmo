@@ -153,6 +153,20 @@ def _manual_lgan_reference(data: Data) -> torch.Tensor:
     return x + tn_msgs + nn_msgs
 
 
+def test_flat_lgan_declares_required_and_optional_fields() -> None:
+    assert FlatLGANRelationalGNN.required_input_fields() == (
+        "lgan_tn_relation_indices",
+        "lgan_tn_entity_indices",
+        "lgan_nn_relation_indices",
+        "lgan_nn_entity_indices",
+        "lgan_rr_src_relation_indices",
+        "lgan_rr_dst_relation_indices",
+    )
+    optional = FlatLGANRelationalGNN.optional_input_metadata_fields()
+    assert "relation_instance_sizes" in optional
+    assert "lgan_tn_sizes" in optional
+
+
 def test_flat_lgan_requires_lgan_indices() -> None:
     data = Data(
         x=torch.zeros((3, 2)),
@@ -239,7 +253,7 @@ def test_lgan_pool_reduce_op_matches_reference_math() -> None:
     nn_rel = torch.tensor([1, 2], dtype=torch.long)
     nn_ent = torch.tensor([2, 4], dtype=torch.long)
 
-    relation_pair_x, tn_msgs, nn_msgs = mp_ops.lgan_pool_reduce(
+    relation_pair_x, tn_msgs, nn_msgs = mp_ops._lgan_pool_reduce(
         slot_messages,
         slot_to_relation_instance,
         relation_instance_arities,
@@ -267,6 +281,268 @@ def test_lgan_pool_reduce_op_matches_reference_math() -> None:
     assert torch.allclose(relation_pair_x, expected_relation_pair, atol=1e-6, rtol=0.0)
     assert torch.allclose(tn_msgs, expected_tn, atol=1e-6, rtol=0.0)
     assert torch.allclose(nn_msgs, expected_nn, atol=1e-6, rtol=0.0)
+
+
+def test_collect_relation_instance_messages_matches_slot_pooling() -> None:
+    data = _make_lgan_data()
+    model = _IndexInitializedFlatLGAN(
+        embedding_size=2,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        aggregation="sum",
+        relation_modules={
+            "rel_a": _ZeroBlock(4),
+            "rel_b": _ZeroBlock(2),
+        },
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="off",
+            program_kernels="off",
+            relation_gather="off",
+        ),
+    )
+    prepared = model._prepare_batch(data)
+    assert prepared.topology is not None
+    assert prepared.lgan_topology is not None
+    x = model.initialize_embeddings(prepared.x)
+    slot_messages = model.relational_layer.collect_slot_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert slot_messages is not None
+    pooled_from_slots = slot_messages.new_zeros(
+        (int(prepared.lgan_topology.relation_instance_count), slot_messages.size(1))
+    )
+    pooled_from_slots.index_add_(
+        0,
+        prepared.lgan_topology.slot_to_relation_instance,
+        slot_messages,
+    )
+    counts = (
+        prepared.lgan_topology.relation_instance_arities.to(
+            device=slot_messages.device,
+            dtype=slot_messages.dtype,
+        )
+        .view(-1, 1)
+        .clamp_min_(1.0)
+    )
+    pooled_from_slots = pooled_from_slots / counts
+    relation_pair_x = model.relational_layer._collect_relation_instance_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert relation_pair_x is not None
+    assert torch.allclose(relation_pair_x, pooled_from_slots, atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_collect_relation_instance_messages_kernel_matches_slot_pooling() -> None:
+    if not mp_ops.available():
+        pytest.skip("relm_mp ops unavailable")
+    device = torch.device("cuda")
+    model = _InputInitializedFlatLGAN(
+        embedding_size=2,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        aggregation="sum",
+        relation_modules={
+            "rel_a": TwoLayerPointwiseRelationMLP(4, 8, activation="silu"),
+            "rel_b": TwoLayerPointwiseRelationMLP(2, 8, activation="silu"),
+        },
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="auto",
+            program_kernels="auto",
+            relation_gather="off",
+        ),
+    ).to(device)
+    prepared = model._prepare_batch(_make_lgan_data().to(device))
+    assert prepared.topology is not None
+    assert prepared.lgan_topology is not None
+    x = model.initialize_embeddings(prepared.x)
+    slot_messages = model.relational_layer.collect_slot_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert slot_messages is not None
+    pooled_from_slots = slot_messages.new_zeros(
+        (int(prepared.lgan_topology.relation_instance_count), slot_messages.size(1))
+    )
+    pooled_from_slots.index_add_(
+        0,
+        prepared.lgan_topology.slot_to_relation_instance,
+        slot_messages,
+    )
+    counts = (
+        prepared.lgan_topology.relation_instance_arities.to(
+            device=slot_messages.device,
+            dtype=slot_messages.dtype,
+        )
+        .view(-1, 1)
+        .clamp_min_(1.0)
+    )
+    pooled_from_slots = pooled_from_slots / counts
+    relation_pair_x = model.relational_layer._collect_relation_instance_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert relation_pair_x is not None
+    assert torch.allclose(relation_pair_x, pooled_from_slots, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_lgan_pool_reduce_cuda_backward_matches_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not mp_ops.available():
+        pytest.skip("relm_mp ops unavailable")
+    device = torch.device("cuda")
+    slot_messages = torch.randn((9, 4), device=device, dtype=torch.float, requires_grad=True)
+    slot_to_relation_instance = torch.tensor([0, 0, 1, 1, 1, 2, 3, 3, 4], device=device, dtype=torch.long)
+    relation_instance_arities = torch.tensor([2, 3, 1, 2, 1], device=device, dtype=torch.long)
+    rr_src = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.long)
+    rr_dst = torch.tensor([1, 2, 3, 4], device=device, dtype=torch.long)
+    tn_rel = torch.tensor([0, 2, 4], device=device, dtype=torch.long)
+    tn_ent = torch.tensor([0, 3, 5], device=device, dtype=torch.long)
+    nn_rel = torch.tensor([1, 3, 4], device=device, dtype=torch.long)
+    nn_ent = torch.tensor([2, 4, 6], device=device, dtype=torch.long)
+
+    out_custom = mp_ops._lgan_pool_reduce(
+        slot_messages,
+        slot_to_relation_instance,
+        relation_instance_arities,
+        rr_src,
+        rr_dst,
+        tn_rel,
+        tn_ent,
+        nn_rel,
+        nn_ent,
+        entity_dim_size=7,
+        mode="sum",
+    )
+    loss_custom = sum(t.sum() for t in out_custom)
+    grad_custom = torch.autograd.grad(loss_custom, (slot_messages,))[0]
+
+    monkeypatch.setenv("RELM_MP_ENABLE", "0")
+    slot_messages_ref = slot_messages.detach().clone().requires_grad_(True)
+    out_ref = mp_ops._lgan_pool_reduce(
+        slot_messages_ref,
+        slot_to_relation_instance,
+        relation_instance_arities,
+        rr_src,
+        rr_dst,
+        tn_rel,
+        tn_ent,
+        nn_rel,
+        nn_ent,
+        entity_dim_size=7,
+        mode="sum",
+    )
+    loss_ref = sum(t.sum() for t in out_ref)
+    grad_ref = torch.autograd.grad(loss_ref, (slot_messages_ref,))[0]
+
+    for custom, ref in zip(out_custom, out_ref):
+        assert torch.allclose(custom, ref, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(grad_custom, grad_ref, atol=1e-5, rtol=1e-4)
+
+
+def test_lgan_relation_graph_step_matches_reference_math() -> None:
+    relation_pair_x = torch.tensor(
+        [[0.5, 0.5], [1.0, 0.5], [0.0, 2.0]],
+        dtype=torch.float,
+    )
+    rr_src = torch.tensor([0, 1], dtype=torch.long)
+    rr_dst = torch.tensor([1, 2], dtype=torch.long)
+    tn_rel = torch.tensor([0, 1, 2], dtype=torch.long)
+    tn_ent = torch.tensor([0, 1, 2], dtype=torch.long)
+    nn_rel = torch.tensor([1, 2], dtype=torch.long)
+    nn_ent = torch.tensor([2, 4], dtype=torch.long)
+    relation_pair_x_out, tn_msgs, nn_msgs = mp_ops._lgan_relation_graph_step(
+        relation_pair_x,
+        rr_src,
+        rr_dst,
+        tn_rel,
+        tn_ent,
+        nn_rel,
+        nn_ent,
+        entity_dim_size=5,
+        mode="sum",
+    )
+    rr_expected = torch.tensor(
+        [[0.0, 0.0], [0.5, 0.5], [1.0, 0.5]],
+        dtype=torch.float,
+    )
+    relation_expected = relation_pair_x + rr_expected
+    tn_expected = torch.zeros((5, 2), dtype=torch.float)
+    tn_expected[0] = relation_expected[0]
+    tn_expected[1] = relation_expected[1]
+    tn_expected[2] = relation_expected[2]
+    nn_expected = torch.zeros((5, 2), dtype=torch.float)
+    nn_expected[2] = relation_expected[1]
+    nn_expected[4] = relation_expected[2]
+    assert torch.allclose(relation_pair_x_out, relation_expected, atol=1e-6, rtol=0.0)
+    assert torch.allclose(tn_msgs, tn_expected, atol=1e-6, rtol=0.0)
+    assert torch.allclose(nn_msgs, nn_expected, atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_lgan_build_pointwise_step_matches_relation_instance_then_graph_step() -> None:
+    if not mp_ops.available():
+        pytest.skip("relm_mp ops unavailable")
+    device = torch.device("cuda")
+    model = _InputInitializedFlatLGAN(
+        embedding_size=2,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        aggregation="sum",
+        relation_modules={
+            "rel_a": TwoLayerPointwiseRelationMLP(4, 8, activation="silu"),
+            "rel_b": TwoLayerPointwiseRelationMLP(2, 8, activation="silu"),
+        },
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="auto",
+            program_kernels="auto",
+            relation_gather="off",
+        ),
+    ).to(device)
+    prepared = model._prepare_batch(_make_lgan_data().to(device))
+    assert prepared.topology is not None
+    x = model.initialize_embeddings(prepared.x)
+
+    integrated = model.relational_layer._run_lgan_pointwise_step(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+        rr_src=prepared.lgan_rr_src_relation_indices,
+        rr_dst=prepared.lgan_rr_dst_relation_indices,
+        tn_rel=prepared.lgan_tn_relation_indices,
+        tn_ent=prepared.lgan_tn_entity_indices,
+        nn_rel=prepared.lgan_nn_relation_indices,
+        nn_ent=prepared.lgan_nn_entity_indices,
+        entity_dim_size=int(x.size(0)),
+        mode="sum",
+    )
+    assert integrated is not None
+    relation_pair_ref = model.relational_layer._collect_relation_instance_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert relation_pair_ref is not None
+    reference = mp_ops._lgan_relation_graph_step(
+        relation_pair_ref,
+        prepared.lgan_rr_src_relation_indices,
+        prepared.lgan_rr_dst_relation_indices,
+        prepared.lgan_tn_relation_indices,
+        prepared.lgan_tn_entity_indices,
+        prepared.lgan_nn_relation_indices,
+        prepared.lgan_nn_entity_indices,
+        entity_dim_size=int(x.size(0)),
+        mode="sum",
+    )
+    for got, ref in zip(integrated, reference, strict=True):
+        assert torch.allclose(got, ref, atol=1e-6, rtol=0.0)
+
 
 
 def test_flat_lgan_accepts_native_mifrost_batch_and_matches_pyg() -> None:
