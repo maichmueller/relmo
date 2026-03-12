@@ -86,6 +86,19 @@ std::tuple< Tensor, Tensor > block_pointwise_cuda(
    const Tensor& b2_stack,
    int64_t pointwise_code
 );
+Tensor block_pointwise_pool_cuda(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+);
 std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
 block_pointwise_backward_cuda(
    const Tensor& grad_rel,
@@ -94,6 +107,21 @@ block_pointwise_backward_cuda(
    const Tensor& slot_offsets,
    const Tensor& row_offsets,
    const Tensor& out_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+);
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
+block_pointwise_pool_backward_cuda(
+   const Tensor& grad_pooled,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
    int64_t total_rows,
    int64_t arity,
    const Tensor& w1_stack,
@@ -724,6 +752,181 @@ std::tuple< Tensor, Tensor > block_pointwise(
       node_idx_cat.narrow(0, out_start, len).copy_(node_idx_i);
    }
    return std::make_tuple(rel_cat, node_idx_cat);
+}
+
+Tensor block_pointwise_pool(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+)
+{
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device(),
+      "block_pointwise_pool expects x and relation_args on the same device."
+   );
+   TORCH_CHECK(
+      slot_offsets.size() == row_sizes.size(),
+      "block_pointwise_pool expects slot_offsets and row_sizes with equal lengths."
+   );
+   TORCH_CHECK(arity > 0, "block_pointwise_pool expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+   TORCH_CHECK(
+      b1_stack.dim() <= 2,
+      "block_pointwise_pool expects b1_stack rank <= 2."
+   );
+   TORCH_CHECK(
+      b2_stack.dim() <= 2,
+      "block_pointwise_pool expects b2_stack rank <= 2."
+   );
+
+   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "block_pointwise_pool weight stacks must have first dim equal to group count."
+   );
+   if(b1_stack.numel() > 0) {
+      TORCH_CHECK(
+         b1_stack.dim() == 2 && b1_stack.size(0) == groups,
+         "block_pointwise_pool b1_stack must have shape [groups, hidden] when non-empty."
+      );
+   }
+   if(b2_stack.numel() > 0) {
+      TORCH_CHECK(
+         b2_stack.dim() == 2 && b2_stack.size(0) == groups,
+         "block_pointwise_pool b2_stack must have shape [groups, out_dim] when non-empty."
+      );
+   }
+
+   const int64_t emb = x.size(1);
+   const int64_t in_dim = emb * arity;
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim,
+      "block_pointwise_pool expects w1_stack.shape[-1] == arity * emb, got ",
+      w1_stack.size(2),
+      " vs ",
+      in_dim,
+      "."
+   );
+   const int64_t hidden = w1_stack.size(1);
+   TORCH_CHECK(
+      w2_stack.size(2) == hidden,
+      "block_pointwise_pool expects w2_stack.shape[-1] == hidden."
+   );
+   TORCH_CHECK(
+      w2_stack.size(1) == in_dim,
+      "block_pointwise_pool expects w2_stack.shape[1] == arity * emb."
+   );
+   if(b1_stack.numel() > 0) {
+      TORCH_CHECK(
+         b1_stack.size(1) == hidden,
+         "block_pointwise_pool expects b1_stack.shape[1] == hidden."
+      );
+   }
+   if(b2_stack.numel() > 0) {
+      TORCH_CHECK(
+         b2_stack.size(1) == in_dim,
+         "block_pointwise_pool expects b2_stack.shape[1] == arity * emb."
+      );
+   }
+
+   Tensor relation_args_i64 =
+      dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
+
+   std::vector< int64_t > row_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t n = row_sizes[static_cast< size_t >(i)];
+      TORCH_CHECK(
+         n >= 0,
+         "block_pointwise_pool row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
+      const int64_t start = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      TORCH_CHECK(
+         start >= 0,
+         "block_pointwise_pool expects non-negative slot offsets."
+      );
+      TORCH_CHECK(
+         start + len <= relation_args_i64.size(0),
+         "block_pointwise_pool slice out of bounds at group ",
+         i,
+         ": start=",
+         start,
+         " len=",
+         len,
+         " relation_args_rows=",
+         relation_args_i64.size(0),
+         "."
+      );
+      row_offsets.push_back(row_offsets.back() + n);
+   }
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(x.is_cuda() && relation_args_i64.is_cuda() && w1_stack.is_cuda() && w2_stack.is_cuda()
+      && (b1_stack.numel() == 0 || b1_stack.is_cuda()) && (b2_stack.numel() == 0 || b2_stack.is_cuda())
+      && is_fastpath_dtype(dtype_of(x))) {
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      return block_pointwise_pool_cuda(
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         row_offsets.back(),
+         arity,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         pointwise_code
+      );
+   }
+#endif
+
+   Tensor pooled_cat = x.new_empty({row_offsets.back(), emb});
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t row_start = row_offsets[static_cast< size_t >(i)];
+      const int64_t row_end = row_offsets[static_cast< size_t >(i + 1)];
+      const int64_t n = row_end - row_start;
+      if(n <= 0) {
+         continue;
+      }
+      const int64_t slot = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      Tensor node_idx_i = relation_args_i64.narrow(0, slot, len);
+      Tensor arg_emb_i = x.index_select(0, node_idx_i);
+      Tensor x_i = arg_emb_i.view({n, in_dim});
+      Tensor hidden_i;
+      if(b1_stack.numel() > 0) {
+         hidden_i = at::addmm(b1_stack.select(0, i), x_i, w1_stack.select(0, i).transpose(0, 1));
+      } else {
+         hidden_i = at::mm(x_i, w1_stack.select(0, i).transpose(0, 1));
+      }
+      hidden_i = apply_pointwise_code(hidden_i, pointwise_code);
+      Tensor out_i;
+      if(b2_stack.numel() > 0) {
+         out_i = at::addmm(b2_stack.select(0, i), hidden_i, w2_stack.select(0, i).transpose(0, 1));
+      } else {
+         out_i = at::mm(hidden_i, w2_stack.select(0, i).transpose(0, 1));
+      }
+      Tensor pooled_i =
+         (x_i + out_i).contiguous().view({n, arity, emb}).mean(1);
+      pooled_cat.narrow(0, row_start, n).copy_(pooled_i);
+   }
+   return pooled_cat;
 }
 
 std::tuple< Tensor, Tensor > program_silu_pair(
@@ -1701,6 +1904,123 @@ block_pointwise_backward(
    TORCH_CHECK(
       false,
       "block_pointwise_backward currently supports only CUDA float32/float64 tensors."
+   );
+}
+
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
+block_pointwise_pool_backward(
+   const Tensor& grad_pooled,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const std::vector< int64_t >& slot_offsets,
+   const std::vector< int64_t >& row_sizes,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+)
+{
+   check_rank(grad_pooled, 2, "grad_pooled");
+   check_rank(x, 2, "x");
+   check_int32_or_int64_index(relation_args, "relation_args");
+   TORCH_CHECK(
+      x.device() == relation_args.device() && grad_pooled.device() == x.device(),
+      "block_pointwise_pool_backward expects grad_pooled, x, and relation_args on the same device."
+   );
+   TORCH_CHECK(
+      slot_offsets.size() == row_sizes.size(),
+      "block_pointwise_pool_backward expects slot_offsets and row_sizes with equal lengths."
+   );
+   TORCH_CHECK(arity > 0, "block_pointwise_pool_backward expects arity > 0.");
+   check_rank(w1_stack, 3, "w1_stack");
+   check_rank(w2_stack, 3, "w2_stack");
+
+   const int64_t groups = static_cast< int64_t >(slot_offsets.size());
+   const int64_t emb = x.size(1);
+   const int64_t in_dim = emb * arity;
+   TORCH_CHECK(
+      grad_pooled.size(1) == emb,
+      "block_pointwise_pool_backward expects grad_pooled.shape[1] == emb."
+   );
+   TORCH_CHECK(
+      w1_stack.size(0) == groups && w2_stack.size(0) == groups,
+      "block_pointwise_pool_backward weight stacks must match group count."
+   );
+   TORCH_CHECK(
+      w1_stack.size(2) == in_dim && w2_stack.size(1) == in_dim,
+      "block_pointwise_pool_backward weight stack dims do not match arity * emb."
+   );
+
+   std::vector< int64_t > row_offsets;
+   row_offsets.reserve(static_cast< size_t >(groups + 1));
+   row_offsets.push_back(0);
+   for(int64_t i = 0; i < groups; ++i) {
+      const int64_t n = row_sizes[static_cast< size_t >(i)];
+      TORCH_CHECK(
+         n >= 0,
+         "block_pointwise_pool_backward row_sizes must be >= 0 at group ",
+         i,
+         "."
+      );
+      const int64_t start = slot_offsets[static_cast< size_t >(i)];
+      const int64_t len = n * arity;
+      TORCH_CHECK(
+         start >= 0,
+         "block_pointwise_pool_backward expects non-negative slot offsets."
+      );
+      TORCH_CHECK(
+         start + len <= relation_args.size(0),
+         "block_pointwise_pool_backward slice out of bounds at group ",
+         i,
+         "."
+      );
+      row_offsets.push_back(row_offsets.back() + n);
+   }
+   TORCH_CHECK(
+      grad_pooled.size(0) == row_offsets.back(),
+      "block_pointwise_pool_backward expects grad_pooled rows to match packed row count."
+   );
+
+#if defined(RELM_MP_HAS_CUDA) && RELM_MP_HAS_CUDA
+   if(grad_pooled.is_cuda() && x.is_cuda() && relation_args.is_cuda() && w1_stack.is_cuda()
+      && w2_stack.is_cuda() && (b1_stack.numel() == 0 || b1_stack.is_cuda())
+      && (b2_stack.numel() == 0 || b2_stack.is_cuda()) && is_fastpath_dtype(dtype_of(grad_pooled))) {
+      Tensor relation_args_i64 =
+         dtype_of(relation_args) == at::kLong ? relation_args : relation_args.to(at::kLong);
+      Tensor slot_offsets_t = at::tensor(slot_offsets, relation_args_i64.options().dtype(at::kLong));
+      Tensor row_offsets_t = at::tensor(row_offsets, relation_args_i64.options().dtype(at::kLong));
+      return block_pointwise_pool_backward_cuda(
+         grad_pooled,
+         x,
+         relation_args_i64,
+         slot_offsets_t,
+         row_offsets_t,
+         row_offsets.back(),
+         arity,
+         w1_stack,
+         b1_stack,
+         w2_stack,
+         b2_stack,
+         pointwise_code
+      );
+   }
+#endif
+
+   Tensor grad_rel = grad_pooled.repeat_interleave(arity, 0) / static_cast<double>(arity);
+   return block_pointwise_backward(
+      grad_rel,
+      x,
+      relation_args,
+      slot_offsets,
+      row_sizes,
+      arity,
+      w1_stack,
+      b1_stack,
+      w2_stack,
+      b2_stack,
+      pointwise_code
    );
 }
 
@@ -3479,6 +3799,12 @@ TORCH_LIBRARY(relm_mp, m)
       "block_pointwise_backward(Tensor grad_rel, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
    );
    m.def(
+      "block_pointwise_pool(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> Tensor"
+   );
+   m.def(
+      "block_pointwise_pool_backward(Tensor grad_pooled, Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, int pointwise_code) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+   );
+   m.def(
       "block_postnorm_ln(Tensor x, Tensor relation_args, int[] slot_offsets, int[] row_sizes, int arity, Tensor w1_stack, Tensor b1_stack, Tensor w2_stack, Tensor b2_stack, Tensor ln_weight_stack, Tensor ln_bias_stack, float ln_eps, int pointwise_code) -> (Tensor, Tensor)"
    );
    m.def(
@@ -3532,6 +3858,14 @@ TORCH_LIBRARY_IMPL(relm_mp, CompositeImplicitAutograd, m)
    m.impl(
       "block_pointwise_backward",
       relm::mp::block_pointwise_backward
+   );
+   m.impl(
+      "block_pointwise_pool",
+      relm::mp::block_pointwise_pool
+   );
+   m.impl(
+      "block_pointwise_pool_backward",
+      relm::mp::block_pointwise_pool_backward
    );
    m.impl(
       "block_postnorm_ln",

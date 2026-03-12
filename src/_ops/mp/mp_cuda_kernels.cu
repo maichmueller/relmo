@@ -1346,6 +1346,85 @@ __global__ void block_pointwise_cuda_kernel(
 }
 
 template < typename scalar_t, typename index_t >
+__global__ void block_pointwise_pool_cuda_kernel(
+   const scalar_t* x_ptr,
+   const index_t* relation_args_ptr,
+   const int64_t* slot_offsets_ptr,
+   const int64_t* row_offsets_ptr,
+   int64_t groups,
+   int64_t arity,
+   int64_t emb,
+   const scalar_t* w1_ptr,
+   const scalar_t* b1_ptr,
+   bool has_b1,
+   int64_t hidden,
+   const scalar_t* w2_ptr,
+   const scalar_t* b2_ptr,
+   bool has_b2,
+   int64_t pointwise_code,
+   scalar_t* pooled_ptr
+)
+{
+   const int64_t row = static_cast< int64_t >(blockIdx.x);
+   if(row >= row_offsets_ptr[groups]) {
+      return;
+   }
+
+   int64_t group = 0;
+   while(group + 1 < groups && row >= row_offsets_ptr[group + 1]) {
+      ++group;
+   }
+   const int64_t row_in_group = row - row_offsets_ptr[group];
+   const int64_t slot_base = slot_offsets_ptr[group] + row_in_group * arity;
+   const int64_t in_dim = arity * emb;
+
+   extern __shared__ unsigned char smem_raw[];
+   scalar_t* input = reinterpret_cast< scalar_t* >(smem_raw);
+   scalar_t* hidden_buf = input + in_dim;
+   scalar_t* out_buf = hidden_buf + hidden;
+
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      const int64_t slot = i / emb;
+      const int64_t dim = i - slot * emb;
+      const int64_t node = static_cast< int64_t >(relation_args_ptr[slot_base + slot]);
+      input[i] = x_ptr[node * emb + dim];
+   }
+   __syncthreads();
+
+   const scalar_t* w1_group = w1_ptr + group * hidden * in_dim;
+   const scalar_t* b1_group = has_b1 ? (b1_ptr + group * hidden) : nullptr;
+   for(int64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
+      scalar_t acc = has_b1 ? b1_group[h] : static_cast< scalar_t >(0);
+      const scalar_t* w_row = w1_group + h * in_dim;
+      for(int64_t i = 0; i < in_dim; ++i) {
+         acc += w_row[i] * input[i];
+      }
+      hidden_buf[h] = pointwise_apply_compat(pointwise_code, acc);
+   }
+   __syncthreads();
+
+   const scalar_t* w2_group = w2_ptr + group * in_dim * hidden;
+   const scalar_t* b2_group = has_b2 ? (b2_ptr + group * in_dim) : nullptr;
+   for(int64_t o = threadIdx.x; o < in_dim; o += blockDim.x) {
+      scalar_t acc = has_b2 ? b2_group[o] : static_cast< scalar_t >(0);
+      const scalar_t* w_row = w2_group + o * hidden;
+      for(int64_t h = 0; h < hidden; ++h) {
+         acc += w_row[h] * hidden_buf[h];
+      }
+      out_buf[o] = input[o] + acc;
+   }
+   __syncthreads();
+
+   for(int64_t dim = threadIdx.x; dim < emb; dim += blockDim.x) {
+      scalar_t acc = static_cast< scalar_t >(0);
+      for(int64_t slot = 0; slot < arity; ++slot) {
+         acc += out_buf[slot * emb + dim];
+      }
+      pooled_ptr[row * emb + dim] = acc / static_cast< scalar_t >(arity);
+   }
+}
+
+template < typename scalar_t, typename index_t >
 __global__ void program_silu_pair_cuda_kernel(
    const scalar_t* x_ptr,
    const index_t* relation_args_ptr,
@@ -1501,6 +1580,55 @@ void launch_block_pointwise(
          node_idx.data_ptr< int64_t >()
    );
    check_kernel_launch("block_pointwise_cuda_kernel");
+}
+
+template < typename scalar_t, typename index_t >
+void launch_block_pointwise_pool(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code,
+   Tensor& pooled,
+   cudaStream_t stream
+)
+{
+   const int64_t groups = slot_offsets.size(0);
+   if(total_rows <= 0) {
+      return;
+   }
+   const int64_t emb = x.size(1);
+   const int64_t hidden = w1_stack.size(1);
+   const int64_t in_dim = arity * emb;
+   const size_t shared_bytes =
+      static_cast< size_t >(2 * in_dim + hidden) * sizeof(scalar_t);
+   const dim3 grid(static_cast< unsigned int >(total_rows));
+   block_pointwise_pool_cuda_kernel< scalar_t, index_t >
+      <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
+         x.data_ptr< scalar_t >(),
+         relation_args.data_ptr< index_t >(),
+         slot_offsets.data_ptr< int64_t >(),
+         row_offsets.data_ptr< int64_t >(),
+         groups,
+         arity,
+         emb,
+         w1_stack.data_ptr< scalar_t >(),
+         b1_stack.numel() > 0 ? b1_stack.data_ptr< scalar_t >() : nullptr,
+         b1_stack.numel() > 0,
+         hidden,
+         w2_stack.data_ptr< scalar_t >(),
+         b2_stack.numel() > 0 ? b2_stack.data_ptr< scalar_t >() : nullptr,
+         b2_stack.numel() > 0,
+         pointwise_code,
+         pooled.data_ptr< scalar_t >()
+      );
+   check_kernel_launch("block_pointwise_pool_cuda_kernel");
 }
 
 template < typename scalar_t, typename index_t >
@@ -2978,6 +3106,119 @@ __global__ void block_pointwise_backward_cuda_kernel(
 }
 
 template < typename scalar_t, typename index_t >
+__global__ void block_pointwise_pool_backward_cuda_kernel(
+   const scalar_t* grad_pooled_ptr,
+   const scalar_t* x_ptr,
+   const index_t* relation_args_ptr,
+   const int64_t* slot_offsets_ptr,
+   const int64_t* row_offsets_ptr,
+   int64_t groups,
+   int64_t arity,
+   int64_t emb,
+   const scalar_t* w1_ptr,
+   const scalar_t* b1_ptr,
+   bool has_b1,
+   int64_t hidden,
+   const scalar_t* w2_ptr,
+   const scalar_t* b2_ptr,
+   bool has_b2,
+   int64_t pointwise_code,
+   scalar_t* grad_x_ptr,
+   scalar_t* grad_w1_ptr,
+   scalar_t* grad_b1_ptr,
+   scalar_t* grad_w2_ptr,
+   scalar_t* grad_b2_ptr
+)
+{
+   const int64_t row = static_cast< int64_t >(blockIdx.x);
+   if(row >= row_offsets_ptr[groups]) {
+      return;
+   }
+
+   int64_t group = 0;
+   while(group + 1 < groups && row >= row_offsets_ptr[group + 1]) {
+      ++group;
+   }
+   const int64_t row_in_group = row - row_offsets_ptr[group];
+   const int64_t slot_base = slot_offsets_ptr[group] + row_in_group * arity;
+   const int64_t in_dim = arity * emb;
+
+   extern __shared__ unsigned char smem_raw[];
+   scalar_t* input = reinterpret_cast< scalar_t* >(smem_raw);
+   scalar_t* z1 = input + in_dim;
+   scalar_t* hidden_buf = z1 + hidden;
+   scalar_t* grad_out = hidden_buf + hidden;
+   scalar_t* grad_z1 = grad_out + in_dim;
+
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      const int64_t slot = i / emb;
+      const int64_t dim = i - slot * emb;
+      const int64_t node = static_cast< int64_t >(relation_args_ptr[slot_base + slot]);
+      input[i] = x_ptr[node * emb + dim];
+      grad_out[i] = grad_pooled_ptr[row * emb + dim] / static_cast< scalar_t >(arity);
+   }
+   __syncthreads();
+
+   const scalar_t* w1_group = w1_ptr + group * hidden * in_dim;
+   const scalar_t* b1_group = has_b1 ? (b1_ptr + group * hidden) : nullptr;
+   for(int64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
+      scalar_t acc = has_b1 ? b1_group[h] : static_cast< scalar_t >(0);
+      const scalar_t* w_row = w1_group + h * in_dim;
+      for(int64_t i = 0; i < in_dim; ++i) {
+         acc += w_row[i] * input[i];
+      }
+      z1[h] = acc;
+      hidden_buf[h] = pointwise_apply_compat(pointwise_code, acc);
+   }
+   __syncthreads();
+
+   const scalar_t* w2_group = w2_ptr + group * in_dim * hidden;
+   for(int64_t o = threadIdx.x; o < in_dim; o += blockDim.x) {
+      if(grad_b2_ptr != nullptr) {
+         atomic_add_compat(grad_b2_ptr + group * in_dim + o, grad_out[o]);
+      }
+      const scalar_t go = grad_out[o];
+      for(int64_t h = 0; h < hidden; ++h) {
+         atomic_add_compat(
+            grad_w2_ptr + (group * in_dim + o) * hidden + h,
+            go * hidden_buf[h]
+         );
+      }
+   }
+   __syncthreads();
+
+   for(int64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
+      scalar_t grad_h = static_cast< scalar_t >(0);
+      for(int64_t o = 0; o < in_dim; ++o) {
+         grad_h += w2_group[o * hidden + h] * grad_out[o];
+      }
+      const scalar_t gz1 = grad_h * pointwise_grad_from_pre_activation_compat(pointwise_code, z1[h]);
+      grad_z1[h] = gz1;
+      if(grad_b1_ptr != nullptr) {
+         atomic_add_compat(grad_b1_ptr + group * hidden + h, gz1);
+      }
+      for(int64_t i = 0; i < in_dim; ++i) {
+         atomic_add_compat(
+            grad_w1_ptr + (group * hidden + h) * in_dim + i,
+            gz1 * input[i]
+         );
+      }
+   }
+   __syncthreads();
+
+   for(int64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+      scalar_t grad_input = grad_out[i];
+      for(int64_t h = 0; h < hidden; ++h) {
+         grad_input += w1_group[h * in_dim + i] * grad_z1[h];
+      }
+      const int64_t slot = i / emb;
+      const int64_t dim = i - slot * emb;
+      const int64_t node = static_cast< int64_t >(relation_args_ptr[slot_base + slot]);
+      atomic_add_compat(grad_x_ptr + node * emb + dim, grad_input);
+   }
+}
+
+template < typename scalar_t, typename index_t >
 void launch_block_pointwise_backward(
    const Tensor& grad_rel,
    const Tensor& x,
@@ -3036,6 +3277,65 @@ void launch_block_pointwise_backward(
          grad_b2.numel() > 0 ? grad_b2.data_ptr< scalar_t >() : nullptr
       );
    check_kernel_launch("block_pointwise_backward_cuda_kernel");
+}
+
+template < typename scalar_t, typename index_t >
+void launch_block_pointwise_pool_backward(
+   const Tensor& grad_pooled,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code,
+   Tensor& grad_x,
+   Tensor& grad_w1,
+   Tensor& grad_b1,
+   Tensor& grad_w2,
+   Tensor& grad_b2,
+   cudaStream_t stream
+)
+{
+   const int64_t groups = slot_offsets.size(0);
+   if(total_rows <= 0) {
+      return;
+   }
+   const int64_t emb = x.size(1);
+   const int64_t hidden = w1_stack.size(1);
+   const int64_t in_dim = arity * emb;
+   const size_t shared_bytes =
+      static_cast< size_t >(2 * in_dim + 3 * hidden) * sizeof(scalar_t);
+   const dim3 grid(static_cast< unsigned int >(total_rows));
+   block_pointwise_pool_backward_cuda_kernel< scalar_t, index_t >
+      <<<grid, static_cast< int >(kThreads), shared_bytes, stream>>>(
+         grad_pooled.data_ptr< scalar_t >(),
+         x.data_ptr< scalar_t >(),
+         relation_args.data_ptr< index_t >(),
+         slot_offsets.data_ptr< int64_t >(),
+         row_offsets.data_ptr< int64_t >(),
+         groups,
+         arity,
+         emb,
+         w1_stack.data_ptr< scalar_t >(),
+         b1_stack.numel() > 0 ? b1_stack.data_ptr< scalar_t >() : nullptr,
+         b1_stack.numel() > 0,
+         hidden,
+         w2_stack.data_ptr< scalar_t >(),
+         b2_stack.numel() > 0 ? b2_stack.data_ptr< scalar_t >() : nullptr,
+         b2_stack.numel() > 0,
+         pointwise_code,
+         grad_x.data_ptr< scalar_t >(),
+         grad_w1.data_ptr< scalar_t >(),
+         grad_b1.numel() > 0 ? grad_b1.data_ptr< scalar_t >() : nullptr,
+         grad_w2.data_ptr< scalar_t >(),
+         grad_b2.numel() > 0 ? grad_b2.data_ptr< scalar_t >() : nullptr
+      );
+   check_kernel_launch("block_pointwise_pool_backward_cuda_kernel");
 }
 
 }  // namespace
@@ -3899,6 +4199,132 @@ std::tuple< Tensor, Tensor > block_pointwise_cuda(
       "block_pointwise_cuda"
    );
    return std::make_tuple(rel_cat, node_idx);
+}
+
+Tensor block_pointwise_pool_cuda(
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+)
+{
+   c10::cuda::CUDAGuard device_guard(x.device());
+   check_same_cuda_device(x, relation_args, "x", "relation_args");
+   check_same_cuda_device(x, slot_offsets, "x", "slot_offsets");
+   check_same_cuda_device(x, row_offsets, "x", "row_offsets");
+   check_same_cuda_device(x, w1_stack, "x", "w1_stack");
+   check_same_cuda_device(x, w2_stack, "x", "w2_stack");
+   if(b1_stack.numel() > 0) {
+      check_same_cuda_device(x, b1_stack, "x", "b1_stack");
+   }
+   if(b2_stack.numel() > 0) {
+      check_same_cuda_device(x, b2_stack, "x", "b2_stack");
+   }
+
+   const int64_t emb = x.size(1);
+   Tensor pooled = at::empty({total_rows, emb}, x.options());
+   if(total_rows <= 0) {
+      return pooled;
+   }
+
+   Tensor x_work = ensure_contiguous(x);
+   Tensor relation_args_work = ensure_contiguous(relation_args);
+   Tensor slot_offsets_work = ensure_contiguous(slot_offsets);
+   Tensor row_offsets_work = ensure_contiguous(row_offsets);
+   Tensor w1_work = ensure_contiguous(w1_stack);
+   Tensor b1_work = b1_stack.numel() > 0 ? ensure_contiguous(b1_stack) : b1_stack;
+   Tensor w2_work = ensure_contiguous(w2_stack);
+   Tensor b2_work = b2_stack.numel() > 0 ? ensure_contiguous(b2_stack) : b2_stack;
+   cudaStream_t stream = current_cuda_stream(x_work);
+
+   if(dtype_of(relation_args_work) == at::kInt) {
+      dispatch_float_or_double(
+         x_work,
+         [&]() {
+            launch_block_pointwise_pool< float, int >(
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               total_rows,
+               arity,
+               w1_work,
+               b1_work,
+               w2_work,
+               b2_work,
+               pointwise_code,
+               pooled,
+               stream
+            );
+         },
+         [&]() {
+            launch_block_pointwise_pool< double, int >(
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               total_rows,
+               arity,
+               w1_work,
+               b1_work,
+               w2_work,
+               b2_work,
+               pointwise_code,
+               pooled,
+               stream
+            );
+         },
+         "block_pointwise_pool_cuda"
+      );
+      return pooled;
+   }
+
+   dispatch_float_or_double(
+      x_work,
+      [&]() {
+         launch_block_pointwise_pool< float, int64_t >(
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            total_rows,
+            arity,
+            w1_work,
+            b1_work,
+            w2_work,
+            b2_work,
+            pointwise_code,
+            pooled,
+            stream
+         );
+      },
+      [&]() {
+         launch_block_pointwise_pool< double, int64_t >(
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            total_rows,
+            arity,
+            w1_work,
+            b1_work,
+            w2_work,
+            b2_work,
+            pointwise_code,
+            pooled,
+            stream
+         );
+      },
+      "block_pointwise_pool_cuda"
+   );
+   return pooled;
 }
 
 std::tuple< Tensor, Tensor > program_silu_pair_cuda(
@@ -5333,6 +5759,159 @@ block_pointwise_backward_cuda(
          );
       },
       "block_pointwise_backward_cuda"
+   );
+   return std::make_tuple(grad_x, grad_w1, grad_b1, grad_w2, grad_b2);
+}
+
+std::tuple< Tensor, Tensor, Tensor, Tensor, Tensor >
+block_pointwise_pool_backward_cuda(
+   const Tensor& grad_pooled,
+   const Tensor& x,
+   const Tensor& relation_args,
+   const Tensor& slot_offsets,
+   const Tensor& row_offsets,
+   int64_t total_rows,
+   int64_t arity,
+   const Tensor& w1_stack,
+   const Tensor& b1_stack,
+   const Tensor& w2_stack,
+   const Tensor& b2_stack,
+   int64_t pointwise_code
+)
+{
+   c10::cuda::CUDAGuard device_guard(grad_pooled.device());
+   check_same_cuda_device(grad_pooled, x, "grad_pooled", "x");
+   check_same_cuda_device(grad_pooled, relation_args, "grad_pooled", "relation_args");
+   check_same_cuda_device(grad_pooled, slot_offsets, "grad_pooled", "slot_offsets");
+   check_same_cuda_device(grad_pooled, row_offsets, "grad_pooled", "row_offsets");
+   check_same_cuda_device(grad_pooled, w1_stack, "grad_pooled", "w1_stack");
+   check_same_cuda_device(grad_pooled, w2_stack, "grad_pooled", "w2_stack");
+   if(b1_stack.numel() > 0) {
+      check_same_cuda_device(grad_pooled, b1_stack, "grad_pooled", "b1_stack");
+   }
+   if(b2_stack.numel() > 0) {
+      check_same_cuda_device(grad_pooled, b2_stack, "grad_pooled", "b2_stack");
+   }
+
+   Tensor grad_x = at::zeros_like(x);
+   Tensor grad_w1 = at::zeros_like(w1_stack);
+   Tensor grad_b1 = b1_stack.numel() > 0 ? at::zeros_like(b1_stack) : at::zeros_like(b1_stack);
+   Tensor grad_w2 = at::zeros_like(w2_stack);
+   Tensor grad_b2 = b2_stack.numel() > 0 ? at::zeros_like(b2_stack) : at::zeros_like(b2_stack);
+   if(total_rows <= 0) {
+      return std::make_tuple(grad_x, grad_w1, grad_b1, grad_w2, grad_b2);
+   }
+
+   Tensor grad_pooled_work = ensure_contiguous(grad_pooled);
+   Tensor x_work = ensure_contiguous(x);
+   Tensor relation_args_work = ensure_contiguous(relation_args);
+   Tensor slot_offsets_work = ensure_contiguous(slot_offsets);
+   Tensor row_offsets_work = ensure_contiguous(row_offsets);
+   Tensor w1_work = ensure_contiguous(w1_stack);
+   Tensor b1_work = b1_stack.numel() > 0 ? ensure_contiguous(b1_stack) : b1_stack;
+   Tensor w2_work = ensure_contiguous(w2_stack);
+   Tensor b2_work = b2_stack.numel() > 0 ? ensure_contiguous(b2_stack) : b2_stack;
+   cudaStream_t stream = current_cuda_stream(grad_pooled_work);
+
+   if(dtype_of(relation_args_work) == at::kInt) {
+      dispatch_float_or_double(
+         grad_pooled_work,
+         [&]() {
+            launch_block_pointwise_pool_backward< float, int >(
+               grad_pooled_work,
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               total_rows,
+               arity,
+               w1_work,
+               b1_work,
+               w2_work,
+               b2_work,
+               pointwise_code,
+               grad_x,
+               grad_w1,
+               grad_b1,
+               grad_w2,
+               grad_b2,
+               stream
+            );
+         },
+         [&]() {
+            launch_block_pointwise_pool_backward< double, int >(
+               grad_pooled_work,
+               x_work,
+               relation_args_work,
+               slot_offsets_work,
+               row_offsets_work,
+               total_rows,
+               arity,
+               w1_work,
+               b1_work,
+               w2_work,
+               b2_work,
+               pointwise_code,
+               grad_x,
+               grad_w1,
+               grad_b1,
+               grad_w2,
+               grad_b2,
+               stream
+            );
+         },
+         "block_pointwise_pool_backward_cuda"
+      );
+      return std::make_tuple(grad_x, grad_w1, grad_b1, grad_w2, grad_b2);
+   }
+
+   dispatch_float_or_double(
+      grad_pooled_work,
+      [&]() {
+         launch_block_pointwise_pool_backward< float, int64_t >(
+            grad_pooled_work,
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            total_rows,
+            arity,
+            w1_work,
+            b1_work,
+            w2_work,
+            b2_work,
+            pointwise_code,
+            grad_x,
+            grad_w1,
+            grad_b1,
+            grad_w2,
+            grad_b2,
+            stream
+         );
+      },
+      [&]() {
+         launch_block_pointwise_pool_backward< double, int64_t >(
+            grad_pooled_work,
+            x_work,
+            relation_args_work,
+            slot_offsets_work,
+            row_offsets_work,
+            total_rows,
+            arity,
+            w1_work,
+            b1_work,
+            w2_work,
+            b2_work,
+            pointwise_code,
+            grad_x,
+            grad_w1,
+            grad_b1,
+            grad_w2,
+            grad_b2,
+            stream
+         );
+      },
+      "block_pointwise_pool_backward_cuda"
    );
    return std::make_tuple(grad_x, grad_w1, grad_b1, grad_w2, grad_b2);
 }

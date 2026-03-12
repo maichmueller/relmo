@@ -2804,13 +2804,13 @@ class FlatRelationalLayer(torch.nn.Module):
 
         pointwise_groups: list[KernelBatchPlan] = []
         pointwise_codes: list[int] = []
-        pointwise_row_indices: list[Tensor] = []
         w1_stacks: list[Tensor] = []
         b1_stacks: list[Tensor] = []
         w2_stacks: list[Tensor] = []
         b2_stacks: list[Tensor] = []
         slot_offsets_groups: list[list[int]] = []
         row_sizes_groups: list[list[int]] = []
+        row_starts_groups: list[list[int]] = []
         consumed: set[int] = set()
 
         def _pool_eager_messages(relation_slice: RelationSlice, messages: Tensor) -> None:
@@ -2946,21 +2946,11 @@ class FlatRelationalLayer(torch.nn.Module):
             pointwise_codes.append(int(pointwise_code))
             slot_offsets_groups.append([int(item[0].slot_start) for item in batch_items])
             row_sizes_groups.append([int(item[0].count) for item in batch_items])
-            row_indices_parts: list[Tensor] = []
-            for relation_slice, _ in batch_items:
-                row_start = relation_row_starts[int(relation_slice.relation_index)]
-                row_indices_parts.append(
-                    torch.arange(
-                        row_start,
-                        row_start + int(relation_slice.count),
-                        device=x.device,
-                        dtype=relation_args.dtype,
-                    )
-                )
-            pointwise_row_indices.append(
-                row_indices_parts[0]
-                if len(row_indices_parts) == 1
-                else torch.cat(row_indices_parts, dim=0)
+            row_starts_groups.append(
+                [
+                    int(relation_row_starts[int(relation_slice.relation_index)])
+                    for relation_slice, _ in batch_items
+                ]
             )
             consumed.update(int(idx_i) for idx_i in grouped_batch.relation_indices)
 
@@ -3011,7 +3001,7 @@ class FlatRelationalLayer(torch.nn.Module):
             pointwise_codes=tuple(pointwise_codes),
             slot_offsets_groups=tuple(tuple(values) for values in slot_offsets_groups),
             row_sizes_groups=tuple(tuple(values) for values in row_sizes_groups),
-            row_indices_groups=tuple(pointwise_row_indices),
+            row_starts_groups=tuple(tuple(values) for values in row_starts_groups),
             w1_stacks=tuple(w1_stacks),
             b1_stacks=tuple(b1_stacks),
             w2_stacks=tuple(w2_stacks),

@@ -600,6 +600,34 @@ def _block_pointwise_python(
     return rel_cat, node_idx
 
 
+def _block_pointwise_pool_python(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    pointwise_code: int,
+) -> torch.Tensor:
+    rel_cat, _ = _block_pointwise_python(
+        x,
+        relation_args,
+        slot_offsets,
+        row_sizes,
+        arity,
+        w1_stack,
+        b1_stack,
+        w2_stack,
+        b2_stack,
+        pointwise_code,
+    )
+    row_count = int(sum(int(v) for v in row_sizes))
+    return _pool_block_messages_to_rows(rel_cat, row_count=row_count, arity=int(arity))
+
+
 def _program_silu_pair_python(
     x: torch.Tensor,
     relation_args: torch.Tensor,
@@ -1813,6 +1841,7 @@ if torch is not None:
             pointwise_codes: tuple[int, ...],
             slot_offsets_groups: tuple[tuple[int, ...], ...],
             row_sizes_groups: tuple[tuple[int, ...], ...],
+            row_starts_groups: tuple[tuple[int, ...], ...],
             num_groups: int,
             *tensor_args: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1821,13 +1850,15 @@ if torch is not None:
                 raise ValueError("lgan_build_pointwise_step expects non-negative num_groups.")
             if len(arities) != group_count or len(pointwise_codes) != group_count:
                 raise ValueError("lgan_build_pointwise_step metadata does not match group count.")
-            if len(slot_offsets_groups) != group_count or len(row_sizes_groups) != group_count:
+            if (
+                len(slot_offsets_groups) != group_count
+                or len(row_sizes_groups) != group_count
+                or len(row_starts_groups) != group_count
+            ):
                 raise ValueError("lgan_build_pointwise_step offset metadata does not match group count.")
-            if len(tensor_args) != 5 * group_count:
-                raise ValueError("lgan_build_pointwise_step expects row-index and parameter tensors per group.")
-
-            row_index_groups = tuple(tensor_args[:group_count])
-            param_tensors = tuple(tensor_args[group_count:])
+            if len(tensor_args) != 4 * group_count:
+                raise ValueError("lgan_build_pointwise_step expects four parameter tensors per group.")
+            param_tensors = tuple(tensor_args)
             if len(param_tensors) != 4 * group_count:
                 raise ValueError("lgan_build_pointwise_step expects four parameter tensors per group.")
             w1_groups = tuple(param_tensors[0:group_count])
@@ -1842,19 +1873,19 @@ if torch is not None:
                 and _namespace_has_op("block_pointwise")
             )
             for group_index in range(group_count):
-                row_indices = row_index_groups[group_index]
-                if int(row_indices.numel()) == 0:
+                row_sizes = tuple(int(v) for v in row_sizes_groups[group_index])
+                if sum(row_sizes) <= 0:
                     continue
                 w1_stack = w1_groups[group_index]
                 b1_stack = b1_groups[group_index]
                 w2_stack = w2_groups[group_index]
                 b2_stack = b2_groups[group_index]
-                if use_custom_block:
-                    rel_cat, _ = _ops_namespace().block_pointwise(
+                if use_custom_block and _should_use_custom("block_pointwise_pool") and _namespace_has_op("block_pointwise_pool"):
+                    pooled = _ops_namespace().block_pointwise_pool(
                         x,
                         relation_args,
                         list(slot_offsets_groups[group_index]),
-                        list(row_sizes_groups[group_index]),
+                        list(row_sizes),
                         int(arities[group_index]),
                         w1_stack,
                         b1_stack,
@@ -1863,11 +1894,11 @@ if torch is not None:
                         int(pointwise_codes[group_index]),
                     )
                 else:
-                    rel_cat, _ = _block_pointwise_python(
+                    pooled = _block_pointwise_pool_python(
                         x,
                         relation_args,
                         list(slot_offsets_groups[group_index]),
-                        list(row_sizes_groups[group_index]),
+                        list(row_sizes),
                         int(arities[group_index]),
                         w1_stack,
                         b1_stack,
@@ -1875,12 +1906,19 @@ if torch is not None:
                         b2_stack,
                         int(pointwise_codes[group_index]),
                     )
-                pooled = _pool_block_messages_to_rows(
-                    rel_cat,
-                    row_count=int(row_indices.numel()),
-                    arity=int(arities[group_index]),
-                )
-                relation_pair_x.index_copy_(0, row_indices, pooled)
+                pooled_offset = 0
+                for row_start, row_count in zip(
+                    row_starts_groups[group_index],
+                    row_sizes,
+                    strict=True,
+                ):
+                    row_count_i = int(row_count)
+                    if row_count_i <= 0:
+                        continue
+                    relation_pair_x.narrow(0, int(row_start), row_count_i).copy_(
+                        pooled.narrow(0, pooled_offset, row_count_i)
+                    )
+                    pooled_offset += row_count_i
 
             use_custom_graph = (
                 relation_pair_x.is_cuda
@@ -1920,6 +1958,7 @@ if torch is not None:
             ctx.pointwise_codes = tuple(int(v) for v in pointwise_codes)
             ctx.slot_offsets_groups = tuple(tuple(int(v) for v in values) for values in slot_offsets_groups)
             ctx.row_sizes_groups = tuple(tuple(int(v) for v in values) for values in row_sizes_groups)
+            ctx.row_starts_groups = tuple(tuple(int(v) for v in values) for values in row_starts_groups)
             ctx.save_for_backward(
                 x,
                 relation_args,
@@ -1929,7 +1968,6 @@ if torch is not None:
                 tn_ent,
                 nn_rel,
                 nn_ent,
-                *row_index_groups,
                 *param_tensors,
             )
             return relation_pair_x_out, tn_msgs, nn_msgs
@@ -1946,15 +1984,14 @@ if torch is not None:
             x = saved[0]
             relation_args = saved[1]
             rr_src, rr_dst, tn_rel, tn_ent, nn_rel, nn_ent = saved[2:8]
-            row_index_groups = saved[8 : 8 + group_count]
-            param_tensors = saved[8 + group_count :]
+            param_tensors = saved[8:]
             w1_groups = tuple(param_tensors[0:group_count])
             b1_groups = tuple(param_tensors[group_count : 2 * group_count])
             w2_groups = tuple(param_tensors[2 * group_count : 3 * group_count])
             b2_groups = tuple(param_tensors[3 * group_count : 4 * group_count])
 
             if grad_relation_pair_x is None and grad_tn_msgs is None and grad_nn_msgs is None:
-                return (None,) * (16 + 5 * group_count)
+                return (None,) * (17 + 4 * group_count)
 
             needs = ctx.needs_input_grad
             grad_relation_pair_x_req = (
@@ -2030,7 +2067,7 @@ if torch is not None:
                 torch.zeros_like(x) if needs[0] else None
             )
             grad_seed = grad_relation_pair_x_in if needs[2] else None
-            grads: list[torch.Tensor | None] = [None] * (16 + 5 * group_count)
+            grads: list[torch.Tensor | None] = [None] * (17 + 4 * group_count)
             if needs[0]:
                 grads[0] = grad_x_total
             if needs[2]:
@@ -2038,31 +2075,44 @@ if torch is not None:
 
             use_custom_block_backward = (
                 x.is_cuda
-                and _should_use_custom("block_pointwise_backward")
-                and _namespace_has_op("block_pointwise_backward")
+                and _should_use_custom("block_pointwise_pool_backward")
+                and _namespace_has_op("block_pointwise_pool_backward")
             )
-            w1_base = 16 + group_count
+            w1_base = 17
             b1_base = w1_base + group_count
             w2_base = b1_base + group_count
             b2_base = w2_base + group_count
             for group_index in range(group_count):
-                row_indices = row_index_groups[group_index]
-                if int(row_indices.numel()) == 0:
+                row_sizes = tuple(int(v) for v in ctx.row_sizes_groups[group_index])
+                total_rows = int(sum(row_sizes))
+                if total_rows <= 0:
                     continue
                 arity = int(ctx.arities[group_index])
-                grad_pooled = grad_relation_pair_x_in.index_select(0, row_indices)
-                grad_rel = grad_pooled.repeat_interleave(arity, dim=0) / float(arity)
+                grad_pooled = grad_relation_pair_x_in.new_empty((total_rows, int(x.size(-1))))
+                pooled_offset = 0
+                for row_start, row_count in zip(
+                    ctx.row_starts_groups[group_index],
+                    row_sizes,
+                    strict=True,
+                ):
+                    row_count_i = int(row_count)
+                    if row_count_i <= 0:
+                        continue
+                    grad_pooled.narrow(0, pooled_offset, row_count_i).copy_(
+                        grad_relation_pair_x_in.narrow(0, int(row_start), row_count_i)
+                    )
+                    pooled_offset += row_count_i
                 w1_stack = w1_groups[group_index]
                 b1_stack = b1_groups[group_index]
                 w2_stack = w2_groups[group_index]
                 b2_stack = b2_groups[group_index]
-                if use_custom_block_backward:
-                    grad_x_i, grad_w1, grad_b1, grad_w2, grad_b2 = _ops_namespace().block_pointwise_backward(
-                        grad_rel,
+                if use_custom_block_backward and _should_use_custom("block_pointwise_pool_backward") and _namespace_has_op("block_pointwise_pool_backward"):
+                    grad_x_i, grad_w1, grad_b1, grad_w2, grad_b2 = _ops_namespace().block_pointwise_pool_backward(
+                        grad_pooled,
                         x,
                         relation_args,
                         list(ctx.slot_offsets_groups[group_index]),
-                        list(ctx.row_sizes_groups[group_index]),
+                        list(row_sizes),
                         arity,
                         w1_stack,
                         b1_stack,
@@ -2077,11 +2127,11 @@ if torch is not None:
                         b1_req = b1_stack.detach().requires_grad_(bool(needs[b1_base + group_index] and b1_stack.numel() > 0))
                         w2_req = w2_stack.detach().requires_grad_(bool(needs[w2_base + group_index]))
                         b2_req = b2_stack.detach().requires_grad_(bool(needs[b2_base + group_index] and b2_stack.numel() > 0))
-                        rel_cat, _ = _block_pointwise_python(
+                        pooled_ref = _block_pointwise_pool_python(
                             x_req,
                             relation_args,
                             list(ctx.slot_offsets_groups[group_index]),
-                            list(ctx.row_sizes_groups[group_index]),
+                            list(row_sizes),
                             arity,
                             w1_req,
                             b1_req,
@@ -2090,9 +2140,9 @@ if torch is not None:
                             int(ctx.pointwise_codes[group_index]),
                         )
                         grads_tuple = torch.autograd.grad(
-                            (rel_cat,),
+                            (pooled_ref,),
                             (x_req, w1_req, b1_req, w2_req, b2_req),
-                            grad_outputs=(grad_rel,),
+                            grad_outputs=(grad_pooled,),
                             allow_unused=True,
                         )
                         grad_x_i, grad_w1, grad_b1, grad_w2, grad_b2 = grads_tuple
@@ -3536,6 +3586,62 @@ def block_pointwise(
     )
 
 
+def block_pointwise_pool(
+    x: torch.Tensor,
+    relation_args: torch.Tensor,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    w1_stack: torch.Tensor,
+    b1_stack: torch.Tensor,
+    w2_stack: torch.Tensor,
+    b2_stack: torch.Tensor,
+    pointwise_code: int,
+) -> torch.Tensor:
+    """Run a 2-layer pointwise block and return pooled relation-row outputs.
+
+    Computes the same residual tuple messages as :func:`block_pointwise`, but
+    averages over tuple slots immediately and returns one row per relation
+    instance in grouped row order.
+    """
+    if torch is None:
+        raise ModuleNotFoundError("block_pointwise_pool requires torch.") from _TORCH_IMPORT_ERROR
+    use_custom = (
+        x.is_cuda
+        and _should_use_custom("block_pointwise_pool")
+        and _namespace_has_op("block_pointwise_pool")
+    )
+    if use_custom:
+        return _ops_namespace().block_pointwise_pool(
+            x,
+            relation_args,
+            list(slot_offsets),
+            list(row_sizes),
+            int(arity),
+            w1_stack,
+            b1_stack,
+            w2_stack,
+            b2_stack,
+            int(pointwise_code),
+        )
+    if _fallback_mode() == "error":
+        raise RuntimeError(
+            "Custom mp op block_pointwise_pool is unavailable in the loaded relm_mp library."
+        )
+    return _block_pointwise_pool_python(
+        x,
+        relation_args,
+        list(slot_offsets),
+        list(row_sizes),
+        int(arity),
+        w1_stack,
+        b1_stack,
+        w2_stack,
+        b2_stack,
+        int(pointwise_code),
+    )
+
+
 def block_postnorm_ln(
     x: torch.Tensor,
     relation_args: torch.Tensor,
@@ -3746,7 +3852,7 @@ def _lgan_build_pointwise_step(
     pointwise_codes: tuple[int, ...] | list[int],
     slot_offsets_groups: tuple[tuple[int, ...], ...] | list[list[int]],
     row_sizes_groups: tuple[tuple[int, ...], ...] | list[list[int]],
-    row_indices_groups: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    row_starts_groups: tuple[tuple[int, ...], ...] | list[list[int]],
     w1_stacks: tuple[torch.Tensor, ...] | list[torch.Tensor],
     b1_stacks: tuple[torch.Tensor, ...] | list[torch.Tensor],
     w2_stacks: tuple[torch.Tensor, ...] | list[torch.Tensor],
@@ -3772,7 +3878,7 @@ def _lgan_build_pointwise_step(
         len(tuple(pointwise_codes))
         == len(tuple(slot_offsets_groups))
         == len(tuple(row_sizes_groups))
-        == len(tuple(row_indices_groups))
+        == len(tuple(row_starts_groups))
         == len(tuple(w1_stacks))
         == len(tuple(b1_stacks))
         == len(tuple(w2_stacks))
@@ -3796,8 +3902,8 @@ def _lgan_build_pointwise_step(
         tuple(int(v) for v in pointwise_codes),
         tuple(tuple(int(x) for x in values) for values in slot_offsets_groups),
         tuple(tuple(int(x) for x in values) for values in row_sizes_groups),
+        tuple(tuple(int(x) for x in values) for values in row_starts_groups),
         int(group_count),
-        *tuple(row_indices_groups),
         *tuple(w1_stacks),
         *tuple(b1_stacks),
         *tuple(w2_stacks),
