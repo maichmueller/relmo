@@ -24,7 +24,7 @@ from typing import Any, Callable
 import torch
 from torch_geometric.data import Data
 
-from relm.models import ArityMLPFactory, FlatExecutionPolicy, FlatRelationalGNN
+from relmo.models import ArityMLPFactory, FlatExecutionPolicy, FlatRelationalGNN
 
 
 @dataclass(frozen=True)
@@ -249,7 +249,7 @@ def _select_relm_parity_relations(
                     "pymimir_relation": pymimir_name,
                     "canonical_name": canonical,
                     "expected_arity": int(pymimir_arity),
-                    "reason": "no matching relm canonical name",
+                    "reason": "no matching relmo canonical name",
                 }
             )
             continue
@@ -286,7 +286,7 @@ def _select_relm_parity_relations(
                     "pymimir_relation": pymimir_name,
                     "canonical_name": canonical,
                     "expected_arity": int(pymimir_arity),
-                    "reason": "no unused relm relation with matching arity",
+                    "reason": "no unused relmo relation with matching arity",
                 }
             )
             continue
@@ -990,10 +990,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--domain-case", default="blocks")
     parser.add_argument("--problem-case", default="probBLOCKS-4-0")
     parser.add_argument("--max-states", type=int, default=16)
-    parser.add_argument("--relm-relation-kernels", choices=("auto", "off"), default="auto")
-    parser.add_argument("--relm-program-kernels", choices=("auto", "off"), default="auto")
-    parser.add_argument("--relm-relation-gather", choices=("auto", "off", "on"), default="auto")
-    parser.add_argument("--relm-mlp-layers", type=int, default=1)
+    parser.add_argument(
+        "--relmo-relation-kernels",
+        dest="relmo_relation_kernels",
+        choices=("auto", "off"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--relmo-program-kernels",
+        dest="relmo_program_kernels",
+        choices=("auto", "off"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--relmo-relation-gather",
+        dest="relmo_relation_gather",
+        choices=("auto", "off", "on"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--relmo-mlp-layers",
+        dest="relmo_mlp_layers",
+        type=int,
+        default=1,
+    )
     parser.add_argument(
         "--encoder-mode",
         choices=("native", "shared_pymimir"),
@@ -1007,13 +1027,13 @@ def _parse_args() -> argparse.Namespace:
         "--strict-parity",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="When enabled, restrict relm to pymimir relation set and matching per-relation arities.",
+        help="When enabled, restrict relmo to pymimir relation set and matching per-relation arities.",
     )
     parser.add_argument(
         "--include-goal",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Include goal encoding in pymimir inputs (relm encodes goal by default).",
+        help="Include goal encoding in pymimir inputs (relmo encodes goal by default).",
     )
     parser.add_argument("--pymimir-normalize-updates", action="store_true")
     parser.add_argument("--tf32-high-precision", action="store_true")
@@ -1204,13 +1224,13 @@ def main() -> int:
     relation_factory = ArityMLPFactory(
         feature_size=int(args.embedding_size),
         residual=False,
-        layers=int(args.relm_mlp_layers),
+        layers=int(args.relmo_mlp_layers),
         activation="mish",
     )
     execution_policy = FlatExecutionPolicy(
-        relation_kernels=args.relm_relation_kernels,
-        program_kernels=args.relm_program_kernels,
-        relation_gather=args.relm_relation_gather,
+        relation_kernels=args.relmo_relation_kernels,
+        program_kernels=args.relmo_program_kernels,
+        relation_gather=args.relmo_relation_gather,
     )
     relm_eager = FlatRelationalGNN(
         embedding_size=int(args.embedding_size),
@@ -1300,7 +1320,7 @@ def main() -> int:
             )
         else:
             if relm_encoder is None:
-                raise RuntimeError("Native relm encoder is not initialized.")
+                raise RuntimeError("Native relmo encoder is not initialized.")
             native_batch = relm_encoder.encode_batch(states=states, goals=relm_goals).to(device)
             payload = _build_flat_relm_inputs_from_flat_data(
                 data=native_batch,
@@ -1330,7 +1350,7 @@ def main() -> int:
             )
         else:
             if relm_encoder is None:
-                raise RuntimeError("Native relm encoder is not initialized.")
+                raise RuntimeError("Native relmo encoder is not initialized.")
             native_batch = relm_encoder.encode_batch(states=states, goals=relm_goals).to(device)
             payload = _build_flat_relm_inputs_from_flat_data(
                 data=native_batch,
@@ -1426,7 +1446,7 @@ def main() -> int:
     total_nodes = int(relm_flat_payload["x"].size(0))
     total_relation_slots = int(relm_flat_payload["relation_args"].numel())
     total_relation_instances = int(relm_flat_payload["relation_counts"].sum().item())
-    relm_msg_params = int(
+    relmo_msg_params = int(
         sum(
             p.numel()
             for name, p in relm_eager.named_parameters()
@@ -1454,10 +1474,10 @@ def main() -> int:
             "encoder_mode": str(args.encoder_mode),
             "strict_parity": bool(args.strict_parity),
             "include_goal": bool(args.include_goal),
-            "relm_mlp_layers": int(args.relm_mlp_layers),
-            "relm_relation_kernels": args.relm_relation_kernels,
-            "relm_program_kernels": args.relm_program_kernels,
-            "relm_relation_gather": args.relm_relation_gather,
+            "relmo_mlp_layers": int(args.relmo_mlp_layers),
+            "relmo_relation_kernels": args.relmo_relation_kernels,
+            "relmo_program_kernels": args.relmo_program_kernels,
+            "relmo_relation_gather": args.relmo_relation_gather,
             "warmup": int(args.warmup),
             "rounds": int(args.rounds),
             "pymimir_normalize_updates": bool(args.pymimir_normalize_updates),
@@ -1477,19 +1497,19 @@ def main() -> int:
         },
         "parity": {
             **parity_meta,
-            "relm_msg_params": relm_msg_params,
+            "relmo_msg_params": relmo_msg_params,
             "pymimir_msg_params": pymimir_msg_params,
-            "relm_msg_param_ratio": (
-                float(relm_msg_params) / float(pymimir_msg_params)
+            "relmo_msg_param_ratio": (
+                float(relmo_msg_params) / float(pymimir_msg_params)
                 if pymimir_msg_params > 0
                 else None
             ),
-            "selected_relm_relations": sorted(relation_dict.keys()),
+            "selected_relmo_relations": sorted(relation_dict.keys()),
             "pymimir_relation_arities": {
                 str(k): int(v) for k, v in sorted(pymimir_relation_arities.items())
             },
             "relation_linear_shapes": {
-                "relm": relm_linear_shapes,
+                "relmo": relm_linear_shapes,
                 "pymimir": pymimir_linear_shapes,
             },
             "relation_linear_shape_comparison": {
@@ -1498,7 +1518,7 @@ def main() -> int:
                 "mismatches": linear_shape_mismatches,
             },
             "relation_instance_counts": {
-                "relm": relm_relation_counts,
+                "relmo": relm_relation_counts,
                 "pymimir": pymimir_relation_counts,
             },
             "relation_instance_count_comparison": {

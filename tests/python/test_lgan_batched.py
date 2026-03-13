@@ -1,6 +1,6 @@
 import torch
 
-from relm.models import LGANRelationalGNN
+from relmo.models import LGANRelationalGNN
 
 
 def test_lgan_batched_cached_label_fanin_smoke() -> None:

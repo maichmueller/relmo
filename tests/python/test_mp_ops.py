@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from relm.ops import mp
+from relmo.ops import mp
 
 
 def _fanout_ref(

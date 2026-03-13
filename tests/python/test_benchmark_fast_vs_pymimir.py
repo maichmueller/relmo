@@ -77,13 +77,13 @@ def _mapped_count_comparison_for_state(state) -> tuple[list[dict[str, object]], 
         embedding_size=8,
     )
 
-    selected_relm_relations, selection_meta = _select_relm_parity_relations(
+    selected_relmo_relations, selection_meta = _select_relm_parity_relations(
         relm_relation_dict=relm_relation_dict,
         pymimir_relation_arities=pymimir_arities,
     )
     relm_payload = _build_flat_relm_inputs_from_flat_data(
         data=relm_data,
-        keep_relations=selected_relm_relations.keys(),
+        keep_relations=selected_relmo_relations.keys(),
     )
     relm_counts = _build_flat_relation_instance_counts(flat_payload=relm_payload)
 

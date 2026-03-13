@@ -7,15 +7,15 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "relm"
+name = "relmo"
 version = "0.1.0"
 description = "Relational model ops with C++/CUDA custom kernels and Python fallbacks"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "relm contributors" }]
+authors = [{ name = "relmo contributors" }]
 dependencies = [
-  "torch>=2.10",
+  "torch>=2.8",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +31,7 @@ bench = [
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
-wheel.packages = ["src/relm"]
+wheel.packages = ["src/relmo"]
 build-dir = "build/{wheel_tag}"
 
 [tool.scikit-build.cmake]

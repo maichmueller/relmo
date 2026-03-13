@@ -11,7 +11,7 @@ import torch
 
 import mifrost  # type: ignore
 
-from relm.models import (
+from relmo.models import (
     FlatExecutionPolicy,
     FlatLGANRelationalGNN,
     PostNormTwoLayerPointwiseRelationMLP,

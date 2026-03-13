@@ -29,7 +29,7 @@ class RelationBlockSpec:
             ``("pointwise", torch.nn.Module)``
             ``("norm", torch.nn.Module)``
         signature:
-            Optional explicit grouping key. If omitted, relm derives one from
+            Optional explicit grouping key. If omitted, relmo derives one from
             the ordered op structure.
     """
 
@@ -41,7 +41,7 @@ class RelationBlockSpec:
 class RelationBlockCompatible(Protocol):
     """Optional protocol for modules that want kernel-family matching."""
 
-    def relm_kernel_spec(self) -> RelationBlockSpec | dict[str, Any] | None: ...
+    def relmo_kernel_spec(self) -> RelationBlockSpec | dict[str, Any] | None: ...
 
 
 __all__ = [

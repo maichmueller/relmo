@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch_geometric.nn import SumAggregation
 
-import relm.models.hetero_mp.batched as batched_impl
-import relm.models.hetero_mp._scatter as scatter_impl
-from relm.models.hetero_mp import (
+import relmo.models.hetero_mp.batched as batched_impl
+import relmo.models.hetero_mp._scatter as scatter_impl
+from relmo.models.hetero_mp import (
     BatchedFanInMP,
     BatchedFanOutMP,
     FanInMP,

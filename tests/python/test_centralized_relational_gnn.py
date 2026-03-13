@@ -3,16 +3,16 @@ from __future__ import annotations
 import pytest
 import torch
 
-from relm.models import ArityMLPFactory, CentralizedRelationalGNN
-from relm.models.film import CentralFiLMFactory, FiLMConcatMLP, FiLMConcatResMLP
-from relm.models.hetero_mp import CentralFanOutMP
-from relm.ops import mp as mp_ops
-from relm.models.relational_gnn import (
+from relmo.models import ArityMLPFactory, CentralizedRelationalGNN
+from relmo.models.film import CentralFiLMFactory, FiLMConcatMLP, FiLMConcatResMLP
+from relmo.models.hetero_mp import CentralFanOutMP
+from relmo.ops import mp as mp_ops
+from relmo.models.relational_gnn import (
     BoundedValueHead,
     CentralRelationModule,
     ZeroOut,
 )
-from relm.models.residual import ResidualModule
+from relmo.models.residual import ResidualModule
 
 from ._graph_fixtures import build_relation_graph, clone_graph
 

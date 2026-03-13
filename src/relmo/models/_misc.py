@@ -1,4 +1,4 @@
-"""Misc helpers for relm models."""
+"""Misc helpers for relmo models."""
 
 from __future__ import annotations
 

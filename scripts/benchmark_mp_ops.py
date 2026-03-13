@@ -195,7 +195,7 @@ def _import_mp(import_mode: str) -> Any:
     elif import_mode != "installed":
         raise ValueError(f"Unsupported import mode: {import_mode!r}")
 
-    from relm.ops import mp
+    from relmo.ops import mp
 
     return mp
 
@@ -561,7 +561,7 @@ def main() -> None:
         "--import-mode",
         choices=("installed", "source"),
         default="installed",
-        help="How to resolve relm import path.",
+        help="How to resolve relmo import path.",
     )
     parser.add_argument(
         "--device",
@@ -669,7 +669,7 @@ def main() -> None:
     timer_backend = _resolve_timer_backend(args.timer, device)
 
     print(
-        f"Benchmarking relm mp on device={device}, dtype={dtype}, "
+        f"Benchmarking relmo mp on device={device}, dtype={dtype}, "
         f"torch={torch.__version__}, custom_available={custom_available}, "
         f"timer_backend={timer_backend}"
     )

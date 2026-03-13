@@ -1,0 +1,337 @@
+name: Wheels
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/wheels.yml"
+      - "pyproject.toml"
+      - "CMakeLists.txt"
+      - "src/**"
+      - "tests/python/test_mp_ops.py"
+      - "scripts/ci/**"
+      - "docs/WHEEL_CI_STRATEGY.md"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      pr_cpu: ${{ steps.pr_cpu.outputs.matrix }}
+      release_cpu: ${{ steps.release_cpu.outputs.matrix }}
+      release_cuda: ${{ steps.release_cuda.outputs.matrix }}
+      release_cpu_pages: ${{ steps.release_cpu_pages.outputs.matrix }}
+      release_cuda_pages: ${{ steps.release_cuda_pages.outputs.matrix }}
+      pr_cpu_compat: ${{ steps.pr_cpu_compat.outputs.matrix }}
+      release_cpu_compat: ${{ steps.release_cpu_compat.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: pr_cpu
+        run: echo "matrix=$(python scripts/ci/wheel_matrix.py --group pr-cpu)" >> "$GITHUB_OUTPUT"
+      - id: release_cpu
+        run: echo "matrix=$(python scripts/ci/wheel_matrix.py --group release-cpu)" >> "$GITHUB_OUTPUT"
+      - id: release_cuda
+        run: echo "matrix=$(python scripts/ci/wheel_matrix.py --group release-cuda)" >> "$GITHUB_OUTPUT"
+      - id: release_cpu_pages
+        run: echo "matrix=$(python scripts/ci/wheel_matrix.py --group release-cpu-pages)" >> "$GITHUB_OUTPUT"
+      - id: release_cuda_pages
+        run: echo "matrix=$(python scripts/ci/wheel_matrix.py --group release-cuda-pages)" >> "$GITHUB_OUTPUT"
+      - id: pr_cpu_compat
+        run: echo "matrix=$(python scripts/ci/wheel_matrix.py --group pr-cpu-compat)" >> "$GITHUB_OUTPUT"
+      - id: release_cpu_compat
+        run: echo "matrix=$(python scripts/ci/wheel_matrix.py --group release-cpu-compat)" >> "$GITHUB_OUTPUT"
+
+  pure_release:
+    name: Pure wheel
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      RELM_TORCH_VERSION: "2.8.0"
+      RELM_TORCH_CHANNEL: "cpu"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and pure wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --sdist --wheel --outdir dist -Cwheel.cmake=false
+      - name: Smoke test fallback wheel
+        run: |
+          python scripts/ci/install_torch.py
+          python -m pip install dist/*.whl
+          RELM_EXPECT_CUSTOM_OPS=0 python scripts/ci/smoke_wheel.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-pure
+          path: dist/*
+
+  cpu_native_pr:
+    name: ${{ matrix.name }}
+    if: github.event_name == 'pull_request'
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.pr_cpu) }}
+    env:
+      RELM_EXPECT_CUSTOM_OPS: "1"
+      RELM_TORCH_VERSION: ${{ matrix.torch_version }}
+      RELM_TORCH_CHANNEL: ${{ matrix.torch_channel }}
+      RELM_WHEEL_LOCAL_VERSION: ${{ matrix.local_version }}
+      CIBW_ARCHS: ${{ matrix.cibw_archs }}
+      CIBW_BUILD: ${{ matrix.cibw_build }}
+      CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+      CIBW_SKIP: "pp* *-musllinux_* *-win32"
+      CIBW_BEFORE_BUILD: "python {project}/scripts/ci/set_local_version.py && python {project}/scripts/ci/install_torch.py"
+      CIBW_BEFORE_TEST: "python {project}/scripts/ci/install_torch.py"
+      CIBW_TEST_COMMAND: "python {project}/scripts/ci/smoke_wheel.py"
+      CIBW_CONFIG_SETTINGS: "cmake.define.RELM_RPATH_MODE=wheel cmake.define.RELM_MP_OPS=ON"
+      CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
+      CIBW_REPAIR_WHEEL_COMMAND_LINUX: ""
+      CIBW_REPAIR_WHEEL_COMMAND_MACOS: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pypa/cibuildwheel@v3.3.0
+        with:
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheelhouse-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
+  compat_cpu_pr:
+    name: ${{ matrix.name }}
+    if: github.event_name == 'pull_request'
+    needs:
+      - plan
+      - cpu_native_pr
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.pr_cpu_compat) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+      - name: Create test environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip pytest
+      - name: Install torch runtime under test
+        env:
+          RELM_TORCH_VERSION: ${{ matrix.torch_version }}
+          RELM_TORCH_CHANNEL: ${{ matrix.torch_channel }}
+        run: .venv/bin/python scripts/ci/install_torch.py
+      - name: Install built wheel
+        run: .venv/bin/python -m pip install --no-deps wheelhouse/relmo-*.whl
+      - name: Smoke test wheel
+        env:
+          RELM_EXPECT_CUSTOM_OPS: "1"
+          RELM_MP_TORCH_VERSION_POLICY: "forward"
+        run: .venv/bin/python scripts/ci/smoke_wheel.py
+      - name: Run operator test suite
+        env:
+          RELM_MP_TORCH_VERSION_POLICY: "forward"
+        run: .venv/bin/python -m pytest tests/python/test_mp_ops.py -q -p no:cacheprovider
+
+  cpu_native_release:
+    name: ${{ matrix.name }}
+    if: github.event_name != 'pull_request'
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.release_cpu) }}
+    env:
+      RELM_EXPECT_CUSTOM_OPS: "1"
+      RELM_TORCH_VERSION: ${{ matrix.torch_version }}
+      RELM_TORCH_CHANNEL: ${{ matrix.torch_channel }}
+      RELM_WHEEL_LOCAL_VERSION: ${{ matrix.local_version }}
+      CIBW_ARCHS: ${{ matrix.cibw_archs }}
+      CIBW_BUILD: ${{ matrix.cibw_build }}
+      CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+      CIBW_SKIP: "pp* *-musllinux_* *-win32"
+      CIBW_BEFORE_BUILD: "python {project}/scripts/ci/set_local_version.py && python {project}/scripts/ci/install_torch.py"
+      CIBW_BEFORE_TEST: "python {project}/scripts/ci/install_torch.py"
+      CIBW_TEST_COMMAND: "python {project}/scripts/ci/smoke_wheel.py"
+      CIBW_CONFIG_SETTINGS: "cmake.define.RELM_RPATH_MODE=wheel cmake.define.RELM_MP_OPS=ON"
+      CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
+      CIBW_REPAIR_WHEEL_COMMAND_LINUX: ""
+      CIBW_REPAIR_WHEEL_COMMAND_MACOS: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pypa/cibuildwheel@v3.3.0
+        with:
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheelhouse-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
+  compat_cpu_release:
+    name: ${{ matrix.name }}
+    if: github.event_name != 'pull_request'
+    needs:
+      - plan
+      - cpu_native_release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.release_cpu_compat) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+      - name: Create test environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip pytest
+      - name: Install torch runtime under test
+        env:
+          RELM_TORCH_VERSION: ${{ matrix.torch_version }}
+          RELM_TORCH_CHANNEL: ${{ matrix.torch_channel }}
+        run: .venv/bin/python scripts/ci/install_torch.py
+      - name: Install built wheel
+        run: .venv/bin/python -m pip install --no-deps wheelhouse/relmo-*.whl
+      - name: Smoke test wheel
+        env:
+          RELM_EXPECT_CUSTOM_OPS: "1"
+          RELM_MP_TORCH_VERSION_POLICY: "forward"
+        run: .venv/bin/python scripts/ci/smoke_wheel.py
+      - name: Run operator test suite
+        env:
+          RELM_MP_TORCH_VERSION_POLICY: "forward"
+        run: .venv/bin/python -m pytest tests/python/test_mp_ops.py -q -p no:cacheprovider
+
+  cuda_native_release:
+    name: ${{ matrix.name }}
+    if: github.event_name != 'pull_request'
+    needs: plan
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.release_cuda) }}
+    env:
+      RELM_EXPECT_CUSTOM_OPS: "1"
+      RELM_TORCH_VERSION: ${{ matrix.torch_version }}
+      RELM_TORCH_CHANNEL: ${{ matrix.torch_channel }}
+      RELM_WHEEL_LOCAL_VERSION: ${{ matrix.local_version }}
+      CIBW_ARCHS: ${{ matrix.cibw_archs }}
+      CIBW_BUILD: ${{ matrix.cibw_build }}
+      CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+      CIBW_SKIP: "pp* *-musllinux_* *-win32"
+      CIBW_BEFORE_BUILD: "python {project}/scripts/ci/set_local_version.py && python {project}/scripts/ci/install_torch.py"
+      CIBW_BEFORE_TEST: "python {project}/scripts/ci/install_torch.py"
+      CIBW_TEST_COMMAND: "python {project}/scripts/ci/smoke_wheel.py"
+      CIBW_CONFIG_SETTINGS: "cmake.define.RELM_RPATH_MODE=wheel cmake.define.RELM_MP_OPS=ON"
+      CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.manylinux_image }}
+      CIBW_REPAIR_WHEEL_COMMAND_LINUX: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pypa/cibuildwheel@v3.3.0
+        with:
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheelhouse-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
+  find_links_cpu_release:
+    name: ${{ matrix.name }} index
+    if: github.event_name != 'pull_request'
+    needs:
+      - plan
+      - cpu_native_release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.release_cpu_pages) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheelhouse-*
+          merge-multiple: true
+          path: wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build find-links page
+        run: |
+          python scripts/ci/build_find_links.py \
+            --wheel-dir wheelhouse \
+            --project relmo \
+            --local-version "${{ matrix.local_version }}" \
+            --output "find-links/${{ matrix.find_links_page }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: find-links-${{ matrix.name }}
+          path: find-links/*.html
+
+  find_links_cuda_release:
+    name: ${{ matrix.name }} index
+    if: github.event_name != 'pull_request'
+    needs:
+      - plan
+      - cuda_native_release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.release_cuda_pages) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheelhouse-*
+          merge-multiple: true
+          path: wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build find-links page
+        run: |
+          python scripts/ci/build_find_links.py \
+            --wheel-dir wheelhouse \
+            --project relmo \
+            --local-version "${{ matrix.local_version }}" \
+            --output "find-links/${{ matrix.find_links_page }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: find-links-${{ matrix.name }}
+          path: find-links/*.html

@@ -507,7 +507,7 @@ class _ThreeLayerSiLUBlockShapeSpec:
     pass
 
 
-_KERNEL_SPEC_METHODS = ("relm_kernel_spec",)
+_KERNEL_SPEC_METHODS = ("relmo_kernel_spec",)
 _SUPPORTED_POINTWISE_TYPES = (
     torch.nn.Identity,
     torch.nn.ReLU,
@@ -2566,10 +2566,11 @@ class FlatRelationalLayer(torch.nn.Module):
         grounded relation instance in the grouped batch and ``row_indices`` maps those
         rows back into the global relation-instance table.
         """
+        row_index_dtype = torch.long
         if int(messages.numel()) == 0:
             return (
                 messages.new_zeros((0, self.embedding_size)),
-                torch.empty((0,), device=device, dtype=index_dtype),
+                torch.empty((0,), device=device, dtype=row_index_dtype),
             )
         pooled_parts: list[Tensor] = []
         row_indices_parts: list[Tensor] = []
@@ -2593,14 +2594,14 @@ class FlatRelationalLayer(torch.nn.Module):
                     relation_row_starts[int(relation_index)],
                     relation_row_starts[int(relation_index)] + row_count_i,
                     device=device,
-                    dtype=index_dtype,
+                    dtype=row_index_dtype,
                 )
             )
             msg_cursor += width
         if not pooled_parts:
             return (
                 messages.new_zeros((0, self.embedding_size)),
-                torch.empty((0,), device=device, dtype=index_dtype),
+                torch.empty((0,), device=device, dtype=row_index_dtype),
             )
         return torch.cat(pooled_parts, dim=0), torch.cat(row_indices_parts, dim=0)
 

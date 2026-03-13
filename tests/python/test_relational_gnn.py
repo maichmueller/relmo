@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from relm.models import FastRelationalGNN, LGANRelationalGNN, RelationalGNN
-from relm.models.hetero_mp import BatchedFanInMP, FanInMP
-from relm.ops import mp as mp_ops
+from relmo.models import FastRelationalGNN, LGANRelationalGNN, RelationalGNN
+from relmo.models.hetero_mp import BatchedFanInMP, FanInMP
+from relmo.ops import mp as mp_ops
 
 from ._graph_fixtures import add_lgan_edges, build_relation_graph, clone_graph
 

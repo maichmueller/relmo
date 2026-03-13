@@ -8,7 +8,7 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.nn.aggr import MeanAggregation
 
-from relm.models import (
+from relmo.models import (
     CentralizedFlatRelationalGNN,
     FlatExecutionPolicy,
     FlatRelationalGNN,
@@ -20,7 +20,7 @@ from relm.models import (
     ThreeLayerPointwiseRelationMLP,
     TwoLayerPointwiseRelationMLP,
 )
-from relm.models import flat_relational_layer as flat_relational_layer_module
+from relmo.models import flat_relational_layer as flat_relational_layer_module
 from tests.python.support.program_family_reference import (
     execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference,
     execute_program_two_layer_silu_then_postnorm_two_layer_silu_reference,
@@ -40,7 +40,7 @@ class _CustomSpecPostNormTwoLayerSiLU(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.lin2(self.act(self.lin1(x))))
 
-    def relm_kernel_spec(self) -> RelationBlockSpec:
+    def relmo_kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[

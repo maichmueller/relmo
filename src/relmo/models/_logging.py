@@ -1,4 +1,4 @@
-"""Small logging helpers for relm models."""
+"""Small logging helpers for relmo models."""
 
 from __future__ import annotations
 

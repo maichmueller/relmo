@@ -1,6 +1,6 @@
 import torch
 
-from relm.models.hetero_mp import BatchedFanInMP, FanInMP
+from relmo.models.hetero_mp import BatchedFanInMP, FanInMP
 
 
 def _make_inputs() -> tuple[dict[str, torch.Tensor], dict[tuple[str, str, str], torch.Tensor]]:

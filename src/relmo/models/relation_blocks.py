@@ -80,7 +80,7 @@ class TwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin2(self.act(self.lin1(x)))
 
-    def relm_kernel_spec(self) -> RelationBlockSpec:
+    def relmo_kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
@@ -116,7 +116,7 @@ class PreNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin2(self.act(self.lin1(self.norm(x))))
 
-    def relm_kernel_spec(self) -> RelationBlockSpec:
+    def relmo_kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
@@ -153,7 +153,7 @@ class PostNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.lin2(self.act(self.lin1(x))))
 
-    def relm_kernel_spec(self) -> RelationBlockSpec:
+    def relmo_kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
@@ -189,7 +189,7 @@ class ThreeLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin3(self.act2(self.lin2(self.act1(self.lin1(x)))))
 
-    def relm_kernel_spec(self) -> RelationBlockSpec:
+    def relmo_kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2, self.lin3],
             ops=[

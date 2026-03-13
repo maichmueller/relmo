@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import warnings
 from pathlib import Path
 from typing import Dict
 
@@ -67,6 +68,12 @@ def _fallback_mode() -> str:
     raw = (_env_first(("RELM_MP_FALLBACK",), "python") or "python")
     raw = raw.strip().lower()
     return raw if raw in {"python", "error"} else "python"
+
+
+def _torch_version_policy() -> str:
+    raw = (_env_first(("RELM_MP_TORCH_VERSION_POLICY",), "forward") or "forward")
+    raw = raw.strip().lower()
+    return raw if raw in {"forward", "strict"} else "forward"
 
 
 def activation_code(signature: tuple[object, ...] | None) -> int | None:
@@ -153,7 +160,7 @@ def _ensure_loaded() -> None:
         return
     if torch is None:
         raise ModuleNotFoundError(
-            "relm.ops.mp requires torch."
+            "relmo.ops.mp requires torch."
         ) from _TORCH_IMPORT_ERROR
 
     last_error: Exception | None = None
@@ -181,7 +188,7 @@ def _ensure_loaded() -> None:
             "Failed to load relm_mp custom op library."
         ) from last_error
     raise FileNotFoundError(
-        "Could not find relm_mp custom op library in the relm package directory."
+        "Could not find relm_mp custom op library in the relmo package directory."
     )
 
 
@@ -217,10 +224,31 @@ def assert_runtime_compat() -> Dict[str, str]:
     build_mm = _major_minor(build_torch)
     runtime_mm = _major_minor(runtime_torch)
     if build_mm != runtime_mm:
-        raise RuntimeError(
-            "mp torch version mismatch: "
+        policy = _torch_version_policy()
+        if policy == "strict":
+            raise RuntimeError(
+                "mp torch version mismatch: "
+                f"built against {build_torch}, runtime is {runtime_torch}. "
+                "Expected matching major.minor."
+            )
+        if runtime_mm[0] != build_mm[0]:
+            raise RuntimeError(
+                "mp torch major version mismatch: "
+                f"built against {build_torch}, runtime is {runtime_torch}."
+            )
+        if runtime_mm < build_mm:
+            raise RuntimeError(
+                "mp torch runtime is older than the build torch: "
+                f"built against {build_torch}, runtime is {runtime_torch}. "
+                "Rebuild against the older torch or upgrade the runtime torch."
+            )
+        warnings.warn(
+            "mp torch version drift: "
             f"built against {build_torch}, runtime is {runtime_torch}. "
-            "Expected matching major.minor."
+            "Continuing because RELM_MP_TORCH_VERSION_POLICY=forward. "
+            "Treat this as compatibility-by-test, not ABI-guaranteed.",
+            RuntimeWarning,
+            stacklevel=2,
         )
 
     build_cuda = info.get("build_cuda_tag", "cpu")

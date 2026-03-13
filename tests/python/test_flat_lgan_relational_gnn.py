@@ -7,13 +7,13 @@ import pytest
 import torch
 from torch_geometric.data import Data
 
-from relm.models import (
+from relmo.models import (
     FlatExecutionPolicy,
     FlatLGANRelationalGNN,
     FlatRelationalOutput,
     TwoLayerPointwiseRelationMLP,
 )
-from relm.ops import mp as mp_ops
+from relmo.ops import mp as mp_ops
 
 
 class _ZeroBlock(torch.nn.Module):

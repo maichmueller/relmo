@@ -1,4 +1,4 @@
-"""relm package."""
+"""relmo package."""
 
 from . import ops
 

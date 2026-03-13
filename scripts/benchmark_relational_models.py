@@ -21,7 +21,7 @@ try:  # pragma: no cover - runtime dependency varies by environment
 except Exception:
     mifrost = None  # type: ignore
 
-from relm.models import ArityMLPFactory, CentralizedRelationalGNN, RelationalGNN
+from relmo.models import ArityMLPFactory, CentralizedRelationalGNN, RelationalGNN
 
 
 @dataclass
