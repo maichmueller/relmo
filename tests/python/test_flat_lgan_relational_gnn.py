@@ -25,6 +25,16 @@ class _ZeroBlock(torch.nn.Module):
         return torch.zeros_like(x)
 
 
+class _UnsupportedSinBlock(torch.nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.width = int(width)
+        self.lin = torch.nn.Linear(self.width, self.width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.lin(x))
+
+
 class _InputInitializedFlatLGAN(FlatLGANRelationalGNN):
     def initialize_embeddings(self, x: torch.Tensor) -> torch.Tensor:
         return x.clone()
@@ -94,6 +104,24 @@ def _make_lgan_model() -> FlatLGANRelationalGNN:
         fusion.weight[1, 5] = 1.0
     model.fusion_updater = fusion
     return model
+
+
+def _make_mixed_kernel_fallback_model() -> FlatLGANRelationalGNN:
+    return _InputInitializedFlatLGAN(
+        embedding_size=2,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        aggregation="sum",
+        relation_modules={
+            "rel_a": TwoLayerPointwiseRelationMLP(4, 8, activation="silu"),
+            "rel_b": _UnsupportedSinBlock(2),
+        },
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="auto",
+            program_kernels="off",
+            relation_gather="off",
+        ),
+    )
 
 
 def _load_native_lgan_batch():
@@ -390,6 +418,130 @@ def test_collect_relation_instance_messages_kernel_matches_slot_pooling() -> Non
     )
     assert relation_pair_x is not None
     assert torch.allclose(relation_pair_x, pooled_from_slots, atol=1e-5, rtol=1e-4)
+
+
+def test_collect_slot_messages_mixed_kernel_and_fallback_matches_eager_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_mixed_kernel_fallback_model()
+    prepared = model._prepare_batch(_make_lgan_data())
+    assert prepared.topology is not None
+    layout = model.relational_layer._get_kernel_layout(prepared.topology)
+    assert len(layout.groups) > 0
+    assert len(layout.fallback_indices) > 0
+    x = model.initialize_embeddings(prepared.x)
+
+    monkeypatch.setattr(model.relational_layer, "_use_relation_kernels", lambda _x: True)
+    monkeypatch.setattr(model.relational_layer, "_use_program_kernels", lambda _x: False)
+    slot_messages = model.relational_layer.collect_slot_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert slot_messages is not None
+
+    slot_reference = x.new_zeros((int(prepared.relation_args.numel()), model.embedding_size))
+    for relation_slice in prepared.topology.relation_slices:
+        direct = model.relational_layer._collect_eager_relation_messages(
+            x,
+            prepared.relation_args,
+            relation_slice,
+        )
+        if direct is None:
+            continue
+        msgs, _ = direct
+        slot_reference[relation_slice.slot_start : relation_slice.slot_end] = msgs
+    assert torch.allclose(slot_messages, slot_reference, atol=1e-6, rtol=1e-5)
+
+
+def test_collect_relation_instance_messages_mixed_kernel_and_fallback_matches_slot_pooling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_mixed_kernel_fallback_model()
+    prepared = model._prepare_batch(_make_lgan_data())
+    assert prepared.topology is not None
+    assert prepared.lgan_topology is not None
+    x = model.initialize_embeddings(prepared.x)
+
+    monkeypatch.setattr(model.relational_layer, "_use_relation_kernels", lambda _x: True)
+    monkeypatch.setattr(model.relational_layer, "_use_program_kernels", lambda _x: False)
+    slot_messages = model.relational_layer.collect_slot_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert slot_messages is not None
+    pooled_from_slots = slot_messages.new_zeros(
+        (int(prepared.lgan_topology.relation_instance_count), slot_messages.size(1))
+    )
+    pooled_from_slots.index_add_(
+        0,
+        prepared.lgan_topology.slot_to_relation_instance,
+        slot_messages,
+    )
+    counts = (
+        prepared.lgan_topology.relation_instance_arities.to(
+            device=slot_messages.device,
+            dtype=slot_messages.dtype,
+        )
+        .view(-1, 1)
+        .clamp_min_(1.0)
+    )
+    pooled_from_slots = pooled_from_slots / counts
+    relation_pair_x = model.relational_layer._collect_relation_instance_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert relation_pair_x is not None
+    assert torch.allclose(relation_pair_x, pooled_from_slots, atol=1e-6, rtol=1e-5)
+
+
+def test_lgan_build_pointwise_step_mixed_kernel_and_fallback_matches_two_step_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_mixed_kernel_fallback_model()
+    prepared = model._prepare_batch(_make_lgan_data())
+    assert prepared.topology is not None
+    x = model.initialize_embeddings(prepared.x)
+
+    monkeypatch.setattr(model.relational_layer, "_use_relation_kernels", lambda _x: True)
+    monkeypatch.setattr(model.relational_layer, "_use_program_kernels", lambda _x: False)
+
+    integrated = model.relational_layer._run_lgan_pointwise_step(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+        rr_src=prepared.lgan_rr_src_relation_indices,
+        rr_dst=prepared.lgan_rr_dst_relation_indices,
+        tn_rel=prepared.lgan_tn_relation_indices,
+        tn_ent=prepared.lgan_tn_entity_indices,
+        nn_rel=prepared.lgan_nn_relation_indices,
+        nn_ent=prepared.lgan_nn_entity_indices,
+        entity_dim_size=int(x.size(0)),
+        mode="sum",
+    )
+    assert integrated is not None
+
+    relation_pair_ref = model.relational_layer._collect_relation_instance_messages(
+        x,
+        prepared.relation_args,
+        prepared.topology,
+    )
+    assert relation_pair_ref is not None
+    reference = mp_ops._lgan_relation_graph_step(
+        relation_pair_ref,
+        prepared.lgan_rr_src_relation_indices,
+        prepared.lgan_rr_dst_relation_indices,
+        prepared.lgan_tn_relation_indices,
+        prepared.lgan_tn_entity_indices,
+        prepared.lgan_nn_relation_indices,
+        prepared.lgan_nn_entity_indices,
+        entity_dim_size=int(x.size(0)),
+        mode="sum",
+    )
+    for got, ref in zip(integrated, reference, strict=True):
+        assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

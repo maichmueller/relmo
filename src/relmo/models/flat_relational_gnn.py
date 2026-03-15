@@ -29,12 +29,12 @@ from .flat_contract import (
     normalize_optional_long_tensor,
     preferred_index_dtype,
 )
-from .flat_relational_layer import (
+from .flat_relational import (
     FlatRelationKernel,
-    FlatRelationalLayer,
     normalize_relation_arities,
     normalize_relation_counts,
 )
+from .flat_relational_layer import FlatRelationalLayer
 from .mlp import ArityMLPFactory, SimpleMLP
 from .pyg_module import PyGFlatModule
 
@@ -494,8 +494,6 @@ class FlatRelationalGNN(PyGFlatModule):
             return data
         if (
             isinstance(data, mifrost.BatchEncoding)
-            and hasattr(data, "relation_counts")
-            and hasattr(data, "relation_args")
         ):
             return self._prepare_native_flat_batch(data, cache=cache)
         if isinstance(data, (pyg.data.Data, pyg.data.Batch)):

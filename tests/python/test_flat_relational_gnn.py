@@ -20,7 +20,8 @@ from relmo.models import (
     ThreeLayerPointwiseRelationMLP,
     TwoLayerPointwiseRelationMLP,
 )
-from relmo.models import flat_relational_layer as flat_relational_layer_module
+from relmo.models.flat_relational import kernels as flat_kernels_module
+from relmo.models.flat_relational import types as flat_types_module
 from tests.python.support.program_family_reference import (
     execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference,
     execute_program_two_layer_silu_then_postnorm_two_layer_silu_reference,
@@ -193,7 +194,7 @@ def _make_program_model(
     *,
     arity: int = 2,
     relation_kernels=None,
-) -> tuple[FlatRelationalGNN, flat_relational_layer_module.RelationSlice]:
+) -> tuple[FlatRelationalGNN, flat_types_module.RelationSlice]:
     model = FlatRelationalGNN(
         embedding_size=4,
         num_layers=1,
@@ -384,7 +385,7 @@ def test_constructor_validates_declared_relation_block_width() -> None:
 def test_build_flat_topology_counts_and_offsets() -> None:
     relation_counts = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
     relation_arities = torch.tensor([2, 1], dtype=torch.long)
-    topology = flat_relational_layer_module.build_flat_topology(relation_counts, relation_arities)
+    topology = flat_types_module.build_flat_topology(relation_counts, relation_arities)
     assert topology.relation_counts_total == (3, 3)
     assert topology.relation_arities == (2, 1)
     assert topology.slot_offsets == (0, 6, 9)
@@ -461,11 +462,11 @@ def test_flat_relational_layer_accepts_pyg_aggregation_object() -> None:
 @pytest.mark.parametrize(
     ("module_factory", "expected_kernel_type"),
     [
-        (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="mish"), flat_relational_layer_module.MishBlockKernel),
-        (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="silu"), flat_relational_layer_module.SiLUBlockKernel),
-        (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="gelu"), flat_relational_layer_module.GELUBlockKernel),
-        (lambda width: PostNormTwoLayerPointwiseRelationMLP(width, 16, activation="silu", norm="layernorm"), flat_relational_layer_module.PostNormSiLULayerNormKernel),
-        (lambda width: _CustomSpecPostNormTwoLayerSiLU(width, 16), flat_relational_layer_module.PostNormSiLULayerNormKernel),
+        (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="mish"), flat_kernels_module.MishBlockKernel),
+        (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="silu"), flat_kernels_module.SiLUBlockKernel),
+        (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="gelu"), flat_kernels_module.GELUBlockKernel),
+        (lambda width: PostNormTwoLayerPointwiseRelationMLP(width, 16, activation="silu", norm="layernorm"), flat_kernels_module.PostNormSiLULayerNormKernel),
+        (lambda width: _CustomSpecPostNormTwoLayerSiLU(width, 16), flat_kernels_module.PostNormSiLULayerNormKernel),
     ],
 )
 def test_kernel_matcher_identifies_supported_block_kernels(module_factory, expected_kernel_type: type[object]) -> None:
@@ -485,8 +486,8 @@ def test_kernel_matcher_identifies_rmsnorm_block_family() -> None:
     match = model.relational_layer._match_kernel(relation_slice)
     assert match is not None
     assert match.kernel is not None
-    assert isinstance(match.kernel, flat_relational_layer_module.PreNormSiLURMSNormKernel)
-    assert match.spec.kernel_type is flat_relational_layer_module.PreNormSiLURMSNormKernel
+    assert isinstance(match.kernel, flat_kernels_module.PreNormSiLURMSNormKernel)
+    assert match.spec.kernel_type is flat_kernels_module.PreNormSiLURMSNormKernel
 
 
 def test_exact_program_matching_requires_relation_program_wrapper() -> None:
@@ -507,21 +508,21 @@ def test_exact_program_matching_requires_relation_program_wrapper() -> None:
                 TwoLayerPointwiseRelationMLP(8, 16, activation="silu"),
                 TwoLayerPointwiseRelationMLP(8, 12, activation="silu"),
             ),
-            flat_relational_layer_module.SiLUPairProgramKernel,
+            flat_kernels_module.SiLUPairProgramKernel,
         ),
         (
             RelationProgram(
                 TwoLayerPointwiseRelationMLP(8, 16, activation="silu"),
                 PostNormTwoLayerPointwiseRelationMLP(8, 12, activation="silu", norm="layernorm"),
             ),
-            flat_relational_layer_module.SiLUThenPostNormProgramKernel,
+            flat_kernels_module.SiLUThenPostNormProgramKernel,
         ),
         (
             RelationProgram(
                 PreNormTwoLayerPointwiseRelationMLP(8, 16, activation="silu", norm="rmsnorm"),
                 TwoLayerPointwiseRelationMLP(8, 12, activation="silu"),
             ),
-            flat_relational_layer_module.PreNormRMSNormThenSiLUProgramKernel,
+            flat_kernels_module.PreNormRMSNormThenSiLUProgramKernel,
         ),
     ],
 )

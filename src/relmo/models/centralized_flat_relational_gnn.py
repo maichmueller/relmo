@@ -18,7 +18,7 @@ import torch_geometric as pyg
 from .film import CentralFiLMFactory, FiLMConcatMLP
 from .flat_contract import FlatExecutionPolicy
 from .flat_relational_gnn import FlatRelationalGNN
-from .flat_relational_layer import FlatRelationKernel
+from .flat_relational import FlatRelationKernel
 from .mlp import ArityMLPFactory, SimpleMLP
 from .residual import ResidualModule
 

@@ -7,7 +7,7 @@ from .centralized_flat_relational_gnn import (
 )
 from .flat_lgan_relational_gnn import FlatLGANRelationalGNN
 from .flat_relational_gnn import FlatRelationalGNN
-from .flat_relational_layer import FlatRelationKernel
+from .flat_relational import FlatRelationKernel
 from .mlp import ArityMLPFactory
 from .relation_block_spec import RelationBlockCompatible, RelationBlockSpec
 from .relation_blocks import (

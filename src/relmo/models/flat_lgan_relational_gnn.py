@@ -37,7 +37,7 @@ from .flat_contract import (
     normalize_optional_index_tensor,
 )
 from .flat_relational_gnn import FlatRelationalGNN
-from .flat_relational_layer import FlatTopology
+from .flat_relational import FlatTopology
 from .mlp import ArityMLPFactory, SimpleMLP
 
 
