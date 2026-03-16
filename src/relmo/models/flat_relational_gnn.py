@@ -196,6 +196,49 @@ class FlatRelationalGNN(PyGFlatModule):
                     f"relation module {relation_name!r} declares width {module_width}, expected {width}."
                 )
 
+    def _repack_relation_args_relation_major(
+        self,
+        relation_args: Tensor,
+        *,
+        relation_counts: Tensor,
+        relation_arities: Tensor,
+    ) -> Tensor:
+        """Convert graph-major packed args to relation-major packed args.
+
+        The flat layer topology uses relation-major contiguous relation slices.
+        Batched native encoders can emit graph-major packing
+        ``[(g0,r0),(g0,r1),...,(g1,r0),(g1,r1),...]``. This method repacks to
+        relation-major order ``[(r0,g0),(r0,g1),...,(r1,g0),(r1,g1),...]``.
+        """
+        if int(relation_counts.size(0)) <= 1 or int(relation_args.numel()) == 0:
+            return relation_args
+        num_graphs = int(relation_counts.size(0))
+        num_relations = int(relation_counts.size(1))
+        chunks_by_relation: list[list[Tensor]] = [[] for _ in range(num_relations)]
+        cursor = 0
+        for graph_index in range(num_graphs):
+            for relation_index in range(num_relations):
+                count = int(relation_counts[graph_index, relation_index].item())
+                arity = int(relation_arities[relation_index].item())
+                width = int(count * arity)
+                next_cursor = int(cursor + width)
+                if width > 0:
+                    chunks_by_relation[relation_index].append(
+                        relation_args[cursor:next_cursor]
+                    )
+                cursor = next_cursor
+        if cursor != int(relation_args.numel()):
+            raise ValueError(
+                "relation_args length does not match graph-major packed slot width "
+                f"implied by relation_counts/relation_arities: {int(relation_args.numel())} vs {cursor}."
+            )
+        relation_major_parts = [
+            torch.cat(chunks, dim=0) for chunks in chunks_by_relation if chunks
+        ]
+        if not relation_major_parts:
+            return relation_args.new_empty((0,))
+        return torch.cat(relation_major_parts, dim=0)
+
     def _normalize_relation_core(
         self,
         x: Tensor,
@@ -227,6 +270,27 @@ class FlatRelationalGNN(PyGFlatModule):
             raise ValueError("input relation_arities does not match the model relation order.")
         if relation_names is not None and tuple(str(name) for name in relation_names) != self.relation_names:
             raise ValueError("input relation_names does not match the model relation order.")
+        expected_slots = int(
+            (
+                relation_counts_2d
+                * arities_1d.view(1, -1).to(
+                    device=relation_counts_2d.device,
+                    dtype=relation_counts_2d.dtype,
+                )
+            )
+            .sum()
+            .item()
+        )
+        if int(relation_args_1d.numel()) != expected_slots:
+            raise ValueError(
+                "relation_args length does not match packed slot width implied by "
+                f"relation_counts/relation_arities: {int(relation_args_1d.numel())} vs {expected_slots}."
+            )
+        relation_args_1d = self._repack_relation_args_relation_major(
+            relation_args_1d,
+            relation_counts=relation_counts_2d,
+            relation_arities=arities_1d,
+        )
         return _NormalizedRelationCore(
             x=x,
             relation_counts=relation_counts_2d,

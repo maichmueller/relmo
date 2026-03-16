@@ -39,11 +39,14 @@ def _native_goal_sat_relm_encoder(domain):
         flat_relation_encoder = mifrost.FlatRelationEncoder
     except Exception as exc:  # pragma: no cover - env-dependent optional wrapper path
         pytest.skip(f"mifrost FlatRelationEncoder wrapper unavailable: {exc}")
+    goal_satisfaction = getattr(mifrost, "GoalSatisfaction", None)
+    if goal_satisfaction is None:
+        pytest.skip("mifrost GoalSatisfaction enum unavailable in this test environment")
     return flat_relation_encoder(
         domain,
         goal_satisfaction_derivations={
-            mifrost.GoalSatisfaction.satisfied,
-            mifrost.GoalSatisfaction.unsatisfied,
+            goal_satisfaction.satisfied,
+            goal_satisfaction.unsatisfied,
         },
     )
 
@@ -160,6 +163,9 @@ def test_build_flat_relm_inputs_from_native_batchencoding_matches_pyg_batch() ->
         flat_relation_encoder = mifrost.FlatRelationEncoder
     except Exception as exc:  # pragma: no cover - env-dependent optional wrapper path
         pytest.skip(f"mifrost FlatRelationEncoder wrapper unavailable: {exc}")
+    goal_satisfaction = getattr(mifrost, "GoalSatisfaction", None)
+    if goal_satisfaction is None:
+        pytest.skip("mifrost GoalSatisfaction enum unavailable in this test environment")
     domain, problem = _load_blocks_problem()
     goals = list(problem.get_goal_condition().get_literals())
     state = problem.get_initial_state()
@@ -167,8 +173,8 @@ def test_build_flat_relm_inputs_from_native_batchencoding_matches_pyg_batch() ->
         domain,
         target_sources=["goal"],
         goal_satisfaction_derivations={
-            mifrost.GoalSatisfaction.satisfied,
-            mifrost.GoalSatisfaction.unsatisfied,
+            goal_satisfaction.satisfied,
+            goal_satisfaction.unsatisfied,
         },
     )
     native_batch = encoder.encode_batch(states=[state, state], goals=goals)

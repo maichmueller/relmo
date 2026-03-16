@@ -74,6 +74,11 @@ class _CountingCentralModule(torch.nn.Module):
         return x[:, : self.out_size]
 
 
+class _InputInitializedFlatRelationalGNN(FlatRelationalGNN):
+    def initialize_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        return x.clone()
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -391,6 +396,94 @@ def test_build_flat_topology_counts_and_offsets() -> None:
     assert topology.slot_offsets == (0, 6, 9)
 
 
+def test_normalize_relation_core_reorders_batched_graph_major_relation_args() -> None:
+    model = _InputInitializedFlatRelationalGNN(
+        embedding_size=4,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        relation_modules={
+            "rel_a": TwoLayerPointwiseRelationMLP(8, 16),
+            "rel_b": TwoLayerPointwiseRelationMLP(4, 12),
+        },
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="off",
+            program_kernels="off",
+            relation_gather="off",
+        ),
+    )
+    x = torch.randn(8, 4)
+    relation_counts = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
+    relation_arities = torch.tensor([2, 1], dtype=torch.long)
+    relation_args_graph_major = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 7, 6],
+        dtype=torch.long,
+    )
+    core = model._normalize_relation_core(
+        x,
+        relation_counts,
+        relation_args_graph_major,
+        relation_arities=relation_arities,
+    )
+    relation_args_relation_major = torch.tensor(
+        [0, 1, 4, 5, 6, 7, 2, 3, 6],
+        dtype=torch.long,
+    )
+    assert torch.equal(core.relation_args, relation_args_relation_major)
+
+
+def test_batched_graph_major_relation_args_matches_per_graph_execution() -> None:
+    torch.manual_seed(0)
+    model = _InputInitializedFlatRelationalGNN(
+        embedding_size=4,
+        num_layers=1,
+        relations={"rel_a": 2, "rel_b": 1},
+        relation_modules={
+            "rel_a": TwoLayerPointwiseRelationMLP(8, 16, activation="mish"),
+            "rel_b": TwoLayerPointwiseRelationMLP(4, 12, activation="mish"),
+        },
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="off",
+            program_kernels="off",
+            relation_gather="off",
+        ),
+    )
+    x = torch.randn(8, 4)
+    relation_counts = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
+    relation_arities = torch.tensor([2, 1], dtype=torch.long)
+    relation_args_graph_major = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 7, 6],
+        dtype=torch.long,
+    )
+    batched_data = Data(
+        x=x,
+        relation_counts=relation_counts,
+        relation_args=relation_args_graph_major,
+        relation_arities=relation_arities,
+    )
+    batched_entity = model.compute_entity_embeddings(batched_data)
+
+    graph0_data = Data(
+        x=x[:4],
+        relation_counts=relation_counts[:1],
+        relation_args=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        relation_arities=relation_arities,
+    )
+    graph1_data = Data(
+        x=x[4:],
+        relation_counts=relation_counts[1:].contiguous(),
+        relation_args=torch.tensor([0, 1, 2, 3, 2], dtype=torch.long),
+        relation_arities=relation_arities,
+    )
+    ref_entity = torch.cat(
+        [
+            model.compute_entity_embeddings(graph0_data),
+            model.compute_entity_embeddings(graph1_data),
+        ],
+        dim=0,
+    )
+    assert torch.allclose(batched_entity, ref_entity, atol=1e-6, rtol=1e-5)
+
+
 def test_flat_relational_layer_sum_matches_reference_forward_and_gradients() -> None:
     modules = {
         "rel_a": TwoLayerPointwiseRelationMLP(8, 16, activation="mish"),
@@ -591,13 +684,16 @@ def test_compute_entity_embeddings_accepts_native_mifrost_flat_batch() -> None:
         pytest.skip(f"mifrost FlatRelationEncoder wrapper unavailable: {exc}")
     if flat_relation_encoder is None:
         pytest.skip("mifrost FlatRelationEncoder wrapper unavailable in this test environment")
+    goal_satisfaction = getattr(mifrost, "GoalSatisfaction", None)
+    if goal_satisfaction is None:
+        pytest.skip("mifrost GoalSatisfaction enum unavailable in this test environment")
     domain, state, goals = _load_blocks_problem()
     encoder = flat_relation_encoder(
         domain,
         target_sources=["goal"],
         goal_satisfaction_derivations={
-            mifrost.GoalSatisfaction.satisfied,
-            mifrost.GoalSatisfaction.unsatisfied,
+            goal_satisfaction.satisfied,
+            goal_satisfaction.unsatisfied,
         },
     )
     native_batch = encoder.encode_batch(states=[state], goals=goals)
