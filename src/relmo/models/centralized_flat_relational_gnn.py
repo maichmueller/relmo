@@ -16,9 +16,9 @@ import torch
 import torch_geometric as pyg
 
 from .film import CentralFiLMFactory, FiLMConcatMLP
-from .flat_contract import FlatExecutionPolicy
+from .flat_relational.flat_contract import FlatExecutionPolicy
+from .flat_relational.kernels import FlatRelationKernel
 from .flat_relational_gnn import FlatRelationalGNN
-from .flat_relational import FlatRelationKernel
 from .mlp import ArityMLPFactory, SimpleMLP
 from .residual import ResidualModule
 
@@ -43,16 +43,16 @@ class CentralizedFlatRelationModule(torch.nn.Module):
     """
 
     def __init__(
-        self,
-        *,
-        central_module: torch.nn.Module,
-        condition_embedding: torch.nn.Embedding,
-        condition_index: int,
-        arity: int,
-        max_arity: int,
-        embedding_size: int,
-        condition_position: str,
-        include_slot_mask: bool,
+            self,
+            *,
+            central_module: torch.nn.Module,
+            condition_embedding: torch.nn.Embedding,
+            condition_index: int,
+            arity: int,
+            max_arity: int,
+            embedding_size: int,
+            condition_position: str,
+            include_slot_mask: bool,
     ) -> None:
         super().__init__()
         if condition_position not in ("pre", "post"):
@@ -109,27 +109,27 @@ class CentralizedFlatRelationalGNN(FlatRelationalGNN):
     """
 
     def __init__(
-        self,
-        embedding_size: int,
-        num_layers: int,
-        relations: Mapping[str, int],
-        aggregation: str | pyg.nn.aggr.Aggregation | None = "sum",
-        *,
-        relation_condition_dim: int | None = None,
-        relation_condition_learnable: bool = True,
-        condition_position: str = "pre",
-        central_module: torch.nn.Module | None = None,
-        central_module_factory: Callable[..., torch.nn.Module]
-        | ArityMLPFactory
-        | CentralFiLMFactory
-        | None = None,
-        central_residual: bool = True,
-        central_conditioning: str = "film",
-        central_slot_mask: bool = True,
-        relation_kernels: Sequence[FlatRelationKernel] | None = None,
-        execution_policy: FlatExecutionPolicy = FlatExecutionPolicy(),
-        compile_forward: bool = False,
-        activation: str | Callable | None = None,
+            self,
+            embedding_size: int,
+            num_layers: int,
+            relations: Mapping[str, int],
+            aggregation: str | pyg.nn.aggr.Aggregation | None = "sum",
+            *,
+            relation_condition_dim: int | None = None,
+            relation_condition_learnable: bool = True,
+            condition_position: str = "pre",
+            central_module: torch.nn.Module | None = None,
+            central_module_factory: Callable[..., torch.nn.Module]
+                                    | ArityMLPFactory
+                                    | CentralFiLMFactory
+                                    | None = None,
+            central_residual: bool = True,
+            central_conditioning: str = "film",
+            central_slot_mask: bool = True,
+            relation_kernels: Sequence[FlatRelationKernel] | None = None,
+            execution_policy: FlatExecutionPolicy = FlatExecutionPolicy(),
+            compile_forward: bool = False,
+            activation: str | Callable | None = None,
     ) -> None:
         if central_module is not None and central_module_factory is not None:
             raise ValueError(
@@ -155,9 +155,9 @@ class CentralizedFlatRelationalGNN(FlatRelationalGNN):
         self._central_module_factory = central_module_factory
         object.__setattr__(self, "_central_module_cache", central_module)
 
-        relation_items = tuple((str(name), int(arity)) for name, arity in relations.items())
+        relation_items:tuple[tuple[str, int], ...] = tuple((str(name), int(arity)) for name, arity in relations.items())
         self.relation_condition_dim = self._resolve_relation_condition_dim(embedding_size)
-        self.relation_condition_index = {
+        self.relation_condition_index: dict[str, int] = {
             predicate: idx for idx, (predicate, _) in enumerate(relation_items)
         }
         relation_condition_embedding = torch.nn.Embedding(
@@ -283,7 +283,7 @@ class CentralizedFlatRelationalGNN(FlatRelationalGNN):
             p
             for p in signature.parameters.values()
             if p.kind
-            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+               not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
         ]
         if len(params) <= 1:
             return factory(self.max_relation_arity)

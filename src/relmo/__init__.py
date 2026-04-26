@@ -1,5 +1,5 @@
 """relmo package."""
 
-from . import ops
+from . import models, ops
 
-__all__ = ["ops"]
+__all__ = ["models", "ops"]

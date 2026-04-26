@@ -13,7 +13,7 @@ from ._ops_env import (
     _resolve_fanin_mode,
     _use_model_mp_batched_fanin_reduce,
     _use_model_mp_batched_fanout,
-    relm_mp_ops,
+    relmo_mp_ops,
 )
 from ._scatter import (
     _build_fanout_scatter_plan,
@@ -290,7 +290,7 @@ class FastFusedRelationalLayerMP(torch.nn.Module):
                 continue
             flat_src, dst_index = pair
             if use_mp_fanin_reduce and _use_model_mp_batched_fanin_reduce(x_dict[dst]):
-                symbol_msgs[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                symbol_msgs[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                     rel_flat_all, flat_src, dst_index, dim_size, self._mp_fanin_mode
                 )
             else:

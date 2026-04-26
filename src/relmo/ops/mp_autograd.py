@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .mp_constants import CUSTOM_TWO_LAYER_POINTWISE_CODES, MODE_LOGSUMEXP, MODE_SUM
-from .mp_dispatch import namespace_has_op, ops_namespace, should_use_custom
+from .mp_dispatch import namespace_has_op, ops_namespace, should_use_custom, use_custom_namespace_op
 from .mp_fallbacks import (
     block_pointwise_pool_python,
     block_pointwise_python,
@@ -51,6 +51,58 @@ def _collect_single_output_grads(
     for idx, grad in zip(grad_targets, grads, strict=True):
         grad_map[idx] = grad
     return tuple(grad_map)
+
+
+def _store_indexed_ctx(
+    ctx: torch.autograd.function.FunctionCtx,
+    *,
+    slot_offsets: list[int],
+    row_sizes: list[int],
+    arity: int,
+    **attrs,
+) -> None:
+    ctx.slot_offsets = [int(v) for v in slot_offsets]
+    ctx.row_sizes = [int(v) for v in row_sizes]
+    ctx.arity = int(arity)
+    for name, value in attrs.items():
+        setattr(ctx, name, value)
+
+
+def _assign_requested_grads(
+    size: int,
+    needs: tuple[bool, ...],
+    pairs: tuple[tuple[int, torch.Tensor | None], ...],
+) -> tuple[torch.Tensor | None, ...]:
+    grad_map: list[torch.Tensor | None] = [None] * size
+    for idx, grad in pairs:
+        if grad is not None and needs[idx]:
+            grad_map[idx] = grad
+    return tuple(grad_map)
+
+
+def _use_custom_indexed_op(
+    x: torch.Tensor,
+    op_name: str,
+    *,
+    extra_condition: bool = True,
+) -> bool:
+    return bool(extra_condition) and use_custom_namespace_op(
+        op_name,
+        tensor=x,
+        require_cuda=True,
+    )
+
+
+def _use_custom_backward(
+    ctx: torch.autograd.function.FunctionCtx,
+    grad_tensor: torch.Tensor,
+    op_name: str,
+) -> bool:
+    return bool(getattr(ctx, "used_custom", False)) and use_custom_namespace_op(
+        op_name,
+        tensor=grad_tensor,
+        require_cuda=True,
+    )
 
 
 if torch is not None:
@@ -168,11 +220,7 @@ if torch is not None:
                 nn_rel,
                 nn_ent,
             )
-            used_custom = (
-                slot_messages.is_cuda
-                and should_use_custom("lgan_pool_reduce")
-                and namespace_has_op("lgan_pool_reduce")
-            )
+            used_custom = _use_custom_indexed_op(slot_messages, "lgan_pool_reduce")
             ctx.used_custom = bool(used_custom)
             if used_custom:
                 return ops_namespace().lgan_pool_reduce(
@@ -225,11 +273,10 @@ if torch is not None:
             needs = ctx.needs_input_grad
             grad_slot_messages: torch.Tensor | None = None
             if needs[0]:
-                use_custom_backward = (
-                    bool(getattr(ctx, "used_custom", False))
-                    and slot_messages.is_cuda
-                    and should_use_custom("lgan_pool_reduce_backward")
-                    and namespace_has_op("lgan_pool_reduce_backward")
+                use_custom_backward = _use_custom_backward(
+                    ctx,
+                    slot_messages,
+                    "lgan_pool_reduce_backward",
                 )
                 grad_relation_pair_x_req = (
                     grad_relation_pair_x
@@ -358,10 +405,9 @@ if torch is not None:
                 nn_rel,
                 nn_ent,
             )
-            used_custom = (
-                relation_pair_x.is_cuda
-                and should_use_custom("lgan_relation_graph_step")
-                and namespace_has_op("lgan_relation_graph_step")
+            used_custom = _use_custom_indexed_op(
+                relation_pair_x,
+                "lgan_relation_graph_step",
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
@@ -423,12 +469,10 @@ if torch is not None:
                     dtype=relation_pair_x.dtype,
                 )
             )
-            if (
-                needs[0]
-                and bool(getattr(ctx, "used_custom", False))
-                and relation_pair_x.is_cuda
-                and should_use_custom("lgan_relation_graph_step_backward")
-                and namespace_has_op("lgan_relation_graph_step_backward")
+            if needs[0] and _use_custom_backward(
+                ctx,
+                relation_pair_x,
+                "lgan_relation_graph_step_backward",
             ):
                 return (
                     ops_namespace().lgan_relation_graph_step_backward(
@@ -539,10 +583,9 @@ if torch is not None:
             b2_groups = tuple(param_tensors[3 * group_count : 4 * group_count])
 
             relation_pair_x = seed_relation_pair_x.clone()
-            use_custom_block = (
-                x.is_cuda
-                and should_use_custom("block_pointwise")
-                and namespace_has_op("block_pointwise")
+            use_custom_block = _use_custom_indexed_op(
+                x,
+                "block_pointwise",
             )
             for group_index in range(group_count):
                 row_sizes = tuple(int(v) for v in row_sizes_groups[group_index])
@@ -552,10 +595,10 @@ if torch is not None:
                 b1_stack = b1_groups[group_index]
                 w2_stack = w2_groups[group_index]
                 b2_stack = b2_groups[group_index]
-                if (
-                    use_custom_block
-                    and should_use_custom("block_pointwise_pool")
-                    and namespace_has_op("block_pointwise_pool")
+                if use_custom_block and use_custom_namespace_op(
+                    "block_pointwise_pool",
+                    tensor=x,
+                    require_cuda=True,
                 ):
                     pooled = ops_namespace().block_pointwise_pool(
                         x,
@@ -596,10 +639,9 @@ if torch is not None:
                     )
                     pooled_offset += row_count_i
 
-            use_custom_graph = (
-                relation_pair_x.is_cuda
-                and should_use_custom("lgan_relation_graph_step")
-                and namespace_has_op("lgan_relation_graph_step")
+            use_custom_graph = _use_custom_indexed_op(
+                relation_pair_x,
+                "lgan_relation_graph_step",
             )
             if use_custom_graph:
                 relation_pair_x_out, tn_msgs, nn_msgs = ops_namespace().lgan_relation_graph_step(
@@ -698,10 +740,10 @@ if torch is not None:
                 )
             )
 
-            if (
-                x.is_cuda
-                and should_use_custom("lgan_relation_graph_step_backward")
-                and namespace_has_op("lgan_relation_graph_step_backward")
+            if use_custom_namespace_op(
+                "lgan_relation_graph_step_backward",
+                tensor=x,
+                require_cuda=True,
             ):
                 grad_relation_pair_x_in = ops_namespace().lgan_relation_graph_step_backward(
                     grad_relation_pair_x_req,
@@ -751,10 +793,10 @@ if torch is not None:
             if needs[2]:
                 grads[2] = grad_seed
 
-            use_custom_block_backward = (
-                x.is_cuda
-                and should_use_custom("block_pointwise_pool_backward")
-                and namespace_has_op("block_pointwise_pool_backward")
+            use_custom_block_backward = use_custom_namespace_op(
+                "block_pointwise_pool_backward",
+                tensor=x,
+                require_cuda=True,
             )
             w1_base = 17
             b1_base = w1_base + group_count
@@ -863,16 +905,18 @@ if torch is not None:
             b2_stack: torch.Tensor,
             pointwise_code: int,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            ctx.slot_offsets = [int(v) for v in slot_offsets]
-            ctx.row_sizes = [int(v) for v in row_sizes]
-            ctx.arity = int(arity)
-            ctx.pointwise_code = int(pointwise_code)
+            _store_indexed_ctx(
+                ctx,
+                slot_offsets=slot_offsets,
+                row_sizes=row_sizes,
+                arity=arity,
+                pointwise_code=int(pointwise_code),
+            )
             ctx.save_for_backward(x, relation_args, w1_stack, b1_stack, w2_stack, b2_stack)
-            used_custom = (
-                x.is_cuda
-                and ctx.pointwise_code in CUSTOM_TWO_LAYER_POINTWISE_CODES
-                and should_use_custom("block_pointwise")
-                and namespace_has_op("block_pointwise")
+            used_custom = _use_custom_indexed_op(
+                x,
+                "block_pointwise",
+                extra_condition=ctx.pointwise_code in CUSTOM_TWO_LAYER_POINTWISE_CODES,
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
@@ -924,12 +968,7 @@ if torch is not None:
 
             x, relation_args, w1_stack, b1_stack, w2_stack, b2_stack = ctx.saved_tensors
             needs = ctx.needs_input_grad
-            if (
-                bool(getattr(ctx, "used_custom", False))
-                and grad_rel.is_cuda
-                and should_use_custom("block_pointwise_backward")
-                and namespace_has_op("block_pointwise_backward")
-            ):
+            if _use_custom_backward(ctx, grad_rel, "block_pointwise_backward"):
                 grad_x, grad_w1, grad_b1, grad_w2, grad_b2 = ops_namespace().block_pointwise_backward(
                     grad_rel,
                     x,
@@ -943,18 +982,17 @@ if torch is not None:
                     b2_stack,
                     int(ctx.pointwise_code),
                 )
-                grad_map: list[torch.Tensor | None] = [None] * 10
-                if needs[0]:
-                    grad_map[0] = grad_x
-                if needs[5]:
-                    grad_map[5] = grad_w1
-                if needs[6] and b1_stack.numel() > 0:
-                    grad_map[6] = grad_b1
-                if needs[7]:
-                    grad_map[7] = grad_w2
-                if needs[8] and b2_stack.numel() > 0:
-                    grad_map[8] = grad_b2
-                return tuple(grad_map)  # type: ignore[return-value]
+                return _assign_requested_grads(
+                    10,
+                    needs,
+                    (
+                        (0, grad_x),
+                        (5, grad_w1),
+                        (6, grad_b1 if b1_stack.numel() > 0 else None),
+                        (7, grad_w2),
+                        (8, grad_b2 if b2_stack.numel() > 0 else None),
+                    ),
+                )  # type: ignore[return-value]
 
             with torch.enable_grad():
                 x_req = _detach_for_grad(x, bool(needs[0]))
@@ -1006,9 +1044,12 @@ if torch is not None:
             w21_stack: torch.Tensor,
             b21_stack: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            ctx.slot_offsets = [int(v) for v in slot_offsets]
-            ctx.row_sizes = [int(v) for v in row_sizes]
-            ctx.arity = int(arity)
+            _store_indexed_ctx(
+                ctx,
+                slot_offsets=slot_offsets,
+                row_sizes=row_sizes,
+                arity=arity,
+            )
             ctx.save_for_backward(
                 x,
                 relation_args,
@@ -1021,11 +1062,7 @@ if torch is not None:
                 w21_stack,
                 b21_stack,
             )
-            used_custom = (
-                x.is_cuda
-                and should_use_custom("program_silu_pair")
-                and namespace_has_op("program_silu_pair")
-            )
+            used_custom = _use_custom_indexed_op(x, "program_silu_pair")
             ctx.used_custom = bool(used_custom)
             if used_custom:
                 return ops_namespace().program_silu_pair(
@@ -1082,12 +1119,7 @@ if torch is not None:
                 b21_stack,
             ) = ctx.saved_tensors
             needs = ctx.needs_input_grad
-            if (
-                bool(getattr(ctx, "used_custom", False))
-                and grad_rel.is_cuda
-                and should_use_custom("program_silu_pair_backward")
-                and namespace_has_op("program_silu_pair_backward")
-            ):
+            if _use_custom_backward(ctx, grad_rel, "program_silu_pair_backward"):
                 (
                     grad_x,
                     grad_w10,
@@ -1114,21 +1146,21 @@ if torch is not None:
                     w21_stack,
                     b21_stack,
                 )
-                grad_map: list[torch.Tensor | None] = [None] * 14
-                for idx, grad in (
-                    (0, grad_x),
-                    (5, grad_w10),
-                    (6, grad_b10),
-                    (7, grad_w20),
-                    (8, grad_b20),
-                    (9, grad_w11),
-                    (10, grad_b11),
-                    (11, grad_w21),
-                    (12, grad_b21),
-                ):
-                    if needs[idx]:
-                        grad_map[idx] = grad
-                return tuple(grad_map)
+                return _assign_requested_grads(
+                    14,
+                    needs,
+                    (
+                        (0, grad_x),
+                        (5, grad_w10),
+                        (6, grad_b10),
+                        (7, grad_w20),
+                        (8, grad_b20),
+                        (9, grad_w11),
+                        (10, grad_b11),
+                        (11, grad_w21),
+                        (12, grad_b21),
+                    ),
+                )
 
             with torch.enable_grad():
                 x_req = _detach_for_grad(x, bool(needs[0]))
@@ -1196,10 +1228,13 @@ if torch is not None:
             ln_bias_stack: torch.Tensor,
             ln_eps: float,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            ctx.slot_offsets = [int(v) for v in slot_offsets]
-            ctx.row_sizes = [int(v) for v in row_sizes]
-            ctx.arity = int(arity)
-            ctx.ln_eps = float(ln_eps)
+            _store_indexed_ctx(
+                ctx,
+                slot_offsets=slot_offsets,
+                row_sizes=row_sizes,
+                arity=arity,
+                ln_eps=float(ln_eps),
+            )
             ctx.save_for_backward(
                 x,
                 relation_args,
@@ -1214,11 +1249,7 @@ if torch is not None:
                 ln_weight_stack,
                 ln_bias_stack,
             )
-            used_custom = (
-                x.is_cuda
-                and should_use_custom("program_silu_postnorm")
-                and namespace_has_op("program_silu_postnorm")
-            )
+            used_custom = _use_custom_indexed_op(x, "program_silu_postnorm")
             ctx.used_custom = bool(used_custom)
             if used_custom:
                 return ops_namespace().program_silu_postnorm(
@@ -1282,12 +1313,7 @@ if torch is not None:
                 ln_bias_stack,
             ) = ctx.saved_tensors
             needs = ctx.needs_input_grad
-            if (
-                bool(getattr(ctx, "used_custom", False))
-                and grad_rel.is_cuda
-                and should_use_custom("program_silu_postnorm_backward")
-                and namespace_has_op("program_silu_postnorm_backward")
-            ):
+            if _use_custom_backward(ctx, grad_rel, "program_silu_postnorm_backward"):
                 (
                     grad_x,
                     grad_w10,
@@ -1319,23 +1345,23 @@ if torch is not None:
                     ln_bias_stack,
                     float(ctx.ln_eps),
                 )
-                grad_map: list[torch.Tensor | None] = [None] * 16
-                for idx, grad in (
-                    (0, grad_x),
-                    (5, grad_w10),
-                    (6, grad_b10),
-                    (7, grad_w20),
-                    (8, grad_b20),
-                    (9, grad_w11),
-                    (10, grad_b11),
-                    (11, grad_w21),
-                    (12, grad_b21),
-                    (13, grad_ln_weight if ln_weight_stack.numel() > 0 else None),
-                    (14, grad_ln_bias if ln_bias_stack.numel() > 0 else None),
-                ):
-                    if grad is not None and needs[idx]:
-                        grad_map[idx] = grad
-                return tuple(grad_map)
+                return _assign_requested_grads(
+                    16,
+                    needs,
+                    (
+                        (0, grad_x),
+                        (5, grad_w10),
+                        (6, grad_b10),
+                        (7, grad_w20),
+                        (8, grad_b20),
+                        (9, grad_w11),
+                        (10, grad_b11),
+                        (11, grad_w21),
+                        (12, grad_b21),
+                        (13, grad_ln_weight if ln_weight_stack.numel() > 0 else None),
+                        (14, grad_ln_bias if ln_bias_stack.numel() > 0 else None),
+                    ),
+                )
 
             with torch.enable_grad():
                 x_req = _detach_for_grad(x, bool(needs[0]))
@@ -1415,10 +1441,13 @@ if torch is not None:
             w21_stack: torch.Tensor,
             b21_stack: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            ctx.slot_offsets = [int(v) for v in slot_offsets]
-            ctx.row_sizes = [int(v) for v in row_sizes]
-            ctx.arity = int(arity)
-            ctx.rms_eps = float(rms_eps)
+            _store_indexed_ctx(
+                ctx,
+                slot_offsets=slot_offsets,
+                row_sizes=row_sizes,
+                arity=arity,
+                rms_eps=float(rms_eps),
+            )
             ctx.save_for_backward(
                 x,
                 relation_args,
@@ -1432,11 +1461,7 @@ if torch is not None:
                 w21_stack,
                 b21_stack,
             )
-            used_custom = (
-                x.is_cuda
-                and should_use_custom("program_rmsnorm_silu")
-                and namespace_has_op("program_rmsnorm_silu")
-            )
+            used_custom = _use_custom_indexed_op(x, "program_rmsnorm_silu")
             ctx.used_custom = bool(used_custom)
             if used_custom:
                 return ops_namespace().program_rmsnorm_silu(
@@ -1497,12 +1522,7 @@ if torch is not None:
                 b21_stack,
             ) = ctx.saved_tensors
             needs = ctx.needs_input_grad
-            if (
-                bool(getattr(ctx, "used_custom", False))
-                and grad_rel.is_cuda
-                and should_use_custom("program_rmsnorm_silu_backward")
-                and namespace_has_op("program_rmsnorm_silu_backward")
-            ):
+            if _use_custom_backward(ctx, grad_rel, "program_rmsnorm_silu_backward"):
                 (
                     grad_x,
                     grad_rms_weight,
@@ -1532,22 +1552,22 @@ if torch is not None:
                     w21_stack,
                     b21_stack,
                 )
-                grad_map: list[torch.Tensor | None] = [None] * 15
-                for idx, grad in (
-                    (0, grad_x),
-                    (5, grad_rms_weight if rms_weight_stack.numel() > 0 else None),
-                    (7, grad_w10),
-                    (8, grad_b10),
-                    (9, grad_w20),
-                    (10, grad_b20),
-                    (11, grad_w11),
-                    (12, grad_b11),
-                    (13, grad_w21),
-                    (14, grad_b21),
-                ):
-                    if grad is not None and needs[idx]:
-                        grad_map[idx] = grad
-                return tuple(grad_map)
+                return _assign_requested_grads(
+                    15,
+                    needs,
+                    (
+                        (0, grad_x),
+                        (5, grad_rms_weight if rms_weight_stack.numel() > 0 else None),
+                        (7, grad_w10),
+                        (8, grad_b10),
+                        (9, grad_w20),
+                        (10, grad_b20),
+                        (11, grad_w11),
+                        (12, grad_b11),
+                        (13, grad_w21),
+                        (14, grad_b21),
+                    ),
+                )
 
             with torch.enable_grad():
                 x_req = _detach_for_grad(x, bool(needs[0]))
@@ -1617,11 +1637,14 @@ if torch is not None:
             ln_eps: float,
             pointwise_code: int,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            ctx.slot_offsets = [int(v) for v in slot_offsets]
-            ctx.row_sizes = [int(v) for v in row_sizes]
-            ctx.arity = int(arity)
-            ctx.ln_eps = float(ln_eps)
-            ctx.pointwise_code = int(pointwise_code)
+            _store_indexed_ctx(
+                ctx,
+                slot_offsets=slot_offsets,
+                row_sizes=row_sizes,
+                arity=arity,
+                ln_eps=float(ln_eps),
+                pointwise_code=int(pointwise_code),
+            )
             ctx.save_for_backward(
                 x,
                 relation_args,
@@ -1632,11 +1655,10 @@ if torch is not None:
                 ln_weight_stack,
                 ln_bias_stack,
             )
-            used_custom = (
-                x.is_cuda
-                and ctx.pointwise_code in CUSTOM_TWO_LAYER_POINTWISE_CODES
-                and should_use_custom("block_postnorm_ln")
-                and namespace_has_op("block_postnorm_ln")
+            used_custom = _use_custom_indexed_op(
+                x,
+                "block_postnorm_ln",
+                extra_condition=ctx.pointwise_code in CUSTOM_TWO_LAYER_POINTWISE_CODES,
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
@@ -1711,12 +1733,7 @@ if torch is not None:
 
             x, relation_args, w1_stack, b1_stack, w2_stack, b2_stack, ln_weight_stack, ln_bias_stack = ctx.saved_tensors
             needs = ctx.needs_input_grad
-            if (
-                bool(getattr(ctx, "used_custom", False))
-                and grad_rel.is_cuda
-                and should_use_custom("block_postnorm_ln_backward")
-                and namespace_has_op("block_postnorm_ln_backward")
-            ):
+            if _use_custom_backward(ctx, grad_rel, "block_postnorm_ln_backward"):
                 grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_ln_weight, grad_ln_bias = (
                     ops_namespace().block_postnorm_ln_backward(
                         grad_rel,
@@ -1735,19 +1752,19 @@ if torch is not None:
                         int(ctx.pointwise_code),
                     )
                 )
-                grad_map: list[torch.Tensor | None] = [None] * 13
-                for idx, grad in (
-                    (0, grad_x),
-                    (5, grad_w1),
-                    (6, grad_b1 if b1_stack.numel() > 0 else None),
-                    (7, grad_w2),
-                    (8, grad_b2 if b2_stack.numel() > 0 else None),
-                    (9, grad_ln_weight if ln_weight_stack.numel() > 0 else None),
-                    (10, grad_ln_bias if ln_bias_stack.numel() > 0 else None),
-                ):
-                    if grad is not None and needs[idx]:
-                        grad_map[idx] = grad
-                return tuple(grad_map)  # type: ignore[return-value]
+                return _assign_requested_grads(
+                    13,
+                    needs,
+                    (
+                        (0, grad_x),
+                        (5, grad_w1),
+                        (6, grad_b1 if b1_stack.numel() > 0 else None),
+                        (7, grad_w2),
+                        (8, grad_b2 if b2_stack.numel() > 0 else None),
+                        (9, grad_ln_weight if ln_weight_stack.numel() > 0 else None),
+                        (10, grad_ln_bias if ln_bias_stack.numel() > 0 else None),
+                    ),
+                )  # type: ignore[return-value]
 
             with torch.enable_grad():
                 x_req = _detach_for_grad(x, bool(needs[0]))
@@ -1811,11 +1828,14 @@ if torch is not None:
             b2_stack: torch.Tensor,
             pointwise_code: int,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            ctx.slot_offsets = [int(v) for v in slot_offsets]
-            ctx.row_sizes = [int(v) for v in row_sizes]
-            ctx.arity = int(arity)
-            ctx.rms_eps = float(rms_eps)
-            ctx.pointwise_code = int(pointwise_code)
+            _store_indexed_ctx(
+                ctx,
+                slot_offsets=slot_offsets,
+                row_sizes=row_sizes,
+                arity=arity,
+                rms_eps=float(rms_eps),
+                pointwise_code=int(pointwise_code),
+            )
             ctx.save_for_backward(
                 x,
                 relation_args,
@@ -1825,11 +1845,10 @@ if torch is not None:
                 w2_stack,
                 b2_stack,
             )
-            used_custom = (
-                x.is_cuda
-                and ctx.pointwise_code in CUSTOM_TWO_LAYER_POINTWISE_CODES
-                and should_use_custom("block_prenorm_rms")
-                and namespace_has_op("block_prenorm_rms")
+            used_custom = _use_custom_indexed_op(
+                x,
+                "block_prenorm_rms",
+                extra_condition=ctx.pointwise_code in CUSTOM_TWO_LAYER_POINTWISE_CODES,
             )
             ctx.used_custom = bool(used_custom)
             if used_custom:
@@ -1887,12 +1906,7 @@ if torch is not None:
 
             x, relation_args, rms_weight_stack, w1_stack, b1_stack, w2_stack, b2_stack = ctx.saved_tensors
             needs = ctx.needs_input_grad
-            if (
-                bool(getattr(ctx, "used_custom", False))
-                and grad_rel.is_cuda
-                and should_use_custom("block_prenorm_rms_backward")
-                and namespace_has_op("block_prenorm_rms_backward")
-            ):
+            if _use_custom_backward(ctx, grad_rel, "block_prenorm_rms_backward"):
                 grad_x, grad_rms_weight, grad_w1, grad_b1, grad_w2, grad_b2 = (
                     ops_namespace().block_prenorm_rms_backward(
                         grad_rel,
@@ -1910,18 +1924,18 @@ if torch is not None:
                         int(ctx.pointwise_code),
                     )
                 )
-                grad_map: list[torch.Tensor | None] = [None] * 12
-                for idx, grad in (
-                    (0, grad_x),
-                    (5, grad_rms_weight if rms_weight_stack.numel() > 0 else None),
-                    (7, grad_w1),
-                    (8, grad_b1 if b1_stack.numel() > 0 else None),
-                    (9, grad_w2),
-                    (10, grad_b2 if b2_stack.numel() > 0 else None),
-                ):
-                    if grad is not None and needs[idx]:
-                        grad_map[idx] = grad
-                return tuple(grad_map)  # type: ignore[return-value]
+                return _assign_requested_grads(
+                    12,
+                    needs,
+                    (
+                        (0, grad_x),
+                        (5, grad_rms_weight if rms_weight_stack.numel() > 0 else None),
+                        (7, grad_w1),
+                        (8, grad_b1 if b1_stack.numel() > 0 else None),
+                        (9, grad_w2),
+                        (10, grad_b2 if b2_stack.numel() > 0 else None),
+                    ),
+                )  # type: ignore[return-value]
 
             with torch.enable_grad():
                 x_req = _detach_for_grad(x, bool(needs[0]))

@@ -5,8 +5,18 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor
 
-from ._ops_env import relm_mp_ops
+from ._ops_env import relmo_mp_ops as _relmo_mp_ops_backend
 from ._tensor_utils import _cat_or_single
+
+relm_mp_ops = _relmo_mp_ops_backend
+
+
+class _RelmoOpsProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(relm_mp_ops, name)
+
+
+relmo_mp_ops = _RelmoOpsProxy()
 
 
 def _fanout_scatter_multi_src(
@@ -25,12 +35,12 @@ def _fanout_scatter_multi_src(
         x_parts.append(x_src)
         src_parts.append(src_idx)
         flat_parts.append(flat_dst)
-    x_cat, src_global, flat_dst = relm_mp_ops.fanout_pack_multi(  # type: ignore[union-attr]
+    x_cat, src_global, flat_dst = relmo_mp_ops.fanout_pack_multi(
         x_parts,
         src_parts,
         flat_parts,
     )
-    return relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
+    return relmo_mp_ops.fanout_scatter(
         x_cat, src_global, flat_dst, int(out_rows)
     )
 
@@ -100,7 +110,7 @@ def _fanout_scatter_from_plan(
             raise ValueError(
                 f"Source size changed for {src!r}: expected {expected_rows}, got {int(x_src.size(0))}."
             )
-        return relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
+        return relmo_mp_ops.fanout_scatter(  # type: ignore[union-attr]
             x_src, plan["src_global"], plan["flat_dst"], int(out_rows)
         )
 
@@ -121,6 +131,6 @@ def _fanout_scatter_from_plan(
         raise ValueError(
             f"Fanout plan x_rows mismatch: expected {plan['x_rows']}, got {int(x_cat.size(0))}."
         )
-    return relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
+    return relmo_mp_ops.fanout_scatter(  # type: ignore[union-attr]
         x_cat, plan["src_global"], plan["flat_dst"], int(out_rows)
     )

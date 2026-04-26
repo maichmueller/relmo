@@ -31,13 +31,13 @@ import mifrost
 
 from ._compile import optional_compile
 from ..ops import mp as relm_mp_ops
-from .flat_contract import (
+from .flat_relational.flat_contract import (
     FlatExecutionPolicy,
     _FlatPreparedBatch,
     normalize_optional_index_tensor,
 )
 from .flat_relational_gnn import FlatRelationalGNN
-from .flat_relational import FlatTopology
+from .flat_relational.types import FlatTopology
 from .mlp import ArityMLPFactory, SimpleMLP
 
 
@@ -502,13 +502,6 @@ class FlatLGANRelationalGNN(FlatRelationalGNN):
     def _use_lgan_pool_reduce_op(self) -> bool:
         return self._indexed_reduce_kind in {"sum", "mean"} and relm_mp_ops.available()
 
-    def _use_kernelized_relation_instance_path(self, entity_embeddings: Tensor) -> bool:
-        if self._indexed_reduce_kind not in {"sum", "mean"}:
-            return False
-        return self.relational_layer._use_relation_kernels(
-            entity_embeddings
-        ) or self.relational_layer._use_program_kernels(entity_embeddings)
-
     @optional_compile(enable_attr="_compile_forward", backend="inductor", dynamic=True)
     def _compute_entity_embeddings_prepared(
         self,
@@ -523,102 +516,59 @@ class FlatLGANRelationalGNN(FlatRelationalGNN):
         lgan_topology = prepared_batch.lgan_topology
         entity_embeddings = self.initialize_embeddings(prepared_batch.x)
         for _ in range(self.num_layers):
-            if self._use_kernelized_relation_instance_path(entity_embeddings):
-                integrated = self.relational_layer._run_lgan_pointwise_step(
+            slot_messages = self._build_relation_slot_messages(
+                entity_embeddings, prepared_batch, cache=cache
+            )
+            if int(slot_messages.numel()) == 0:
+                relation_pair_x = entity_embeddings.new_zeros(
+                    (int(lgan_topology.relation_instance_count), self.embedding_size)
+                )
+                tn_msgs = entity_embeddings.new_zeros(entity_embeddings.shape)
+                nn_msgs = entity_embeddings.new_zeros(entity_embeddings.shape)
+            elif self._use_lgan_pool_reduce_op():
+                relation_pair_x, tn_msgs, nn_msgs = relm_mp_ops._lgan_pool_reduce(
+                    slot_messages,
+                    lgan_topology.slot_to_relation_instance,
+                    lgan_topology.relation_instance_arities,
+                    prepared_batch.lgan_rr_src_relation_indices,
+                    prepared_batch.lgan_rr_dst_relation_indices,
+                    prepared_batch.lgan_tn_relation_indices,
+                    prepared_batch.lgan_tn_entity_indices,
+                    prepared_batch.lgan_nn_relation_indices,
+                    prepared_batch.lgan_nn_entity_indices,
+                    entity_dim_size=int(entity_embeddings.size(0)),
+                    mode=str(self._indexed_reduce_kind),
+                )
+            else:
+                relation_pair_x = self.relational_layer.collect_relation_instance_messages(
                     entity_embeddings,
                     prepared_batch.relation_args,
                     prepared_batch.topology,
-                    rr_src=prepared_batch.lgan_rr_src_relation_indices,
-                    rr_dst=prepared_batch.lgan_rr_dst_relation_indices,
-                    tn_rel=prepared_batch.lgan_tn_relation_indices,
-                    tn_ent=prepared_batch.lgan_tn_entity_indices,
-                    nn_rel=prepared_batch.lgan_nn_relation_indices,
-                    nn_ent=prepared_batch.lgan_nn_entity_indices,
-                    entity_dim_size=int(entity_embeddings.size(0)),
-                    mode=str(self._indexed_reduce_kind),
                     cache=cache,
                 )
-                if integrated is not None:
-                    relation_pair_x, tn_msgs, nn_msgs = integrated
-                else:
-                    relation_pair_x = self.relational_layer._collect_relation_instance_messages(
-                        entity_embeddings,
-                        prepared_batch.relation_args,
-                        prepared_batch.topology,
-                        cache=cache,
-                    )
-                    if relation_pair_x is None or int(relation_pair_x.numel()) == 0:
-                        relation_pair_x = entity_embeddings.new_zeros(
-                            (int(lgan_topology.relation_instance_count), self.embedding_size)
-                        )
-                        tn_msgs = entity_embeddings.new_zeros(entity_embeddings.shape)
-                        nn_msgs = entity_embeddings.new_zeros(entity_embeddings.shape)
-                    else:
-                        relation_pair_x, tn_msgs, nn_msgs = relm_mp_ops._lgan_relation_graph_step(
-                            relation_pair_x,
-                            prepared_batch.lgan_rr_src_relation_indices,
-                            prepared_batch.lgan_rr_dst_relation_indices,
-                            prepared_batch.lgan_tn_relation_indices,
-                            prepared_batch.lgan_tn_entity_indices,
-                            prepared_batch.lgan_nn_relation_indices,
-                            prepared_batch.lgan_nn_entity_indices,
-                            entity_dim_size=int(entity_embeddings.size(0)),
-                            mode=str(self._indexed_reduce_kind),
-                        )
-            else:
-                slot_messages = self._build_relation_slot_messages(
-                    entity_embeddings, prepared_batch, cache=cache
-                )
-                if int(slot_messages.numel()) == 0:
+                if relation_pair_x is None:
                     relation_pair_x = entity_embeddings.new_zeros(
                         (int(lgan_topology.relation_instance_count), self.embedding_size)
                     )
-                    tn_msgs = entity_embeddings.new_zeros(entity_embeddings.shape)
-                    nn_msgs = entity_embeddings.new_zeros(entity_embeddings.shape)
-                elif self._use_lgan_pool_reduce_op():
-                    relation_pair_x, tn_msgs, nn_msgs = relm_mp_ops._lgan_pool_reduce(
-                        slot_messages,
-                        lgan_topology.slot_to_relation_instance,
-                        lgan_topology.relation_instance_arities,
-                        prepared_batch.lgan_rr_src_relation_indices,
-                        prepared_batch.lgan_rr_dst_relation_indices,
-                        prepared_batch.lgan_tn_relation_indices,
-                        prepared_batch.lgan_tn_entity_indices,
-                        prepared_batch.lgan_nn_relation_indices,
-                        prepared_batch.lgan_nn_entity_indices,
-                        entity_dim_size=int(entity_embeddings.size(0)),
-                        mode=str(self._indexed_reduce_kind),
-                    )
-                else:
-                    relation_pair_x = self.relational_layer._collect_relation_instance_messages(
-                        entity_embeddings,
-                        prepared_batch.relation_args,
-                        prepared_batch.topology,
-                        cache=cache,
-                    )
-                    if relation_pair_x is None:
-                        relation_pair_x = entity_embeddings.new_zeros(
-                            (int(lgan_topology.relation_instance_count), self.embedding_size)
-                        )
-                    rr_msgs = self._aggregate_indexed(
-                        relation_pair_x,
-                        prepared_batch.lgan_rr_src_relation_indices,
-                        prepared_batch.lgan_rr_dst_relation_indices,
-                        dim_size=int(lgan_topology.relation_instance_count),
-                    )
-                    relation_pair_x = relation_pair_x + rr_msgs
-                    tn_msgs = self._aggregate_indexed(
-                        relation_pair_x,
-                        prepared_batch.lgan_tn_relation_indices,
-                        prepared_batch.lgan_tn_entity_indices,
-                        dim_size=int(entity_embeddings.size(0)),
-                    )
-                    nn_msgs = self._aggregate_indexed(
-                        relation_pair_x,
-                        prepared_batch.lgan_nn_relation_indices,
-                        prepared_batch.lgan_nn_entity_indices,
-                        dim_size=int(entity_embeddings.size(0)),
-                    )
+                rr_msgs = self._aggregate_indexed(
+                    relation_pair_x,
+                    prepared_batch.lgan_rr_src_relation_indices,
+                    prepared_batch.lgan_rr_dst_relation_indices,
+                    dim_size=int(lgan_topology.relation_instance_count),
+                )
+                relation_pair_x = relation_pair_x + rr_msgs
+                tn_msgs = self._aggregate_indexed(
+                    relation_pair_x,
+                    prepared_batch.lgan_tn_relation_indices,
+                    prepared_batch.lgan_tn_entity_indices,
+                    dim_size=int(entity_embeddings.size(0)),
+                )
+                nn_msgs = self._aggregate_indexed(
+                    relation_pair_x,
+                    prepared_batch.lgan_nn_relation_indices,
+                    prepared_batch.lgan_nn_entity_indices,
+                    dim_size=int(entity_embeddings.size(0)),
+                )
             updated = self.fusion_updater(
                 torch.cat([entity_embeddings, tn_msgs, nn_msgs], dim=1)
             )

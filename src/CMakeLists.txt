@@ -24,6 +24,8 @@ set(_relm_torch_cuda_raw "cpu")
 set(_relm_torch_cuda_tag "cpu")
 set(_relm_torch_abi_target "unknown")
 set(_relm_torch_link_target "")
+set(_relm_pkg_dir "${CMAKE_SOURCE_DIR}/src/relmo")
+set(_relm_legacy_mp_artifact "${_relm_pkg_dir}/relm_relmp_ops${CMAKE_SHARED_LIBRARY_SUFFIX}")
 string(TOUPPER "${RELM_MP_OPS}" _relm_mp_mode)
 
 set(_relm_mp_modes AUTO ON OFF)
@@ -154,15 +156,21 @@ if (_relm_mp_enabled)
     set_target_properties(relm_mp_ops PROPERTIES BUILD_RPATH "${_relm_rpath}" INSTALL_RPATH "${_relm_rpath}" INSTALL_RPATH_USE_LINK_PATH FALSE)
 
     if (RELM_RPATH_MODE STREQUAL "dev")
-        set_target_properties(relm_mp_ops PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/src/relmo")
+        file(REMOVE "${_relm_legacy_mp_artifact}")
+        set_target_properties(relm_mp_ops PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${_relm_pkg_dir}")
+        add_custom_command(
+                TARGET relm_mp_ops POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E rm -f "${_relm_legacy_mp_artifact}"
+        )
     endif ()
 
     install(TARGETS relm_mp_ops LIBRARY DESTINATION "relmo")
+    install(CODE "file(REMOVE \"\${CMAKE_INSTALL_PREFIX}/relmo/relm_relmp_ops${CMAKE_SHARED_LIBRARY_SUFFIX}\")")
 else ()
     install(CODE "file(REMOVE \"\${CMAKE_INSTALL_PREFIX}/relmo/relm_mp_ops${CMAKE_SHARED_LIBRARY_SUFFIX}\")")
     install(CODE "file(REMOVE \"\${CMAKE_INSTALL_PREFIX}/relmo/relm_relmp_ops${CMAKE_SHARED_LIBRARY_SUFFIX}\")")
     if (RELM_RPATH_MODE STREQUAL "dev")
-        file(REMOVE "${CMAKE_SOURCE_DIR}/src/relmo/relm_mp_ops${CMAKE_SHARED_LIBRARY_SUFFIX}")
-        file(REMOVE "${CMAKE_SOURCE_DIR}/src/relmo/relm_relmp_ops${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        file(REMOVE "${_relm_pkg_dir}/relm_mp_ops${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        file(REMOVE "${_relm_legacy_mp_artifact}")
     endif ()
 endif ()

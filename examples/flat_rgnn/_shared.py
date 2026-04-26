@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping
 
 import mifrost
 import pymimir
-import torch
 
-from relm.models import FlatExecutionPolicy, TwoLayerPointwiseRelationMLP, RelationProgram
+from relmo.models import FlatExecutionPolicy
+from relmo.models.builders import (
+    EAGER_POLICY,
+    RelationProgram,
+    TwoLayerPointwiseRelationMLP,
+    build_eager_fallback_modules,
+    build_program_relation_modules,
+    build_relations,
+    build_typed_relation_modules,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,73 +32,6 @@ def load_problem(
     goals = list(problem.get_goal_condition().get_literals())
     actions = list(state.generate_applicable_actions())
     return domain, problem, state, goals, actions
-
-
-def build_relations(batch) -> dict[str, int]:
-    return {
-        name: int(arity)
-        for name, arity in zip(batch.relation_names, batch.relation_arities)
-    }
-
-
-def build_typed_relation_modules(
-    relations: Mapping[str, int],
-    *,
-    embedding_size: int = 32,
-    activation: str = "silu",
-):
-    modules = {}
-    for name, arity in relations.items():
-        width = int(arity) * embedding_size
-        hidden = max(64, width)
-        modules[name] = TwoLayerPointwiseRelationMLP(
-            width=width,
-            hidden=hidden,
-            activation=activation,
-        )
-    return modules
-
-
-def build_program_relation_modules(
-    relations: Mapping[str, int],
-    *,
-    embedding_size: int = 32,
-    activation: str = "silu",
-):
-    modules = {}
-    for name, arity in relations.items():
-        width = int(arity) * embedding_size
-        hidden = max(64, width)
-        modules[name] = RelationProgram(
-            TwoLayerPointwiseRelationMLP(width=width, hidden=hidden, activation=activation),
-            TwoLayerPointwiseRelationMLP(width=width, hidden=hidden, activation=activation),
-        )
-    return modules
-
-
-def build_eager_fallback_modules(
-    relations: Mapping[str, int],
-    *,
-    embedding_size: int = 32,
-):
-    modules = {}
-    for name, arity in relations.items():
-        width = int(arity) * embedding_size
-        hidden = max(64, width)
-        modules[name] = torch.nn.Sequential(
-            torch.nn.Linear(width, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, width),
-        )
-    return modules
-
-
-EAGER_POLICY = FlatExecutionPolicy(
-    relation_kernels="off",
-    program_kernels="off",
-    relation_gather="off",
-)
-
 KERNEL_POLICY = FlatExecutionPolicy(
     relation_kernels="auto",
     program_kernels="auto",

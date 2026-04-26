@@ -27,7 +27,7 @@ from .mp_autograd import (
     _LGANRelationGraphStepFunction,
 )
 from .mp_constants import MODE_LOGSUMEXP, MODE_MEAN, MODE_SUM, activation_code
-from .mp_dispatch import namespace_has_op, ops_namespace, require_available_custom_op, should_use_custom
+from .mp_dispatch import dispatch_namespace_op, should_use_custom
 from .mp_fallbacks import (
     block_pointwise_pool_python,
     fanin_pack_from_edges_python,
@@ -76,11 +76,13 @@ def fanout_pack_multi(
     flat_dst_parts: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     require_torch("fanout_pack_multi")
-    if should_use_custom("fanout_pack_multi"):
-        if namespace_has_op("fanout_pack_multi"):
-            return ops_namespace().fanout_pack_multi(x_parts, src_idx_parts, flat_dst_parts)
-        require_available_custom_op("fanout_pack_multi")
-    return fanout_pack_multi_python(x_parts, src_idx_parts, flat_dst_parts)
+    return dispatch_namespace_op(
+        "fanout_pack_multi",
+        x_parts,
+        src_idx_parts,
+        flat_dst_parts,
+        fallback=fanout_pack_multi_python,
+    )
 
 
 def fanin_pack_multi(
@@ -89,11 +91,13 @@ def fanin_pack_multi(
     dst_idx_parts: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     require_torch("fanin_pack_multi")
-    if should_use_custom("fanin_pack_multi"):
-        if namespace_has_op("fanin_pack_multi"):
-            return ops_namespace().fanin_pack_multi(rel_parts, flat_src_parts, dst_idx_parts)
-        require_available_custom_op("fanin_pack_multi")
-    return fanin_pack_multi_python(rel_parts, flat_src_parts, dst_idx_parts)
+    return dispatch_namespace_op(
+        "fanin_pack_multi",
+        rel_parts,
+        flat_src_parts,
+        dst_idx_parts,
+        fallback=fanin_pack_multi_python,
+    )
 
 
 def fanout_pack_from_edges(
@@ -106,19 +110,8 @@ def fanout_pack_from_edges(
     slot_offset_parts: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     require_torch("fanout_pack_from_edges")
-    if should_use_custom("fanout_pack_from_edges"):
-        if namespace_has_op("fanout_pack_from_edges"):
-            return ops_namespace().fanout_pack_from_edges(
-                x_parts,
-                edge_src_parts,
-                edge_dst_parts,
-                src_part_ids,
-                arity_parts,
-                pos_parts,
-                slot_offset_parts,
-            )
-        require_available_custom_op("fanout_pack_from_edges")
-    return fanout_pack_from_edges_python(
+    return dispatch_namespace_op(
+        "fanout_pack_from_edges",
         x_parts,
         edge_src_parts,
         edge_dst_parts,
@@ -126,6 +119,7 @@ def fanout_pack_from_edges(
         arity_parts,
         pos_parts,
         slot_offset_parts,
+        fallback=fanout_pack_from_edges_python,
     )
 
 
@@ -139,19 +133,8 @@ def fanin_pack_from_edges(
     mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     require_torch("fanin_pack_from_edges")
-    if should_use_custom("fanin_pack_from_edges"):
-        if namespace_has_op("fanin_pack_from_edges"):
-            return ops_namespace().fanin_pack_from_edges(
-                rel_parts,
-                edge_src_parts,
-                edge_dst_parts,
-                rel_part_ids,
-                arity_parts,
-                pos_parts,
-                int(mode),
-            )
-        require_available_custom_op("fanin_pack_from_edges")
-    return fanin_pack_from_edges_python(
+    return dispatch_namespace_op(
+        "fanin_pack_from_edges",
         rel_parts,
         edge_src_parts,
         edge_dst_parts,
@@ -159,6 +142,7 @@ def fanin_pack_from_edges(
         arity_parts,
         pos_parts,
         int(mode),
+        fallback=fanin_pack_from_edges_python,
     )
 
 
@@ -206,27 +190,8 @@ def block_pointwise_pool(
     """Run a 2-layer pointwise block and return pooled relation-row outputs."""
 
     require_torch("block_pointwise_pool")
-    use_custom = (
-        x.is_cuda
-        and should_use_custom("block_pointwise_pool")
-        and namespace_has_op("block_pointwise_pool")
-    )
-    if use_custom:
-        return ops_namespace().block_pointwise_pool(
-            x,
-            relation_args,
-            list(slot_offsets),
-            list(row_sizes),
-            int(arity),
-            w1_stack,
-            b1_stack,
-            w2_stack,
-            b2_stack,
-            int(pointwise_code),
-        )
-    if should_use_custom("block_pointwise_pool"):
-        require_available_custom_op("block_pointwise_pool")
-    return block_pointwise_pool_python(
+    return dispatch_namespace_op(
+        "block_pointwise_pool",
         x,
         relation_args,
         list(slot_offsets),
@@ -237,6 +202,9 @@ def block_pointwise_pool(
         w2_stack,
         b2_stack,
         int(pointwise_code),
+        fallback=block_pointwise_pool_python,
+        tensor=x,
+        require_cuda=True,
     )
 
 

@@ -21,6 +21,7 @@ from relmo.models import (
     TwoLayerPointwiseRelationMLP,
 )
 from relmo.models.flat_relational import kernels as flat_kernels_module
+from relmo.models.flat_relational import topology as flat_topology_module
 from relmo.models.flat_relational import types as flat_types_module
 from tests.python.support.program_family_reference import (
     execute_program_prenorm_two_layer_silu_rmsnorm_then_two_layer_silu_reference,
@@ -41,7 +42,7 @@ class _CustomSpecPostNormTwoLayerSiLU(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.lin2(self.act(self.lin1(x))))
 
-    def relmo_kernel_spec(self) -> RelationBlockSpec:
+    def kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
@@ -390,7 +391,7 @@ def test_constructor_validates_declared_relation_block_width() -> None:
 def test_build_flat_topology_counts_and_offsets() -> None:
     relation_counts = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
     relation_arities = torch.tensor([2, 1], dtype=torch.long)
-    topology = flat_types_module.build_flat_topology(relation_counts, relation_arities)
+    topology = flat_topology_module.build_flat_topology(relation_counts, relation_arities)
     assert topology.relation_counts_total == (3, 3)
     assert topology.relation_arities == (2, 1)
     assert topology.slot_offsets == (0, 6, 9)
@@ -558,6 +559,7 @@ def test_flat_relational_layer_accepts_pyg_aggregation_object() -> None:
         (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="mish"), flat_kernels_module.MishBlockKernel),
         (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="silu"), flat_kernels_module.SiLUBlockKernel),
         (lambda width: TwoLayerPointwiseRelationMLP(width, 16, activation="gelu"), flat_kernels_module.GELUBlockKernel),
+        (lambda width: PostNormTwoLayerPointwiseRelationMLP(width, 16, activation="mish", norm="layernorm"), flat_kernels_module.PostNormMishLayerNormKernel),
         (lambda width: PostNormTwoLayerPointwiseRelationMLP(width, 16, activation="silu", norm="layernorm"), flat_kernels_module.PostNormSiLULayerNormKernel),
         (lambda width: _CustomSpecPostNormTwoLayerSiLU(width, 16), flat_kernels_module.PostNormSiLULayerNormKernel),
     ],
@@ -642,15 +644,19 @@ def test_unsupported_custom_module_falls_back_to_eager_execution() -> None:
         ThreeLayerPointwiseRelationMLP(8, 16, 12, activation="silu"),
     ],
 )
-def test_non_kernel_modules_fall_back_to_eager_execution(module: torch.nn.Module) -> None:
+def test_non_kernel_modules_are_recognized_but_not_executable(module: torch.nn.Module) -> None:
     model, relation_slice = _make_program_model(module)
-    assert model.relational_layer._match_kernel(relation_slice) is None
+    match = model.relational_layer._match_kernel(relation_slice)
+    assert match is not None
+    assert match.kernel is None
 
 
 def test_custom_kernel_sequence_is_used_as_is() -> None:
     module = TwoLayerPointwiseRelationMLP(8, 16, activation="silu")
     model, relation_slice = _make_program_model(module, relation_kernels=())
-    assert model.relational_layer._match_kernel(relation_slice) is None
+    match = model.relational_layer._match_kernel(relation_slice)
+    assert match is not None
+    assert match.kernel is None
 
 
 def test_compute_entity_embeddings_rejects_raw_payload() -> None:

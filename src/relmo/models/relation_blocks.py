@@ -10,12 +10,14 @@ from __future__ import annotations
 
 from typing import Iterable, Literal
 
+from dataclasses import dataclass
+from typing import Any, Hashable, Protocol, Sequence, TypeAlias
 import torch
 
-from .relation_block_spec import RelationBlockSpec
-
-PointwiseKind = Literal["identity", "relu", "mish", "gelu", "silu", "tanh"]
-NormKind = Literal["layernorm", "rmsnorm"]
+RelationBlockOpPayload: TypeAlias = int | torch.nn.Module
+RelationBlockOp: TypeAlias = tuple[str, RelationBlockOpPayload]
+PointwiseKind: TypeAlias = Literal["identity", "relu", "mish", "gelu", "silu", "tanh"]
+NormKind: TypeAlias = Literal["layernorm", "rmsnorm"]
 
 
 def _make_pointwise(
@@ -52,11 +54,46 @@ def _make_norm(
     if norm_name == "layernorm":
         return torch.nn.LayerNorm(width, eps=eps, elementwise_affine=affine)
     if norm_name == "rmsnorm":
-        rmsnorm_cls = getattr(torch.nn, "RMSNorm", None)
-        if rmsnorm_cls is None:
-            raise RuntimeError("RMSNorm is unavailable in this torch build.")
-        return rmsnorm_cls(width, eps=eps, elementwise_affine=affine)
+        try:
+            from torch.nn import RMSNorm
+        except ImportError as exc:  # pragma: no cover - depends on torch build
+            raise RuntimeError(
+                f"RMSNorm available only in torch 2.10+. This torch version is {torch.__version__}"
+            ) from exc
+        return RMSNorm(width, eps=eps, elementwise_affine=affine)
     raise ValueError(f"Unsupported norm kind: {norm!r}.")
+
+
+@dataclass(frozen=True)
+class RelationBlockSpec:
+    """Declarative description of a width-preserving relation block.
+
+    Attributes:
+        linears:
+            Linear layers referenced by ``("linear", idx)`` operations.
+        ops:
+            Ordered operations. Supported items are:
+            ``("linear", int-index-into-linears)``
+            ``("pointwise", torch.nn.Module)``
+            ``("norm", torch.nn.Module)``
+        signature:
+            Optional explicit grouping key. If omitted, relmo derives one from
+            the ordered op structure.
+    """
+
+    linears: Sequence[torch.nn.Linear]
+    ops: Sequence[RelationBlockOp]
+    signature: Hashable | None = None
+
+
+class RelationBlockProto(Protocol):
+    """
+    Relation blocks may expose a declarative spec that allows the flat runtime to
+    match them against exact CUDA kernel families. Modules without a spec remain
+    fully supported through the eager fallback path.
+    """
+
+    def kernel_spec(self) -> RelationBlockSpec | dict[str, Any] | None: ...
 
 
 class TwoLayerPointwiseRelationMLP(torch.nn.Module):
@@ -80,7 +117,7 @@ class TwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin2(self.act(self.lin1(x)))
 
-    def relmo_kernel_spec(self) -> RelationBlockSpec:
+    def kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
@@ -116,7 +153,7 @@ class PreNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin2(self.act(self.lin1(self.norm(x))))
 
-    def relmo_kernel_spec(self) -> RelationBlockSpec:
+    def kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
@@ -153,7 +190,7 @@ class PostNormTwoLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.lin2(self.act(self.lin1(x))))
 
-    def relmo_kernel_spec(self) -> RelationBlockSpec:
+    def kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2],
             ops=[
@@ -189,7 +226,7 @@ class ThreeLayerPointwiseRelationMLP(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin3(self.act2(self.lin2(self.act1(self.lin1(x)))))
 
-    def relmo_kernel_spec(self) -> RelationBlockSpec:
+    def kernel_spec(self) -> RelationBlockSpec:
         return RelationBlockSpec(
             linears=[self.lin1, self.lin2, self.lin3],
             ops=[

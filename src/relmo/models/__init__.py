@@ -1,23 +1,31 @@
-"""Relational GNN models and flat relation building blocks."""
+"""Relational GNN models and model-construction facades."""
 
-from .flat_contract import FlatBatchInput, FlatExecutionPolicy, FlatRelationalOutput
-from .centralized_flat_relational_gnn import (
-    CentralizedFlatRelationModule,
-    CentralizedFlatRelationalGNN,
-)
-from .flat_lgan_relational_gnn import FlatLGANRelationalGNN
-from .flat_relational_gnn import FlatRelationalGNN
-from .flat_relational import FlatRelationKernel
-from .mlp import ArityMLPFactory
-from .relation_block_spec import RelationBlockCompatible, RelationBlockSpec
-from .relation_blocks import (
+from . import builders, flat, hetero
+from .builders import (
+    ArityMLPFactory,
+    EAGER_POLICY,
     PostNormTwoLayerPointwiseRelationMLP,
     PreNormTwoLayerPointwiseRelationMLP,
+    RelationBlockProto,
+    RelationBlockSpec,
     RelationProgram,
     ThreeLayerPointwiseRelationMLP,
     TwoLayerPointwiseRelationMLP,
+    build_eager_fallback_modules,
+    build_program_relation_modules,
+    build_relations,
+    build_typed_relation_modules,
 )
-from .relational_gnn import (
+from .flat import (
+    CentralizedFlatRelationModule,
+    CentralizedFlatRelationalGNN,
+    FlatBatchInput,
+    FlatExecutionPolicy,
+    FlatLGANRelationalGNN,
+    FlatRelationalGNN,
+    FlatRelationalOutput,
+)
+from .hetero import (
     CentralizedRelationalGNN,
     FastRelationalGNN,
     LGANRelationalGNN,
@@ -26,15 +34,22 @@ from .relational_gnn import (
 
 __all__ = [
     "ArityMLPFactory",
+    "builders",
+    "build_eager_fallback_modules",
+    "build_program_relation_modules",
+    "build_relations",
+    "build_typed_relation_modules",
     "FlatExecutionPolicy",
     "FlatBatchInput",
     "CentralizedFlatRelationModule",
     "CentralizedFlatRelationalGNN",
-    "FlatRelationKernel",
+    "EAGER_POLICY",
+    "flat",
     "FlatLGANRelationalGNN",
     "FlatRelationalGNN",
     "FlatRelationalOutput",
-    "RelationBlockCompatible",
+    "hetero",
+    "RelationBlockProto",
     "RelationBlockSpec",
     "RelationProgram",
     "TwoLayerPointwiseRelationMLP",

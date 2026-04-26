@@ -1,7 +1,7 @@
 """Flat relation layer facade.
 
-This module intentionally keeps only orchestration/wiring. Matching, kernel
-execution, and collection logic lives under ``relmo.models.flat_relational``.
+This module keeps the orchestration surface only. Matching, execution,
+collection, and topology helpers live under ``relmo.models.flat_relational``.
 """
 
 from __future__ import annotations
@@ -14,28 +14,18 @@ from torch import Tensor
 from torch_geometric.nn.resolver import aggregation_resolver
 
 from .aggr import LogSumExpAggregation
-from .flat_contract import FlatExecutionPolicy
-from .flat_kernel_runtime import KernelExecutionLayout
-from .flat_relational import (
-    FlatRelationCollectorMixin,
-    FlatRelationKernel,
-    FlatRelationMatchingMixin,
-    FlatRelationRunnerMixin,
-    FlatTopology,
-    KernelMatch,
-    build_default_kernel_registry,
+from .flat_relational.flat_contract import FlatExecutionPolicy
+from .flat_relational import collection
+from .flat_relational.kernels import FlatRelationKernel, build_default_kernel_registry
+from .flat_relational.topology import (
     build_flat_topology,
     normalize_relation_arities,
     topology_cache_key,
 )
+from .flat_relational.types import FlatTopology
 
 
-class FlatRelationalLayer(
-    FlatRelationCollectorMixin,
-    FlatRelationRunnerMixin,
-    FlatRelationMatchingMixin,
-    torch.nn.Module,
-):
+class FlatRelationalLayer(torch.nn.Module):
     """Flat relation message passing over packed relation tensors."""
 
     def __init__(
@@ -79,13 +69,8 @@ class FlatRelationalLayer(
         self._persistent_topology_cache: dict[
             tuple[tuple[int, ...], tuple[int, ...]], FlatTopology
         ] = {}
-        self._relation_block_info_cache: dict[int, dict[str, Any] | None] = {}
-        self._persistent_grouped_param_stacks: dict[
-            tuple[Any, ...], dict[str, Any]
-        ] = {}
-        self._kernel_match_cache: dict[tuple[int, int], KernelMatch | None] = {}
         self._persistent_kernel_layout_cache: dict[
-            tuple[tuple[int, ...], tuple[int, ...]], KernelExecutionLayout
+            tuple[tuple[int, ...], tuple[int, ...]], collection.KernelExecutionLayout
         ] = {}
 
         self.kernels = (
@@ -93,15 +78,17 @@ class FlatRelationalLayer(
             if kernels is not None
             else build_default_kernel_registry()
         )
-        self._centralized_batch_spec_cache = self._build_centralized_batch_spec()
+        self._centralized_batch_spec_cache = collection.build_centralized_batch_spec(
+            self
+        )
 
-    def _use_relation_kernels(self, x: Tensor) -> bool:
+    def use_relation_kernels(self, x: Tensor) -> bool:
         return self.execution_policy.use_relation_kernels(device=x.device)
 
-    def _use_program_kernels(self, x: Tensor) -> bool:
+    def use_program_kernels(self, x: Tensor) -> bool:
         return self.execution_policy.use_program_kernels(device=x.device)
 
-    def _use_relation_gather(self, x: Tensor) -> bool:
+    def use_relation_gather(self, x: Tensor) -> bool:
         return self.execution_policy.use_relation_gather(device=x.device)
 
     def get_topology(
@@ -144,6 +131,63 @@ class FlatRelationalLayer(
         msgs, idx = collected
         return self.aggr(x=msgs, index=idx, dim=0, dim_size=int(x.size(0)))
 
+    def _get_kernel_layout(
+        self,
+        topology: FlatTopology,
+        *,
+        cache: dict | None = None,
+    ) -> collection.KernelExecutionLayout:
+        return collection.build_kernel_execution_layout(self, topology, cache=cache)
+
+    def collect_messages(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        *,
+        cache: dict | None = None,
+    ) -> tuple[Tensor, Tensor] | None:
+        return collection.collect_messages(
+            self,
+            x,
+            relation_args,
+            topology,
+            cache=cache,
+        )
+
+    def collect_slot_messages(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        *,
+        cache: dict | None = None,
+    ) -> Tensor | None:
+        return collection.collect_slot_messages(
+            self,
+            x,
+            relation_args,
+            topology,
+            cache=cache,
+        )
+
+    def collect_relation_instance_messages(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        topology: FlatTopology,
+        *,
+        cache: dict | None = None,
+    ) -> Tensor | None:
+        return collection.collect_relation_instance_messages(
+            self,
+            x,
+            relation_args,
+            topology,
+            cache=cache,
+        )
+
+
     def forward(
         self,
         x: Tensor,
@@ -156,9 +200,9 @@ class FlatRelationalLayer(
     ) -> Tensor:
         if x.dim() != 2:
             raise ValueError(f"x must be rank-2, got shape {tuple(x.shape)}.")
-        if int(x.size(1)) != self.embedding_size:
+        if x.size(1) != self.embedding_size:
             raise ValueError(
-                f"x must have feature size {self.embedding_size}, got {int(x.size(1))}."
+                f"x must have feature size {self.embedding_size}, got {x.size(1)}."
             )
         relation_args = relation_args.to(device=x.device).view(-1)
         if relation_args.dtype not in (torch.int32, torch.int64):
@@ -174,8 +218,12 @@ class FlatRelationalLayer(
                 f"{int(topology.slot_offsets[-1])}."
             )
 
-        collected = self._collect_messages(
-            x, relation_args, topology, cache=cache
+        collected = collection.collect_messages(
+            self,
+            x,
+            relation_args,
+            topology,
+            cache=cache,
         )
         return self._aggregate_messages(x=x, collected=collected)
 

@@ -1,59 +1,18 @@
-"""Flat relational internals split by subsystem."""
+"""Internal flat relational implementation package.
 
-from .collectors import FlatRelationCollectorMixin
-from .kernels import (
-    FlatRelationKernel,
-    GELUBlockKernel,
-    MishBlockKernel,
-    PostNormMishLayerNormKernel,
-    PostNormSiLULayerNormKernel,
-    PreNormRMSNormThenSiLUProgramKernel,
-    PreNormSiLURMSNormKernel,
-    SiLUBlockKernel,
-    SiLUPairProgramKernel,
-    SiLUThenPostNormProgramKernel,
-    build_default_kernel_registry,
-)
-from .matching import FlatRelationMatchingMixin
-from .runners import FlatRelationRunnerMixin
-from .types import (
-    BlockKernelSpec,
-    CentralizedBatchSpec,
-    FlatTopology,
-    KernelBatchPlan,
-    KernelMatch,
-    ProgramKernelSpec,
-    RelationSlice,
-    build_flat_topology,
-    normalize_relation_arities,
-    normalize_relation_counts,
-    topology_cache_key,
-)
+User-facing flat model entrypoints live in ``relmo.models.flat`` and
+``relmo.models.builders``. Kernel experimentation notes are preserved in
+``docs/flat_lgan_plan.md`` and ``docs/manual_fused_program_kernel_plan.md``.
+"""
+
+from . import collection, execution, flat_contract, kernels, matching, topology, types
 
 __all__ = [
-    "FlatRelationCollectorMixin",
-    "FlatRelationKernel",
-    "FlatRelationMatchingMixin",
-    "FlatRelationRunnerMixin",
-    "GELUBlockKernel",
-    "MishBlockKernel",
-    "PostNormMishLayerNormKernel",
-    "PostNormSiLULayerNormKernel",
-    "PreNormRMSNormThenSiLUProgramKernel",
-    "PreNormSiLURMSNormKernel",
-    "SiLUBlockKernel",
-    "SiLUPairProgramKernel",
-    "SiLUThenPostNormProgramKernel",
-    "build_default_kernel_registry",
-    "BlockKernelSpec",
-    "CentralizedBatchSpec",
-    "FlatTopology",
-    "KernelBatchPlan",
-    "KernelMatch",
-    "ProgramKernelSpec",
-    "RelationSlice",
-    "build_flat_topology",
-    "normalize_relation_arities",
-    "normalize_relation_counts",
-    "topology_cache_key",
+    "collection",
+    "execution",
+    "flat_contract",
+    "kernels",
+    "matching",
+    "topology",
+    "types",
 ]

@@ -18,7 +18,7 @@ from ._ops_env import (
     _use_model_mp_batched_fanin_pack,
     _use_model_mp_batched_fanin_reduce,
     _use_model_mp_batched_fanout,
-    relm_mp_ops,
+    relmo_mp_ops as _relmo_mp_ops_backend,
 )
 from ._scatter import (
     _build_fanout_scatter_plan,
@@ -26,6 +26,16 @@ from ._scatter import (
     _fanout_scatter_multi_src,
 )
 from ._tensor_utils import _cat_or_single, _finalize_pair_lists, _get_or_make_buffer, _match_ntype
+
+relm_mp_ops = _relmo_mp_ops_backend
+
+
+class _RelmoOpsProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(relm_mp_ops, name)
+
+
+relmo_mp_ops = _RelmoOpsProxy()
 
 
 class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
@@ -203,7 +213,7 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                             raise KeyError(f"Missing src node type {src!r} in x_dict for fanout.")
                         x_parts.append(x_src)
                         src_rows.append(int(x_src.size(0)))
-                    x_cat_pre, src_global_pre, flat_dst_pre = relm_mp_ops.fanout_pack_from_edges(  # type: ignore[union-attr]
+                    x_cat_pre, src_global_pre, flat_dst_pre = relmo_mp_ops.fanout_pack_from_edges(  # type: ignore[union-attr]
                         x_parts,
                         mp_edge_src_parts,
                         mp_edge_dst_parts,
@@ -318,7 +328,7 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                         raise ValueError(
                             f"Fanout packed plan x_rows mismatch: expected {packed_plan['x_rows']}, got {int(x_cat.size(0))}."
                         )
-                    args_flat_all = relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
+                    args_flat_all = relmo_mp_ops.fanout_scatter(  # type: ignore[union-attr]
                         x_cat,
                         packed_plan["src_global"],
                         packed_plan["flat_dst"],
@@ -337,7 +347,7 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                             if src not in x_dict:
                                 raise KeyError(f"Missing src node type {src!r} in x_dict for fanout.")
                             x_parts.append(x_dict[src])
-                        x_cat, src_global, flat_dst = relm_mp_ops.fanout_pack_from_edges(  # type: ignore[union-attr]
+                        x_cat, src_global, flat_dst = relmo_mp_ops.fanout_pack_from_edges(  # type: ignore[union-attr]
                             x_parts,
                             list(edge_plan["edge_src_parts"]),
                             list(edge_plan["edge_dst_parts"]),
@@ -346,7 +356,7 @@ class BatchedFanOutMP(DeviceAwareMixin, torch.nn.Module):
                             list(edge_plan["pos_parts"]),
                             list(edge_plan["slot_offset_parts"]),
                         )
-                        args_flat_all = relm_mp_ops.fanout_scatter(  # type: ignore[union-attr]
+                        args_flat_all = relmo_mp_ops.fanout_scatter(  # type: ignore[union-attr]
                             x_cat, src_global, flat_dst, int(total_slots)
                         )
                     except Exception:
@@ -524,7 +534,7 @@ class BatchedFanInMP(torch.nn.Module):
                             f"expected {int(packed_plan['rel_cat_rows'])}, got {int(rel_cat.size(0))}."
                         )
                     if use_mp_fanin_reduce:
-                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                        out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                             rel_cat,
                             packed_plan["flat_src"],
                             packed_plan["dst_idx"],
@@ -557,7 +567,7 @@ class BatchedFanInMP(torch.nn.Module):
                         )
                     rel_parts.append(rel_src)
                 if plan_ok and rel_parts:
-                    rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
+                    rel_cat, flat_src_all, dst_all = relmo_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
                         rel_parts,
                         list(edge_plan["edge_src_parts"]),
                         list(edge_plan["edge_dst_parts"]),
@@ -567,7 +577,7 @@ class BatchedFanInMP(torch.nn.Module):
                         int(edge_plan["mode"]),
                     )
                     if use_mp_fanin_reduce:
-                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                        out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                             rel_cat,
                             flat_src_all,
                             dst_all,
@@ -605,7 +615,7 @@ class BatchedFanInMP(torch.nn.Module):
                         if (not self.validate_routing) or int(rel_cat.size(0)) == int(
                             plan["total_src_rows"]
                         ):
-                            out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                            out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                                 rel_cat,
                                 plan["flat_src"],
                                 plan["dst_idx"],
@@ -643,13 +653,13 @@ class BatchedFanInMP(torch.nn.Module):
                     indices.append(dst_idx)
 
             if use_mp_fanin and rel_parts:
-                rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
+                rel_cat, flat_src_all, dst_all = relmo_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
                     rel_parts,
                     mp_src_parts,
                     mp_dst_parts,
                 )
                 if use_mp_fanin_reduce:
-                    out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                    out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                         rel_cat,
                         flat_src_all,
                         dst_all,
@@ -710,7 +720,7 @@ class BatchedFanInMP(torch.nn.Module):
                     )
                 ):
                     if use_mp_fanin_reduce:
-                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                        out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                             rel_flat_shared,
                             global_plan["flat_src"],
                             global_plan["dst_idx"],
@@ -759,7 +769,7 @@ class BatchedFanInMP(torch.nn.Module):
                             f"expected {int(packed_plan['rel_cat_rows'])}, got {int(rel_cat.size(0))}."
                         )
                     if use_mp_fanin_reduce:
-                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                        out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                             rel_cat,
                             packed_plan["flat_src"],
                             packed_plan["dst_idx"],
@@ -793,7 +803,7 @@ class BatchedFanInMP(torch.nn.Module):
                         )
                     rel_parts.append(rel_pred.view(-1, self.embedding_size))
                 if plan_ok and rel_parts:
-                    rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
+                    rel_cat, flat_src_all, dst_all = relmo_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
                         rel_parts,
                         list(edge_plan["edge_src_parts"]),
                         list(edge_plan["edge_dst_parts"]),
@@ -803,7 +813,7 @@ class BatchedFanInMP(torch.nn.Module):
                         int(edge_plan["mode"]),
                     )
                     if use_mp_fanin_reduce:
-                        out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                        out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                             rel_cat,
                             flat_src_all,
                             dst_all,
@@ -836,7 +846,7 @@ class BatchedFanInMP(torch.nn.Module):
                         if (not self.validate_routing) or int(rel_cat.size(0)) == int(
                             plan["total_rel_rows"]
                         ):
-                            out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                            out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                                 rel_cat,
                                 plan["flat_src"],
                                 plan["dst_idx"],
@@ -877,13 +887,13 @@ class BatchedFanInMP(torch.nn.Module):
                     indices.append(dst_idx)
 
             if use_mp_fanin and rel_parts:
-                rel_cat, flat_src_all, dst_all = relm_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
+                rel_cat, flat_src_all, dst_all = relmo_mp_ops.fanin_pack_multi(  # type: ignore[union-attr]
                     rel_parts,
                     mp_src_parts,
                     mp_dst_parts,
                 )
                 if use_mp_fanin_reduce:
-                    out[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                    out[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                         rel_cat,
                         flat_src_all,
                         dst_all,
@@ -1130,7 +1140,7 @@ class BatchedFanInMP(torch.nn.Module):
                 if not plan_ok or not rel_parts:
                     continue
                 try:
-                    rel_cat_pre, flat_src_pre, dst_pre = relm_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
+                    rel_cat_pre, flat_src_pre, dst_pre = relmo_mp_ops.fanin_pack_from_edges(  # type: ignore[union-attr]
                         rel_parts,
                         list(edge_plan["edge_src_parts"]),
                         list(edge_plan["edge_dst_parts"]),

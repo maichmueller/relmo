@@ -9,10 +9,13 @@ from torch.nn import Module
 from torch_geometric.data import Batch, Data, HeteroData
 from torch_geometric.typing import Adj
 
-from .flat_contract import FlatBatchInput
+from .flat_relational.flat_contract import FlatBatchInput
 from .mixins import DeviceAwareMixin
 
-import mifrost  # type: ignore
+try:  # pragma: no cover - optional native dependency
+    import mifrost  # type: ignore
+except ImportError:  # pragma: no cover - optional native dependency
+    mifrost = None
 
 
 class PyGModule(DeviceAwareMixin, Module, ABC):
@@ -36,12 +39,14 @@ class PyGModule(DeviceAwareMixin, Module, ABC):
             return super().__call__(x, edge_index, batch, *args[3:], **kwargs)
         if isinstance(data, (Data, Batch)):
             return super().__call__(*self.unpack(data), *args[1:], **kwargs)
-        if isinstance(data, (mifrost.BatchEncoding, mifrost.HomoBatchEncodingView)):
+        if mifrost is not None and isinstance(
+            data, (mifrost.BatchEncoding, mifrost.HomoBatchEncodingView)
+        ):
             return super().__call__(*self.unpack_native(data), *args[1:], **kwargs)
         raise NotImplementedError(f"Invalid input type {type(data)!r} for '__call__'")
 
     def unpack_native(self, data):
-        if isinstance(data, mifrost.BatchEncoding):
+        if mifrost is not None and isinstance(data, mifrost.BatchEncoding):
             data = data.as_homo()
         return (
             data.x.to(self.device),
@@ -81,12 +86,14 @@ class PyGHeteroModule(DeviceAwareMixin, Module, ABC):
             )
         if isinstance(data, Batch):
             return super().__call__(*self.unpack(data), *args[1:], **kwargs)
-        if isinstance(data, (mifrost.BatchEncoding, mifrost.HeteroBatchEncodingView)):
+        if mifrost is not None and isinstance(
+            data, (mifrost.BatchEncoding, mifrost.HeteroBatchEncodingView)
+        ):
             return super().__call__(*self.unpack_native(data), *args[1:], **kwargs)
         raise NotImplementedError(f"Invalid input type {type(data)!r} for '__call__'")
 
     def unpack_native(self, data):
-        if isinstance(data, mifrost.BatchEncoding):
+        if mifrost is not None and isinstance(data, mifrost.BatchEncoding):
             data = data.as_hetero()
         data = data.to(self.device)
         x_dict = {key: value.to(self.device) for key, value in data.x_dict.items()}
@@ -121,7 +128,8 @@ class PyGFlatModule(DeviceAwareMixin, Module, ABC):
         if isinstance(data, (Data, Batch)) and hasattr(data, "relation_counts") and hasattr(data, "relation_args"):
             return super().__call__(data, *args[1:], **kwargs)
         if (
-            isinstance(data, mifrost.BatchEncoding)
+            mifrost is not None
+            and isinstance(data, mifrost.BatchEncoding)
             and hasattr(data, "relation_counts")
             and hasattr(data, "relation_args")
         ):
@@ -136,7 +144,7 @@ class PyGFlatModule(DeviceAwareMixin, Module, ABC):
         return cls.unpack_pyg_flat(data)
 
     def unpack_native_flat(self, data):
-        if isinstance(data, mifrost.BatchEncoding):
+        if mifrost is not None and isinstance(data, mifrost.BatchEncoding):
             data = data.to(self.device)
 
         relation_counts = data.relation_counts

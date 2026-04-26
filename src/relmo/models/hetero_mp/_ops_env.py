@@ -9,9 +9,9 @@ from torch_geometric.nn.aggr import SumAggregation
 from ..aggr import LogSumExpAggregation
 
 try:  # pragma: no cover - optional during minimal model-only imports
-    from ...ops import mp as relm_mp_ops
+    from ...ops import mp as relmo_mp_ops
 except Exception:  # pragma: no cover
-    relm_mp_ops = None  # type: ignore[assignment]
+    relmo_mp_ops = None  # type: ignore[assignment]
 
 _MODE_SUM = 0
 _MODE_LOGSUMEXP = 1
@@ -68,7 +68,7 @@ def _mp_flag(name: str, default: bool) -> bool:
     return _env_bool(name, resolved_default)
 
 def _use_model_mp_ops(ref: torch.Tensor) -> bool:
-    if relm_mp_ops is None:
+    if relmo_mp_ops is None:
         return False
     if not _mp_flag("RELM_MODELS_MP_OPS", True):
         return False

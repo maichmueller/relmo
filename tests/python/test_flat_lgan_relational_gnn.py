@@ -355,7 +355,7 @@ def test_collect_relation_instance_messages_matches_slot_pooling() -> None:
         .clamp_min_(1.0)
     )
     pooled_from_slots = pooled_from_slots / counts
-    relation_pair_x = model.relational_layer._collect_relation_instance_messages(
+    relation_pair_x = model.relational_layer.collect_relation_instance_messages(
         x,
         prepared.relation_args,
         prepared.topology,
@@ -411,7 +411,7 @@ def test_collect_relation_instance_messages_kernel_matches_slot_pooling() -> Non
         .clamp_min_(1.0)
     )
     pooled_from_slots = pooled_from_slots / counts
-    relation_pair_x = model.relational_layer._collect_relation_instance_messages(
+    relation_pair_x = model.relational_layer.collect_relation_instance_messages(
         x,
         prepared.relation_args,
         prepared.topology,
@@ -442,7 +442,7 @@ def test_collect_slot_messages_mixed_kernel_and_fallback_matches_eager_reference
 
     slot_reference = x.new_zeros((int(prepared.relation_args.numel()), model.embedding_size))
     for relation_slice in prepared.topology.relation_slices:
-        direct = model.relational_layer._collect_eager_relation_messages(
+        direct = model.relational_layer.collect_eager_relation_messages(
             x,
             prepared.relation_args,
             relation_slice,
@@ -488,7 +488,7 @@ def test_collect_relation_instance_messages_mixed_kernel_and_fallback_matches_sl
         .clamp_min_(1.0)
     )
     pooled_from_slots = pooled_from_slots / counts
-    relation_pair_x = model.relational_layer._collect_relation_instance_messages(
+    relation_pair_x = model.relational_layer.collect_relation_instance_messages(
         x,
         prepared.relation_args,
         prepared.topology,
@@ -523,7 +523,7 @@ def test_lgan_build_pointwise_step_mixed_kernel_and_fallback_matches_two_step_re
     )
     assert integrated is not None
 
-    relation_pair_ref = model.relational_layer._collect_relation_instance_messages(
+    relation_pair_ref = model.relational_layer.collect_relation_instance_messages(
         x,
         prepared.relation_args,
         prepared.topology,
@@ -675,7 +675,7 @@ def test_lgan_build_pointwise_step_matches_relation_instance_then_graph_step() -
         mode="sum",
     )
     assert integrated is not None
-    relation_pair_ref = model.relational_layer._collect_relation_instance_messages(
+    relation_pair_ref = model.relational_layer.collect_relation_instance_messages(
         x,
         prepared.relation_args,
         prepared.topology,

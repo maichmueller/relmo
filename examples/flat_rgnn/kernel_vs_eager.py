@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import mifrost
 
-from relm.models import FlatRelationalGNN
+from relmo.models import FlatRelationalGNN
 
 from _shared import (
     EAGER_POLICY,

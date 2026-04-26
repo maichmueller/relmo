@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import mifrost
 
-from relm.models import (
+from relmo.models import (
     CentralizedFlatRelationalGNN,
     FlatLGANRelationalGNN,
     FlatRelationalGNN,

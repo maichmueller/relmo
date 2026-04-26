@@ -14,7 +14,7 @@ from ._ops_env import (
     _use_model_mp_fanin,
     _use_model_mp_fanin_fused,
     _use_model_mp_fanout,
-    relm_mp_ops,
+    relmo_mp_ops,
 )
 from ._scatter import (
     _build_fanout_scatter_plan,
@@ -396,7 +396,7 @@ class CentralFusedLayerMP(torch.nn.Module):
                 self._mp_fanin_mode is not None
                 and _use_model_mp_fanin_fused(out_flat)
             ):
-                symbol_msgs[dst] = relm_mp_ops.fanin_reduce(  # type: ignore[union-attr]
+                symbol_msgs[dst] = relmo_mp_ops.fanin_reduce(  # type: ignore[union-attr]
                     out_flat, flat_src, dst_index, dim_size, self._mp_fanin_mode
                 )
             else:

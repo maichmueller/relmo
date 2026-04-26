@@ -31,12 +31,18 @@ import torch
 from torch import Tensor
 from torch_geometric.data import Batch, Data
 
-import mifrost
+try:  # pragma: no cover - optional native dependency
+    import mifrost  # type: ignore
+except ImportError:  # pragma: no cover - optional native dependency
+    mifrost = None
 
 INT32_MAX = int(torch.iinfo(torch.int32).max)
 # Public flat-model input boundary: either a native mifrost flat batch or an
 # explicit PyG carrier with the flat relation tensors attached.
-FlatBatchInput = mifrost.BatchEncoding | Data | Batch
+if mifrost is not None:
+    FlatBatchInput = mifrost.BatchEncoding | Data | Batch
+else:
+    FlatBatchInput = Data | Batch
 
 
 @dataclass(frozen=True)
@@ -45,16 +51,16 @@ class FlatExecutionPolicy:
 
     Attributes:
         relation_kernels:
-            ``"auto"`` enables exact single-block CUDA kernels when the block
-            family is registered and the current device supports it. ``"off"``
-            always uses eager module execution.
+            The public policy field is retained for API stability, but the
+            current runtime keeps relation kernels disabled and always uses
+            eager module execution.
         program_kernels:
-            ``"auto"`` enables exact composed-program CUDA kernels for matched
-            :class:`RelationProgram` families. ``"off"`` always uses eager
-            module execution.
+            The public policy field is retained for API stability, but the
+            current runtime keeps program kernels disabled and always uses
+            eager module execution.
         relation_gather:
-            ``"auto"`` uses the current device-aware default: enabled on CUDA,
-            disabled on CPU. ``"on"`` and ``"off"`` force the behavior.
+            The public policy field is retained for API stability, but the
+            current runtime keeps the custom relation gather path disabled.
     """
 
     relation_kernels: str = "auto"
@@ -76,21 +82,16 @@ class FlatExecutionPolicy:
             )
 
     def use_relation_kernels(self, *, device: torch.device) -> bool:
-        if self.relation_kernels == "off":
-            return False
-        return device.type == "cuda"
+        del device
+        return False
 
     def use_program_kernels(self, *, device: torch.device) -> bool:
-        if self.program_kernels == "off":
-            return False
-        return device.type == "cuda"
+        del device
+        return False
 
     def use_relation_gather(self, *, device: torch.device) -> bool:
-        if self.relation_gather == "on":
-            return True
-        if self.relation_gather == "off":
-            return False
-        return device.type == "cuda"
+        del device
+        return False
 
 
 @dataclass(frozen=True)

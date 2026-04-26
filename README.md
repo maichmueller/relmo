@@ -61,6 +61,12 @@ The `--no-deps` keeps your chosen Torch runtime in place when installing a lane-
 
 The published package name and Python import namespace are both `relmo`.
 
+## Flat model docs
+
+The supported flat-model user surface is documented in [docs/flat_rgnn_usage_examples.md](docs/flat_rgnn_usage_examples.md) and centers on `relmo.models.flat` plus `relmo.models.builders`.
+
+Kernel experiments that were evaluated and not kept are intentionally preserved as engineering history in [docs/flat_lgan_plan.md](docs/flat_lgan_plan.md) and [docs/manual_fused_program_kernel_plan.md](docs/manual_fused_program_kernel_plan.md), so future work does not repeat already-failed paths blindly.
+
 ## Benchmark modes
 
 ```bash
