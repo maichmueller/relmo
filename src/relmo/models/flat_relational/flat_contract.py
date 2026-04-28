@@ -225,8 +225,7 @@ def normalize_optional_long_tensor(
 
 
 def preferred_index_dtype(*, device: torch.device, max_index_bound: int) -> torch.dtype:
-    if int(max_index_bound) <= INT32_MAX:
-        return torch.int32
+    del device, max_index_bound
     return torch.long
 
 

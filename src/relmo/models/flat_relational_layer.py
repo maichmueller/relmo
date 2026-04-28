@@ -204,9 +204,7 @@ class FlatRelationalLayer(torch.nn.Module):
             raise ValueError(
                 f"x must have feature size {self.embedding_size}, got {x.size(1)}."
             )
-        relation_args = relation_args.to(device=x.device).view(-1)
-        if relation_args.dtype not in (torch.int32, torch.int64):
-            relation_args = relation_args.to(dtype=torch.long)
+        relation_args = relation_args.to(device=x.device, dtype=torch.long).view(-1)
         if topology is None:
             topology = self.get_topology(
                 relation_counts, relation_arities=relation_arities, cache=cache
