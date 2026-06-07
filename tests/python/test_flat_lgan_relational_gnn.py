@@ -420,19 +420,15 @@ def test_collect_relation_instance_messages_kernel_matches_slot_pooling() -> Non
     assert torch.allclose(relation_pair_x, pooled_from_slots, atol=1e-5, rtol=1e-4)
 
 
-def test_collect_slot_messages_mixed_kernel_and_fallback_matches_eager_reference(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_collect_slot_messages_eager_runtime_matches_reference() -> None:
     model = _make_mixed_kernel_fallback_model()
     prepared = model._prepare_batch(_make_lgan_data())
     assert prepared.topology is not None
     layout = model.relational_layer._get_kernel_layout(prepared.topology)
-    assert len(layout.groups) > 0
-    assert len(layout.fallback_indices) > 0
+    assert layout.groups == ()
+    assert layout.fallback_indices == ()
     x = model.initialize_embeddings(prepared.x)
 
-    monkeypatch.setattr(model.relational_layer, "_use_relation_kernels", lambda _x: True)
-    monkeypatch.setattr(model.relational_layer, "_use_program_kernels", lambda _x: False)
     slot_messages = model.relational_layer.collect_slot_messages(
         x,
         prepared.relation_args,
@@ -454,17 +450,13 @@ def test_collect_slot_messages_mixed_kernel_and_fallback_matches_eager_reference
     assert torch.allclose(slot_messages, slot_reference, atol=1e-6, rtol=1e-5)
 
 
-def test_collect_relation_instance_messages_mixed_kernel_and_fallback_matches_slot_pooling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_collect_relation_instance_messages_eager_runtime_matches_slot_pooling() -> None:
     model = _make_mixed_kernel_fallback_model()
     prepared = model._prepare_batch(_make_lgan_data())
     assert prepared.topology is not None
     assert prepared.lgan_topology is not None
     x = model.initialize_embeddings(prepared.x)
 
-    monkeypatch.setattr(model.relational_layer, "_use_relation_kernels", lambda _x: True)
-    monkeypatch.setattr(model.relational_layer, "_use_program_kernels", lambda _x: False)
     slot_messages = model.relational_layer.collect_slot_messages(
         x,
         prepared.relation_args,
@@ -497,16 +489,11 @@ def test_collect_relation_instance_messages_mixed_kernel_and_fallback_matches_sl
     assert torch.allclose(relation_pair_x, pooled_from_slots, atol=1e-6, rtol=1e-5)
 
 
-def test_lgan_build_pointwise_step_mixed_kernel_and_fallback_matches_two_step_reference(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_lgan_pointwise_kernel_path_is_quarantined() -> None:
     model = _make_mixed_kernel_fallback_model()
     prepared = model._prepare_batch(_make_lgan_data())
     assert prepared.topology is not None
     x = model.initialize_embeddings(prepared.x)
-
-    monkeypatch.setattr(model.relational_layer, "_use_relation_kernels", lambda _x: True)
-    monkeypatch.setattr(model.relational_layer, "_use_program_kernels", lambda _x: False)
 
     integrated = model.relational_layer._run_lgan_pointwise_step(
         x,
@@ -521,7 +508,7 @@ def test_lgan_build_pointwise_step_mixed_kernel_and_fallback_matches_two_step_re
         entity_dim_size=int(x.size(0)),
         mode="sum",
     )
-    assert integrated is not None
+    assert integrated is None
 
     relation_pair_ref = model.relational_layer.collect_relation_instance_messages(
         x,
@@ -540,8 +527,7 @@ def test_lgan_build_pointwise_step_mixed_kernel_and_fallback_matches_two_step_re
         entity_dim_size=int(x.size(0)),
         mode="sum",
     )
-    for got, ref in zip(integrated, reference, strict=True):
-        assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5)
+    assert len(reference) == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

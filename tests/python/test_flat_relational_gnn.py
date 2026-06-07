@@ -218,7 +218,7 @@ def test_flat_execution_policy_resolves_modes() -> None:
     assert policy.use_relation_kernels(device=torch.device("cpu")) is False
     assert policy.use_program_kernels(device=torch.device("cpu")) is False
     assert policy.use_relation_gather(device=torch.device("cpu")) is False
-    assert policy.use_relation_gather(device=torch.device("cuda")) is True
+    assert policy.use_relation_gather(device=torch.device("cuda")) is False
 
 
 def test_flat_execution_policy_rejects_invalid_values() -> None:

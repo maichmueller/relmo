@@ -1,15 +1,21 @@
-"""Compatibility facade for hetero relational model variants."""
+"""Private hetero-model compatibility namespace."""
 
-from ._hetero import (
+from ..relational_gnn import (
+    BoundedValueHead,
+    CentralRelationModule,
     CentralizedRelationalGNN,
     FastRelationalGNN,
     LGANRelationalGNN,
     RelationalGNN,
+    ZeroOut,
 )
 
 __all__ = [
+    "BoundedValueHead",
+    "CentralRelationModule",
     "CentralizedRelationalGNN",
     "FastRelationalGNN",
     "LGANRelationalGNN",
     "RelationalGNN",
+    "ZeroOut",
 ]

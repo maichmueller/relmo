@@ -19,6 +19,7 @@ from torch import Tensor
 from torch_geometric.nn.resolver import aggregation_resolver
 
 from ._compile import optional_compile
+from ._flat.preparation import FlatBatchPreparer
 from .aggr import LogSumExpAggregation
 from .flat_relational.flat_contract import (
     FlatBatchInput,
@@ -110,6 +111,10 @@ class FlatRelationalGNN(PyGFlatModule):
         )
         self.activation = activation or "mish"
         self.execution_policy = execution_policy
+        self._batch_preparer = FlatBatchPreparer(
+            prepare_native=self._prepare_native_flat_batch,
+            prepare_pyg=self._prepare_pyg_flat_batch,
+        )
 
         modules = self._build_relation_modules(
             relation_modules=relation_modules,
@@ -551,16 +556,7 @@ class FlatRelationalGNN(PyGFlatModule):
             data: FlatBatchInput | _FlatPreparedBatch,
             cache: dict | None = None,
     ) -> _FlatPreparedBatch:
-        if getattr(data, "_relm_flat_prepared_batch", False):
-            return data
-        if mifrost is not None and isinstance(data, mifrost.BatchEncoding):
-            return self._prepare_native_flat_batch(data, cache=cache)
-        if isinstance(data, (pyg.data.Data, pyg.data.Batch)):
-            return self._prepare_pyg_flat_batch(data, cache=cache)
-        raise TypeError(
-            "FlatRelationalGNN expects a mifrost flat BatchEncoding or a PyG "
-            "Data/Batch carrying relation_counts and relation_args."
-        )
+        return self._batch_preparer.prepare(data, cache=cache)
 
     def _build_output(
             self,

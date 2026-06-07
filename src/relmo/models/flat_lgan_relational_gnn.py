@@ -27,7 +27,10 @@ import torch_geometric as pyg
 from torch import Tensor
 from torch_geometric.nn.aggr import MeanAggregation, SumAggregation
 
-import mifrost
+try:  # pragma: no cover - optional native dependency
+    import mifrost  # type: ignore
+except ImportError:  # pragma: no cover - optional native dependency
+    mifrost = None
 
 from ._compile import optional_compile
 from ..ops import mp as relm_mp_ops

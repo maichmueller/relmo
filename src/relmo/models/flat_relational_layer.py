@@ -17,6 +17,7 @@ from .aggr import LogSumExpAggregation
 from .flat_relational.flat_contract import FlatExecutionPolicy
 from .flat_relational import collection
 from .flat_relational.kernels import FlatRelationKernel, build_default_kernel_registry
+from .flat_relational.matching import match_relation_kernel
 from .flat_relational.topology import (
     build_flat_topology,
     normalize_relation_arities,
@@ -72,6 +73,8 @@ class FlatRelationalLayer(torch.nn.Module):
         self._persistent_kernel_layout_cache: dict[
             tuple[tuple[int, ...], tuple[int, ...]], collection.KernelExecutionLayout
         ] = {}
+        self._kernel_match_cache: dict[tuple[int, int], object | None] = {}
+        self._relation_block_cache: dict[int, object | None] = {}
 
         self.kernels = (
             tuple(kernels)
@@ -90,6 +93,12 @@ class FlatRelationalLayer(torch.nn.Module):
 
     def use_relation_gather(self, x: Tensor) -> bool:
         return self.execution_policy.use_relation_gather(device=x.device)
+
+    def _use_relation_kernels(self, x: Tensor) -> bool:
+        return self.use_relation_kernels(x)
+
+    def _use_program_kernels(self, x: Tensor) -> bool:
+        return self.use_program_kernels(x)
 
     def get_topology(
         self,
@@ -139,6 +148,10 @@ class FlatRelationalLayer(torch.nn.Module):
     ) -> collection.KernelExecutionLayout:
         return collection.build_kernel_execution_layout(self, topology, cache=cache)
 
+    def _match_kernel(self, relation_slice):
+        """Compatibility/debug hook for the quarantined kernel matcher."""
+        return match_relation_kernel(self, relation_slice)
+
     def collect_messages(
         self,
         x: Tensor,
@@ -153,6 +166,23 @@ class FlatRelationalLayer(torch.nn.Module):
             relation_args,
             topology,
             cache=cache,
+        )
+
+    def collect_eager_relation_messages(
+        self,
+        x: Tensor,
+        relation_args: Tensor,
+        relation_slice,
+        *,
+        arg_emb_all: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor] | None:
+        """Compatibility/debug hook for direct eager relation collection."""
+        return collection.collect_eager_relation_messages(
+            self,
+            x,
+            relation_args,
+            relation_slice,
+            arg_emb_all=arg_emb_all,
         )
 
     def collect_slot_messages(
@@ -186,6 +216,10 @@ class FlatRelationalLayer(torch.nn.Module):
             topology,
             cache=cache,
         )
+
+    def _run_lgan_pointwise_step(self, *args, **kwargs):
+        """Compatibility hook for the removed kernelized LGAN pointwise path."""
+        return collection.run_lgan_pointwise_step(self, *args, **kwargs)
 
 
     def forward(

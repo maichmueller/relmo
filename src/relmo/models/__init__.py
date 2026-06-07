@@ -1,5 +1,13 @@
 """Relational GNN models and model-construction facades."""
 
+try:  # pragma: no cover - exercised by import-safety subprocess tests
+    import torch_geometric as _torch_geometric  # noqa: F401
+except ModuleNotFoundError as exc:  # pragma: no cover
+    raise ModuleNotFoundError(
+        "relmo.models requires the optional 'models' dependencies. "
+        "Install them with `pip install relmo[models]`."
+    ) from exc
+
 from . import builders, flat, hetero
 from .builders import (
     ArityMLPFactory,

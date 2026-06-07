@@ -61,6 +61,22 @@ The `--no-deps` keeps your chosen Torch runtime in place when installing a lane-
 
 The published package name and Python import namespace are both `relmo`.
 
+## Optional extras
+
+The root `relmo` package and `relmo.ops` import with only the core `torch`
+dependency installed. Model code requires the model extra:
+
+```bash
+pip install "relmo[models]"
+```
+
+PDDL and native encoder interop tools are optional:
+
+```bash
+pip install "relmo[interop]"
+pip install "relmo[bench]"
+```
+
 ## Flat model docs
 
 The supported flat-model user surface is documented in [docs/flat_rgnn_usage_examples.md](docs/flat_rgnn_usage_examples.md) and centers on `relmo.models.flat` plus `relmo.models.builders`.
