@@ -263,13 +263,22 @@ class FlatRelationalGNN(PyGFlatModule):
         """Canonicalize the flat relation tensors required by the core layer."""
         if x.dim() != 2:
             raise ValueError(f"x must be rank-2, got shape {tuple(x.shape)}.")
-        relation_counts_2d = normalize_relation_counts(relation_counts, device=x.device)
+        # Counts and arities only drive host-side topology construction. Keep
+        # them on the CPU so native batches do not move metadata to CUDA only
+        # to synchronize it back through item()/tolist() immediately.
+        relation_counts_2d = normalize_relation_counts(
+            relation_counts,
+            device=torch.device("cpu"),
+        )
         index_dtype = preferred_index_dtype(device=x.device, max_index_bound=int(x.size(0)))
         relation_args_1d = relation_args.to(device=x.device, dtype=index_dtype).view(-1)
         arities_1d = (
-            self.relation_arities.to(device=x.device)
+            self.relation_arities
             if relation_arities is None
-            else normalize_relation_arities(relation_arities, device=x.device)
+            else normalize_relation_arities(
+                relation_arities,
+                device=torch.device("cpu"),
+            )
         )
         if relation_counts_2d.size(1) != arities_1d.numel():
             raise ValueError(
@@ -286,7 +295,6 @@ class FlatRelationalGNN(PyGFlatModule):
             (
                     relation_counts_2d
                     * arities_1d.view(1, -1).to(
-                device=relation_counts_2d.device,
                 dtype=relation_counts_2d.dtype,
             )
             )
@@ -320,7 +328,9 @@ class FlatRelationalGNN(PyGFlatModule):
     ) -> tuple[Tensor, Tensor | None]:
         """Resolve the graph id per entity row from ``batch`` or ``node_sizes``."""
         node_sizes_t = (
-            None if node_sizes is None else node_sizes.to(device=x.device, dtype=torch.long).view(-1)
+            None
+            if node_sizes is None
+            else node_sizes.to(dtype=torch.long).view(-1)
         )
         if batch is None:
             if node_sizes_t is not None:
@@ -329,6 +339,7 @@ class FlatRelationalGNN(PyGFlatModule):
                         "node_sizes does not sum to x.size(0): "
                         f"{int(node_sizes_t.sum().item())} vs {int(x.size(0))}."
                     )
+                node_sizes_t = node_sizes_t.to(device=x.device)
                 batch = torch.repeat_interleave(
                     torch.arange(int(node_sizes_t.numel()), device=x.device, dtype=torch.long),
                     node_sizes_t,
@@ -337,6 +348,8 @@ class FlatRelationalGNN(PyGFlatModule):
                 batch = torch.zeros((int(x.size(0)),), device=x.device, dtype=torch.long)
         else:
             batch = batch.to(device=x.device, dtype=torch.long).view(-1)
+            if node_sizes_t is not None:
+                node_sizes_t = node_sizes_t.to(device=x.device)
         return batch, node_sizes_t
 
     def _normalize_output_views(

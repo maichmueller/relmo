@@ -20,6 +20,7 @@ from relmo.models import (
     ThreeLayerPointwiseRelationMLP,
     TwoLayerPointwiseRelationMLP,
 )
+from relmo.models.flat_relational import collection as flat_collection_module
 from relmo.models.flat_relational import kernels as flat_kernels_module
 from relmo.models.flat_relational import topology as flat_topology_module
 from relmo.models.flat_relational import types as flat_types_module
@@ -508,6 +509,51 @@ def test_flat_relational_layer_sum_matches_reference_forward_and_gradients() -> 
     out.square().sum().backward()
     ref.square().sum().backward()
     assert torch.allclose(x.grad, x_ref.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_eager_slot_collection_reuses_one_argument_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_model(
+        {
+            "rel_a": TwoLayerPointwiseRelationMLP(8, 16, activation="mish"),
+            "rel_b": TwoLayerPointwiseRelationMLP(4, 12, activation="mish"),
+        },
+        aggregation="sum",
+        execution_policy=FlatExecutionPolicy(
+            relation_kernels="off",
+            program_kernels="off",
+            relation_gather="off",
+        ),
+    )
+    payload = _make_small_payload()
+    topology = model.relational_layer.get_topology(
+        payload["relation_counts"],
+        payload["relation_arities"],
+    )
+    gathered_inputs: list[torch.Tensor | None] = []
+    original = flat_collection_module.collect_eager_relation_messages
+
+    def record_gather(*args, arg_emb_all=None, **kwargs):
+        gathered_inputs.append(arg_emb_all)
+        return original(*args, arg_emb_all=arg_emb_all, **kwargs)
+
+    monkeypatch.setattr(
+        flat_collection_module,
+        "collect_eager_relation_messages",
+        record_gather,
+    )
+    model.relational_layer(
+        torch.randn(5, 4),
+        payload["relation_counts"],
+        payload["relation_args"],
+        relation_arities=payload["relation_arities"],
+        topology=topology,
+    )
+
+    assert len(gathered_inputs) == 2
+    assert gathered_inputs[0] is not None
+    assert gathered_inputs[1] is gathered_inputs[0]
 
 
 def test_flat_relational_layer_mean_matches_reference_forward_and_gradients() -> None:

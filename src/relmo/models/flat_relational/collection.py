@@ -394,12 +394,11 @@ def collect_slot_messages(
     if int(relation_args.numel()) == 0:
         return None
 
-    slot_messages = x.new_zeros((int(relation_args.numel()), layer.embedding_size))
-    arg_emb_all = (
-        x.index_select(0, relation_args)
-        if layer.use_relation_gather(x) and int(relation_args.numel()) > 0
-        else None
-    )
+    # All relation slices partition relation_args in canonical slot order.
+    # Gathering once avoids one index_select launch per non-empty relation,
+    # which dominates small, deeply recurrent flat RGNN workloads.
+    arg_emb_all = x.index_select(0, relation_args)
+    message_parts: list[Tensor] = []
     for relation_slice in topology.relation_slices:
         direct = collect_eager_relation_messages(
             layer,
@@ -411,10 +410,12 @@ def collect_slot_messages(
         if direct is None:
             continue
         msgs, _ = direct
-        slot_messages[
-            relation_slice.slot_start : relation_slice.slot_end
-        ] = msgs
-    return slot_messages
+        message_parts.append(msgs)
+    if not message_parts:
+        return None
+    if len(message_parts) == 1:
+        return message_parts[0]
+    return torch.cat(message_parts, dim=0)
 
 
 def collect_relation_instance_messages(

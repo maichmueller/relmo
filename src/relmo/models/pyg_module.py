@@ -144,19 +144,20 @@ class PyGFlatModule(DeviceAwareMixin, Module, ABC):
         return cls.unpack_pyg_flat(data)
 
     def unpack_native_flat(self, data):
+        relation_counts = data.relation_counts
+        relation_arities = getattr(data, "relation_arities", None)
+        node_sizes_host = getattr(data, "node_sizes", None)
         if mifrost is not None and isinstance(data, mifrost.BatchEncoding):
             data = data.to(self.device)
 
-        relation_counts = data.relation_counts
         relation_args = data.relation_args
-        relation_arities = getattr(data, "relation_arities", None)
 
         x = getattr(data, "x", None)
         if x is None:
-            node_sizes = getattr(data, "node_sizes", None)
+            node_sizes = node_sizes_host
             if torch.is_tensor(node_sizes) and node_sizes.numel() > 0:
                 node_count = int(node_sizes.sum().item())
-                device = node_sizes.device
+                device = relation_args.device
             else:
                 node_count = int(getattr(data, "num_nodes", 0))
                 device = relation_args.device if torch.is_tensor(relation_args) else torch.device("cpu")
@@ -199,6 +200,8 @@ class PyGFlatModule(DeviceAwareMixin, Module, ABC):
                 continue
             value = getattr(data, key)
             extras[key] = value
+        if torch.is_tensor(node_sizes_host) and node_sizes_host.device.type == "cpu":
+            extras["node_sizes"] = node_sizes_host
         return x, relation_counts, relation_args, relation_arities, extras
 
     @classmethod

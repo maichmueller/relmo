@@ -134,9 +134,8 @@ class FlatRelationalLayer(torch.nn.Module):
         x: Tensor,
         collected: tuple[Tensor, Tensor] | None,
     ) -> Tensor:
-        aggregated = x.new_zeros((int(x.size(0)), self.embedding_size))
         if collected is None:
-            return aggregated
+            return x.new_zeros((int(x.size(0)), self.embedding_size))
         msgs, idx = collected
         return self.aggr(x=msgs, index=idx, dim=0, dim_size=int(x.size(0)))
 
