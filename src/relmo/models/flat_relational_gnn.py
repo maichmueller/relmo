@@ -219,12 +219,19 @@ class FlatRelationalGNN(PyGFlatModule):
             return relation_args
         num_graphs = int(relation_counts.size(0))
         num_relations = int(relation_counts.size(1))
+        # Read the small per-(graph, relation) count/arity metadata on the host
+        # once: per-element .item() inside the loop forces a device->host sync
+        # per entry and dominates GPU time in launch-bound decode batches. One
+        # tolist() each is byte-identical but sync-free.
+        relation_counts_host = relation_counts.tolist()
+        relation_arities_host = relation_arities.tolist()
         chunks_by_relation: list[list[Tensor]] = [[] for _ in range(num_relations)]
         cursor = 0
         for graph_index in range(num_graphs):
+            counts_row = relation_counts_host[graph_index]
             for relation_index in range(num_relations):
-                count = int(relation_counts[graph_index, relation_index].item())
-                arity = int(relation_arities[relation_index].item())
+                count = int(counts_row[relation_index])
+                arity = int(relation_arities_host[relation_index])
                 width = int(count * arity)
                 next_cursor = int(cursor + width)
                 if width > 0:

@@ -65,11 +65,15 @@ def build_flat_topology(
     relation_slices: list[RelationSlice] = []
     slot_offsets = [0]
     cursor = 0
-    for relation_index, (count_t, arity_t) in enumerate(
-        zip(counts_total, arities_1d)
+    # Host-side once: per-element .item() forces a device->host sync per
+    # relation; tolist() is byte-identical but sync-free.
+    counts_total_host = counts_total.tolist()
+    arities_host = arities_1d.tolist()
+    for relation_index, (count, arity) in enumerate(
+        zip(counts_total_host, arities_host)
     ):
-        count = int(count_t.item())
-        arity = int(arity_t.item())
+        count = int(count)
+        arity = int(arity)
         if arity < 0:
             raise ValueError(f"relation arity must be >= 0, got {arity}.")
         width = count * arity
@@ -85,8 +89,8 @@ def build_flat_topology(
         cursor += width
         slot_offsets.append(cursor)
     return FlatTopology(
-        relation_counts_total=tuple(int(x.item()) for x in counts_total),
-        relation_arities=tuple(int(x.item()) for x in arities_1d),
+        relation_counts_total=tuple(int(x) for x in counts_total_host),
+        relation_arities=tuple(int(x) for x in arities_host),
         relation_slices=tuple(relation_slices),
         slot_offsets=tuple(int(x) for x in slot_offsets),
     )
